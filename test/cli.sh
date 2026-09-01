@@ -770,10 +770,6 @@ cl_announces_removed() {          # <file>
 cl_announces_removed_except() {   # <file> <fixed string the one blessed line carries>
   grep -vF -- "$2" "$1" | grep -qEi "$CL_PATTERN"
 }
-check "corpus: 214.md still names the removal it announces (#214)" 0 "" \
-  cl_announces_removed "$ROOT/changelog.d/214.md"
-check "corpus: 159.md still carries the history clause the sweep excepts (#214)" 0 "1" \
-  grep -c 'Retired agent template spellings' "$ROOT/changelog.d/159.md"
 # Every tracked file in the directory, not a *.md glob: the criterion greps
 # changelog.d/ whole, and README.md and shape assemble into nothing but are
 # read by the same people.
@@ -787,10 +783,84 @@ check "corpus: 159.md still carries the history clause the sweep excepts (#214)"
 # excepting nothing and the sweep is asserting nothing.
 CL_TRACKED="$(git -C "$ROOT" ls-files changelog.d 2>/dev/null)"
 cl_walk_reaches() { printf '%s\n' "$CL_TRACKED" | grep -qxF "$1"; }
-check "corpus: the walk reaches 214.md, which the first exception names (#214)" 0 "" \
-  cl_walk_reaches changelog.d/214.md
-check "corpus: ...and 159.md, which the second names — an empty walk sweeps nothing" 0 "" \
-  cl_walk_reaches changelog.d/159.md
+#
+# ---- the two trees this block runs on (#222 D6) ---------------------------
+#
+# A release cut CONSUMES every fragment, so the five controls that read
+# changelog.d/{214,159,177}.md as tracked paths cannot run on the tree the cut
+# produces — and that tree is the one whose release notes those controls exist
+# to police. They do not become optional there; they change subject, from the
+# fragments to the section the fragments were assembled into.
+#
+# The branch is derived from the TREE and from nothing else: the fragments'
+# absence, and the assembled section's presence. Not an environment variable,
+# not a --release argument, not a VERSION read. A control the builder of a
+# release can switch off is not a control, and the whole reason this block is
+# in the cut's own diff is that the cut must not be able to buy its way past
+# it.
+#
+# 'shape' and README.md are the directory's furniture and survive the
+# consumption by design (they are what changelog-armed refuses a tree
+# without), so they are not fragments and do not keep the ordinary path alive.
+CL_FRAGMENTS="$(printf '%s\n' "$CL_TRACKED" \
+  | grep -vxF -e changelog.d/README.md -e changelog.d/shape -e '')"
+# The section is located structurally — the top '## ' heading and everything
+# under it — so nothing here reads a version out of VERSION or matches one by
+# name.
+cl_release_heading() { grep -m1 '^## ' "$ROOT/CHANGELOG.md"; }
+cl_release_section() { awk '/^## /{n++; if (n>1) exit; next} n==1' "$ROOT/CHANGELOG.md"; }
+cl_release_section_is_stamped() {
+  cl_release_heading \
+    | grep -qE '^## [0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)? — [0-9]{4}-[0-9]{2}-[0-9]{2}$'
+}
+cl_release_section_has_entries() { cl_release_section | grep -q '^- '; }
+cl_release_section_announces() { cl_release_section | grep -qEi "$CL_PATTERN"; }
+cl_release_section_clause() { cl_release_section | grep -cF "$1"; }
+# The amended 177.md entries, found in the section by their own terminal
+# citation. '(#177).' and not '#177': 214.md's tenant-seed entry cites
+# '(#177, #214).' and is a DIFFERENT entry, one that announces a removal on
+# purpose, so a looser match would drag it in and invert this control.
+cl_release_177() { cl_release_section | grep -F -- '(#177).'; }
+cl_release_177_count() { cl_release_177 | grep -c '^- '; }
+cl_release_177_announces() { cl_release_177 | grep -qEi "$CL_PATTERN"; }
+if [ -n "$CL_FRAGMENTS" ]; then
+  # ---- the ordinary tree: exercised by this repository's own main ---------
+  # Unchanged in substance and in wording. Every assertion below ran before
+  # #222 and runs identically after it.
+  check "corpus: 214.md still names the removal it announces (#214)" 0 "" \
+    cl_announces_removed "$ROOT/changelog.d/214.md"
+  check "corpus: 159.md still carries the history clause the sweep excepts (#214)" 0 "1" \
+    grep -c 'Retired agent template spellings' "$ROOT/changelog.d/159.md"
+  check "corpus: the walk reaches 214.md, which the first exception names (#214)" 0 "" \
+    cl_walk_reaches changelog.d/214.md
+  check "corpus: ...and 159.md, which the second names — an empty walk sweeps nothing" 0 "" \
+    cl_walk_reaches changelog.d/159.md
+else
+  # ---- the release tree: exercised by the cut PR itself -------------------
+  # This is the liveness guarantee moved, not dropped. On the ordinary tree
+  # the 'git ls-files' walk proves the sweep reached something before it swept
+  # an empty directory; here the directory IS empty by design, so the proof
+  # moves to the artefact the fragments became. A missing, unstamped or empty
+  # section reds — which is the whole point, because an absence sweep that
+  # reaches nothing must red rather than pass.
+  check "corpus/release: CHANGELOG.md's top section is a stamped release heading (#214, #222)" 0 "" \
+    cl_release_section_is_stamped
+  check "corpus/release: ...and it is not empty — a section that assembled nothing reds" 0 "" \
+    cl_release_section_has_entries
+  # The two excepted clauses, now asserted where they actually ship. These are
+  # the same two exceptions the ordinary path names, read out of the section
+  # instead of out of the files: 214.md's removal announcement, which a
+  # BREAKING entry that cannot say '--role' would not be, and 159.md's
+  # one-line history clause.
+  check "corpus/release: the section carries 214.md's removal announcement (#214, #222)" 0 "" \
+    cl_release_section_announces
+  check "corpus/release: ...and names --role, the removal it announces" 0 "1" \
+    cl_release_section_clause 'box new --role <role>'
+  check "corpus/release: ...and carries the BREAKING entry that heads it" 0 "1" \
+    cl_release_section_clause '**BREAKING** — box no longer installs or runs a converger'
+  check "corpus/release: ...and 159.md's history clause, exactly once (#214, #222)" 0 "1" \
+    cl_release_section_clause 'Retired agent template spellings'
+fi
 while read -r rel; do
   [ -n "$rel" ] || continue
   case "$rel" in
@@ -834,8 +904,23 @@ if [ -n "$SFPRECOMMIT" ]; then
   git -C "$ROOT" show "$SFPRECOMMIT:changelog.d/177.md" > "$CLPRE" 2>/dev/null || true
   check "corpus: the guard reds on the real pre-amendment 177.md (${SFPRECOMMIT:0:7}) (#214)" 0 "" \
     cl_announces_removed "$CLPRE"
-  check "corpus: ...and is green on the amended one (the control's other half)" 1 "" \
-    cl_announces_removed "$ROOT/changelog.d/177.md"
+  # This half reads git history and is indifferent to the cut, so it is
+  # unchanged. Its other half reads the amended fragment as a tracked path,
+  # and on a release tree that path is gone — the amended text is in the
+  # section. Same assertion, same subject, found where the cut put it (#222 D6).
+  if [ -n "$CL_FRAGMENTS" ]; then
+    check "corpus: ...and is green on the amended one (the control's other half)" 1 "" \
+      cl_announces_removed "$ROOT/changelog.d/177.md"
+  else
+    # Liveness first, for the reason the walk exists: an extraction that
+    # reaches no entry would make the assertion below pass by having nothing
+    # to look at, which is the failure mode this whole block is written
+    # against. 177.md contributed two entries and both must be found.
+    check "corpus/release: the section carries 177.md's two amended entries (#222)" 0 "2" \
+      cl_release_177_count
+    check "corpus/release: ...and the guard is green on them (the control's other half)" 1 "" \
+      cl_release_177_announces
+  fi
   rm -f "$CLPRE"
 fi
 
