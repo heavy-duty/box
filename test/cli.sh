@@ -10621,6 +10621,380 @@ check "panel: a labels.conf with no panel= line is a red as well" 1 "no panel= n
 rm -rf "$PANELWORK"
 
 # ---------------------------------------------------------------------------
+# The scope labels are described in THREE files, and they describe one set of
+# scopes (#275). .ceremony/LABELS.md names two of them — .github/labels.conf,
+# the definitions the state machine writes to GitHub, and CONTRIBUTING.md, the
+# list a contributor reads — and the path map the labeler job actually reads,
+# .github/labeler.yml, is a third it does not name because it is machinery
+# rather than definition. At 1fcd1b0 the three described three different sets.
+#
+# This is the block above's failure mode with one more file in it: two
+# documents drifted apart because nothing compared them. So the guard is the
+# same guard — extract, compare, name the symmetric difference in every
+# direction, and make an extraction that reads nothing a red of its own rather
+# than two empty sets agreeing.
+#
+# WHAT IT CATCHES, stated exactly, because the honest bound is part of the
+# spec (#275 D2): the scope NAMES. A scope minted into one of the three files
+# and forgotten in the other two reds here, which is the class a future scope
+# mint hits. It does NOT compare a glob to a prose description — nothing can —
+# so it would not have caught any of the three drifts that motivated it. Those
+# were fixed by hand in this diff, and the pins further down are pins on three
+# named strings, not a comparator.
+# ---------------------------------------------------------------------------
+SCOPEWORK="$(mktemp -d)"
+
+# Three extractors, one per file, each emitting one scope name per line in
+# file order. Each is anchored to the shape its own file uses, so that a
+# reader of the OTHER shape — a `scope:` mentioned in labeler.yml's header
+# comment, a backticked scope name in CONTRIBUTING's prose — is not read as a
+# member. That is the same bound doc_panel above carries for dan-claude-bot.
+yml_scopes() {   # yml_scopes <labeler.yml>
+  sed -n 's/^"\(scope:[A-Za-z0-9-]*\)":$/\1/p' "$1"
+}
+conf_scopes() {  # conf_scopes <labels.conf>
+  sed -n 's/^\(scope:[A-Za-z0-9-]*\)|.*$/\1/p' "$1"
+}
+# Bounded at the next heading like doc_panel, and for the same reason: a
+# same-shaped bullet in a later section is not the scope list.
+doc_scopes() {   # doc_scopes <CONTRIBUTING.md>
+  # shellcheck disable=SC2016  # the backticks are markdown in the file being read
+  sed -n '/^## Scope labels$/,/^## /p' "$1" \
+    | sed -n 's/^- `\(scope:[A-Za-z0-9-]*\)` —.*$/\1/p'
+}
+
+# scope_name_sets_agree [<labeler.yml> [<labels.conf> [<CONTRIBUTING.md>]]] —
+# the repo's own by default. Three sets means six ordered directions, and all
+# six are reported: with two files "they disagree" leaves only one question,
+# with three it leaves three, so the message has to say which file is missing
+# which name from which.
+scope_name_sets_agree() {
+  ( set -u
+    yml="${1:-$ROOT/.github/labeler.yml}"
+    conf="${2:-$ROOT/.github/labels.conf}"
+    doc="${3:-$ROOT/CONTRIBUTING.md}"
+    in_yml="$(yml_scopes "$yml" | sort -u)"
+    in_conf="$(conf_scopes "$conf" | sort -u)"
+    in_doc="$(doc_scopes "$doc" | sort -u)"
+    [ -n "$in_yml" ]  || { echo "no scope keys read out of $yml"; exit 1; }
+    [ -n "$in_conf" ] || { echo "no scope rows read out of $conf"; exit 1; }
+    [ -n "$in_doc" ]  || { echo "no scope bullets read out of $doc's ## Scope labels"; exit 1; }
+    bad=0
+    # Every ordered pair of the three, which is the six directions. `$yml`,
+    # `$conf` and `$doc` hold the file names and `$in_*` the sets, so one
+    # indirection over the same three keys reaches both.
+    for a in yml conf doc; do
+      for b in yml conf doc; do
+        [ "$a" = "$b" ] && continue
+        a_set="in_$a"; b_set="in_$b"
+        only_a="$(comm -23 <(printf '%s\n' "${!a_set}") <(printf '%s\n' "${!b_set}") | tr '\n' ' ')"
+        if [ -n "${only_a% }" ]; then
+          [ "$bad" -eq 0 ] && echo "the three scope maps disagree:"
+          echo "  listed in ${!a}, absent from ${!b}: ${only_a% }"
+          bad=1
+        fi
+      done
+    done
+    exit "$bad" )
+}
+check "scope: the three files name the same set of scopes" 0 "" scope_name_sets_agree
+# Six in, six out (#275 D3). Asserted as a count rather than left implied by
+# the agreement above, which a diff retiring one scope from all three files
+# would pass.
+scope_counts() {   # scope_counts — "<yml> <conf> <doc>" scope counts
+  ( set -u
+    n() { sort -u | grep -c . ; }
+    printf '%s %s %s\n' \
+      "$(yml_scopes  "$ROOT/.github/labeler.yml" | n)" \
+      "$(conf_scopes "$ROOT/.github/labels.conf" | n)" \
+      "$(doc_scopes  "$ROOT/CONTRIBUTING.md"     | n)" )
+}
+check "scope: there are six of them, in every file" 0 "6 6 6" scope_counts
+
+# --- the extraction is bounded ---------------------------------------------
+# CONTRIBUTING's heading bound, proven as the panel block proves its own: a
+# bullet of the scope shape in a later section is not a scope.
+awk '{ print } END { print ""; print "## Later"; print ""; print "- `scope:zzz` — not a scope" }' \
+  "$ROOT/CONTRIBUTING.md" > "$SCOPEWORK/later.md"
+check "scope: a same-shaped bullet in a LATER section is not read as a scope" 0 "" \
+  scope_name_sets_agree "$ROOT/.github/labeler.yml" "$ROOT/.github/labels.conf" "$SCOPEWORK/later.md"
+# labeler.yml's own header comment says the word `scope:*`; the key anchor is
+# what keeps it out. Asserted directly rather than left to the sets happening
+# to match, exactly as doc_panel_omits_triage is.
+yml_scopes_omit_the_header() {
+  ( set -u
+    yml_scopes "$ROOT/.github/labeler.yml" | grep '[*]' \
+      && { echo "labeler.yml's header prose was read as a scope name"; exit 1; }
+    exit 0 )
+}
+check "scope: labeler.yml's header comment is not read as a scope" 0 "" \
+  yml_scopes_omit_the_header
+
+# --- and it fails, in all six directions ------------------------------------
+# One extra scope in one file is absent from the other two, so each fixture
+# below carries two of the six directions and the three carry all six. Each is
+# asserted by its exact message, so a guard that reported only "they disagree"
+# would pass none of them.
+awk '{ print } END { print "\"scope:zzz\":"; print "  - changed-files:"; print "      - any-glob-to-any-file: [\"zzz/**\"]" }' \
+  "$ROOT/.github/labeler.yml" > "$SCOPEWORK/extra.yml"
+check "scope: a scope in labeler.yml alone reds — absent from labels.conf" 1 \
+  "listed in $SCOPEWORK/extra.yml, absent from $ROOT/.github/labels.conf: scope:zzz" \
+  scope_name_sets_agree "$SCOPEWORK/extra.yml" "$ROOT/.github/labels.conf" "$ROOT/CONTRIBUTING.md"
+check "scope: ...and absent from CONTRIBUTING.md — the second direction" 1 \
+  "listed in $SCOPEWORK/extra.yml, absent from $ROOT/CONTRIBUTING.md: scope:zzz" \
+  scope_name_sets_agree "$SCOPEWORK/extra.yml" "$ROOT/.github/labels.conf" "$ROOT/CONTRIBUTING.md"
+awk '{ print } END { print "scope:zzz|C5DEF5|not a scope" }' \
+  "$ROOT/.github/labels.conf" > "$SCOPEWORK/extra.conf"
+check "scope: a scope in labels.conf alone reds — absent from labeler.yml" 1 \
+  "listed in $SCOPEWORK/extra.conf, absent from $ROOT/.github/labeler.yml: scope:zzz" \
+  scope_name_sets_agree "$ROOT/.github/labeler.yml" "$SCOPEWORK/extra.conf" "$ROOT/CONTRIBUTING.md"
+check "scope: ...and absent from CONTRIBUTING.md — the fourth direction" 1 \
+  "listed in $SCOPEWORK/extra.conf, absent from $ROOT/CONTRIBUTING.md: scope:zzz" \
+  scope_name_sets_agree "$ROOT/.github/labeler.yml" "$SCOPEWORK/extra.conf" "$ROOT/CONTRIBUTING.md"
+# The bullet goes INSIDE the section this time, which is what makes it a
+# disagreement rather than the bounded-extraction case above.
+awk '{ print } /^- `scope:drill`/ { print "- `scope:zzz` — not a scope" }' \
+  "$ROOT/CONTRIBUTING.md" > "$SCOPEWORK/extra.md"
+check "scope: a scope in CONTRIBUTING.md alone reds — absent from labeler.yml" 1 \
+  "listed in $SCOPEWORK/extra.md, absent from $ROOT/.github/labeler.yml: scope:zzz" \
+  scope_name_sets_agree "$ROOT/.github/labeler.yml" "$ROOT/.github/labels.conf" "$SCOPEWORK/extra.md"
+check "scope: ...and absent from labels.conf — the sixth direction" 1 \
+  "listed in $SCOPEWORK/extra.md, absent from $ROOT/.github/labels.conf: scope:zzz" \
+  scope_name_sets_agree "$ROOT/.github/labeler.yml" "$ROOT/.github/labels.conf" "$SCOPEWORK/extra.md"
+# A scope DELETED from one file lands in directions the three fixtures above
+# already cover — the other two files hold a name this one does not. It is
+# here because it is the shape a real edit takes (a scope retired from
+# labels.conf and left in the map), and because it proves the comparison is
+# not pinned to the repo's own copies in any of the three positions.
+grep -v '^scope:host|' "$ROOT/.github/labels.conf" > "$SCOPEWORK/short.conf"
+check "scope: a scope dropped from labels.conf reds too" 1 "scope:host" \
+  scope_name_sets_agree "$ROOT/.github/labeler.yml" "$SCOPEWORK/short.conf" "$ROOT/CONTRIBUTING.md"
+
+# --- an extraction that reads nothing is a failure, not an agreement --------
+# Three empty sets are equal, so each file's "read nothing" is its own red:
+# a renamed heading, a labels edit that drops the rows, a map rewritten in a
+# shape the anchor does not match.
+sed 's/^## Scope labels$/## Areas/' "$ROOT/CONTRIBUTING.md" > "$SCOPEWORK/noheading.md"
+check "scope: a renamed section is a red, not three empty sets agreeing" 1 "no scope bullets" \
+  scope_name_sets_agree "$ROOT/.github/labeler.yml" "$ROOT/.github/labels.conf" "$SCOPEWORK/noheading.md"
+grep -v '^scope:' "$ROOT/.github/labels.conf" > "$SCOPEWORK/noscopes.conf"
+check "scope: a labels.conf with no scope rows is a red as well" 1 "no scope rows" \
+  scope_name_sets_agree "$ROOT/.github/labeler.yml" "$SCOPEWORK/noscopes.conf" "$ROOT/CONTRIBUTING.md"
+sed 's/^"scope:/"area:/' "$ROOT/.github/labeler.yml" > "$SCOPEWORK/renamed.yml"
+check "scope: a labeler.yml naming no scope keys is a red as well" 1 "no scope keys" \
+  scope_name_sets_agree "$SCOPEWORK/renamed.yml" "$ROOT/.github/labels.conf" "$ROOT/CONTRIBUTING.md"
+
+# ---------------------------------------------------------------------------
+# What the name-set guard above cannot see: which PATHS a scope attaches to.
+# That is where all three of #275's drifts lived, and it is not a comparison
+# any check can make — a glob and an English sentence are not comparable. What
+# IS checkable is the glob half on its own: given labeler.yml, which scopes
+# does a one-path diff land? So the three cases the issue names are asserted
+# as derivations rather than asserted in prose.
+#
+# scope_of reimplements one narrow slice of actions/labeler, which is only
+# honest if the slice is pinned. Two pins do that: every matcher key in the
+# file is `any-glob-to-any-file` (the ANY semantics this assumes), and every
+# glob is either an exact path or a `<dir>/**` prefix (the only two forms this
+# matches). A file that grows a third shape reds on those pins instead of
+# being silently mismatched here.
+# ---------------------------------------------------------------------------
+labeler_matchers_are_any_to_any() {   # [<labeler.yml>]
+  ( set -u
+    other="$(grep -E '^[[:space:]]*-[[:space:]]*[a-z-]+-glob-to-[a-z-]+:' \
+               "${1:-$ROOT/.github/labeler.yml}" | grep -v 'any-glob-to-any-file:')"
+    [ -z "$other" ] \
+      || { echo "a matcher other than any-glob-to-any-file:"; printf '%s\n' "$other"; exit 1; }
+    exit 0 )
+}
+check "scope: every matcher in labeler.yml is any-glob-to-any-file" 0 "" \
+  labeler_matchers_are_any_to_any
+
+# labeler_globs <labeler.yml> — "<scope> <glob>" per line. The scope key is the
+# only quoted string on its own line; every glob lives on a line carrying the
+# list's `[`, in either of the two layouts the file uses (inline, or wrapped
+# onto the next line).
+labeler_globs() {
+  awk '
+    /^"scope:[A-Za-z0-9-]*":$/ { scope = $0; gsub(/^"|":$/, "", scope); next }
+    /\[/ {
+      line = $0
+      while (match(line, /"[^"]+"/)) {
+        printf "%s %s\n", scope, substr(line, RSTART + 1, RLENGTH - 2)
+        line = substr(line, RSTART + RLENGTH)
+      }
+    }
+  ' "$1"
+}
+glob_matches() {   # glob_matches <glob> <path>
+  case "$1" in
+    */'**')  case "$2" in "${1%/**}"/*) return 0 ;; esac; return 1 ;;
+    *)       [ "$1" = "$2" ] ;;
+  esac
+}
+labeler_globs_are_a_shape_this_matches() {   # [<labeler.yml>]
+  ( set -u
+    bad=0
+    while read -r _scope glob; do
+      case "$glob" in
+        */'**')                     ;;   # a directory prefix
+        *'*'*|*'?'*|*'['*|*'{'*)
+          echo "glob '$glob' is neither an exact path nor a <dir>/** prefix"; bad=1 ;;
+        *)                          ;;   # an exact path
+      esac
+    done <<EOF
+$(labeler_globs "${1:-$ROOT/.github/labeler.yml}")
+EOF
+    exit "$bad" )
+}
+check "scope: every glob is an exact path or a <dir>/** prefix" 0 "" \
+  labeler_globs_are_a_shape_this_matches
+sed 's#"drill/\*\*"#"drill/*.sh"#' "$ROOT/.github/labeler.yml" > "$SCOPEWORK/oddglob.yml"
+check "scope: ...and a glob outside that subset reds rather than being mismatched" 1 \
+  "neither an exact path nor a <dir>/** prefix" \
+  labeler_globs_are_a_shape_this_matches "$SCOPEWORK/oddglob.yml"
+
+scope_of() {   # scope_of <path> [<labeler.yml>]
+  ( set -u
+    path="$1"
+    while read -r scope glob; do
+      glob_matches "$glob" "$path" && echo "$scope"
+    done <<EOF
+$(labeler_globs "${2:-$ROOT/.github/labeler.yml}")
+EOF
+  ) | sort -u
+}
+scope_of_is() {   # scope_of_is <labeler.yml> <path> [<expected scope>...]
+  ( set -u
+    yml="$1"; path="$2"; shift 2
+    want=""
+    if [ "$#" -gt 0 ]; then want="$(printf '%s\n' "$@" | sort -u | tr '\n' ' ')"; fi
+    got="$(scope_of "$path" "$yml" | tr '\n' ' ')"
+    [ "${got% }" = "${want% }" ] \
+      || { echo "a $path-only diff lands [${got% }]; expected [${want% }]"; exit 1; }
+    exit 0 )
+}
+LABELER="$ROOT/.github/labeler.yml"
+# The three cases #275 names, each a one-path diff landing the scope its
+# definitions name. drills/0.11.0.md is the one worth showing rather than
+# asserting: it is the shape every release window produces (#253) and it
+# landed NO scope at all before this change.
+check "scope: a drills/*.md-only diff lands scope:drill" 0 "" \
+  scope_of_is "$LABELER" drills/0.11.0.md scope:drill
+check "scope: a test/cli.sh-only diff lands scope:cli" 0 "" \
+  scope_of_is "$LABELER" test/cli.sh scope:cli
+check "scope: a profiles/*-only diff lands scope:templates" 0 "" \
+  scope_of_is "$LABELER" profiles/box-profile.yaml scope:templates
+# ...and the change narrows nothing (#275 D1's rule and its test plan's
+# must-pass): every attachment that stood before this diff still stands.
+check "scope: bin/box still lands scope:cli" 0 "" \
+  scope_of_is "$LABELER" bin/box scope:cli
+check "scope: drill/ — the rehearsal machinery — still lands scope:drill" 0 "" \
+  scope_of_is "$LABELER" drill/doctor.sh scope:drill
+check "scope: templates/ still lands scope:templates" 0 "" \
+  scope_of_is "$LABELER" templates/box-init.sh scope:templates
+check "scope: install.sh still lands scope:installer" 0 "" \
+  scope_of_is "$LABELER" install.sh scope:installer
+check "scope: host/ still lands scope:host" 0 "" \
+  scope_of_is "$LABELER" host/setup-host.sh scope:host
+# Two scopes on one path is not a collision to fix: drill/multiuser.sh is
+# globbed by both and always has been. Pinned so that a later narrowing of
+# either glob has to argue with a check.
+check "scope: host/grant-user.sh lands scope:tiers and scope:host" 0 "" \
+  scope_of_is "$LABELER" host/grant-user.sh scope:host scope:tiers
+check "scope: drill/multiuser.sh lands scope:tiers and scope:drill" 0 "" \
+  scope_of_is "$LABELER" drill/multiuser.sh scope:drill scope:tiers
+# A path no scope claims lands nothing, which is what makes the two reds below
+# mean what they say rather than being satisfied by a matcher that matches
+# everything.
+check "scope: an unclaimed path lands no scope" 0 "" \
+  scope_of_is "$LABELER" README.md
+
+# --- and the two globs this diff moved are reds if they are reverted --------
+sed 's#\["drill/\*\*", "drills/\*\*"\]#["drill/**"]#' "$LABELER" > "$SCOPEWORK/nodrills.yml"
+check "scope: labeler.yml without drills/** leaves a drill record unlabelled" 1 \
+  "lands []" scope_of_is "$SCOPEWORK/nodrills.yml" drills/0.11.0.md scope:drill
+sed 's#\["bin/\*\*", "test/cli.sh"\]#["bin/**"]#' "$LABELER" > "$SCOPEWORK/nocli.yml"
+check "scope: labeler.yml without test/cli.sh leaves a harness diff unlabelled" 1 \
+  "lands []" scope_of_is "$SCOPEWORK/nocli.yml" test/cli.sh scope:cli
+
+# ---------------------------------------------------------------------------
+# The definitions' half of the same three cases. These are PINS ON THREE NAMED
+# STRINGS and nothing more: they red if this diff's descriptions are reverted
+# to the ones that disagreed with the map, and they say nothing at all about
+# any scope row that moves next. The general comparison is the one D2 rules
+# out — a glob against an English sentence — so what is written here is the
+# repo's grep-the-load-bearing-line idiom, at the three lines this issue moved.
+# ---------------------------------------------------------------------------
+conf_desc() {   # conf_desc <labels.conf> <scope>
+  awk -F'|' -v s="$2" '$1 == s { print $3 }' "$1"
+}
+doc_desc() {    # doc_desc <CONTRIBUTING.md> <scope>
+  sed -n '/^## Scope labels$/,/^## /p' "$1" \
+    | sed -n "s/^- \`$2\` — //p"
+}
+scope_definitions_name_their_surfaces() {   # [<labels.conf> [<CONTRIBUTING.md>]]
+  ( set -u
+    conf="${1:-$ROOT/.github/labels.conf}"; doc="${2:-$ROOT/CONTRIBUTING.md}"
+    bad=0
+    while IFS='|' read -r scope where needle; do
+      [ -n "$scope" ] || continue
+      case "$where" in
+        conf) file="$conf"; have="$(conf_desc "$conf" "$scope")" ;;
+        *)    file="$doc";  have="$(doc_desc "$doc" "$scope")"   ;;
+      esac
+      case "$have" in
+        *"$needle"*) ;;
+        *) echo "$file's $scope description does not name '$needle': [$have]"; bad=1 ;;
+      esac
+    done <<'ROWS'
+scope:cli|conf|test/cli.sh
+scope:cli|doc|test/cli.sh
+scope:drill|conf|drills/
+scope:drill|doc|drills/
+scope:templates|conf|profiles/
+scope:templates|doc|profile
+ROWS
+    exit "$bad" )
+}
+check "scope: both definitions of the three moved scopes name their surfaces" 0 "" \
+  scope_definitions_name_their_surfaces
+# Reverted in each file, one case per direction the issue's table named.
+sed 's#^scope:cli|C5DEF5|.*$#scope:cli|C5DEF5|bin/box — the command surface#' \
+  "$ROOT/.github/labels.conf" > "$SCOPEWORK/oldcli.conf"
+check "scope: labels.conf saying scope:cli is bin/box alone reds" 1 "does not name 'test/cli.sh'" \
+  scope_definitions_name_their_surfaces "$SCOPEWORK/oldcli.conf" "$ROOT/CONTRIBUTING.md"
+# shellcheck disable=SC2016  # ditto — a markdown bullet, not a command substitution
+sed 's#^- `scope:cli` — .*$#- `scope:cli` — `bin/box`, the command surface#' \
+  "$ROOT/CONTRIBUTING.md" > "$SCOPEWORK/oldcli.md"
+check "scope: ...and CONTRIBUTING.md saying it reds too — the other file" 1 "does not name 'test/cli.sh'" \
+  scope_definitions_name_their_surfaces "$ROOT/.github/labels.conf" "$SCOPEWORK/oldcli.md"
+sed 's#^scope:drill|C5DEF5|.*$#scope:drill|C5DEF5|drill/ — rehearsals, doctor, RUNS.md#' \
+  "$ROOT/.github/labels.conf" > "$SCOPEWORK/olddrill.conf"
+check "scope: labels.conf saying scope:drill is drill/ alone reds" 1 "does not name 'drills/'" \
+  scope_definitions_name_their_surfaces "$SCOPEWORK/olddrill.conf" "$ROOT/CONTRIBUTING.md"
+# shellcheck disable=SC2016  # ditto
+sed 's#^- `scope:drill` — .*$#- `scope:drill` — rehearsals, doctor, and run evidence#' \
+  "$ROOT/CONTRIBUTING.md" > "$SCOPEWORK/olddrill.md"
+check "scope: ...and CONTRIBUTING.md leaving the two directories unnamed reds" 1 "does not name 'drills/'" \
+  scope_definitions_name_their_surfaces "$ROOT/.github/labels.conf" "$SCOPEWORK/olddrill.md"
+sed 's#^scope:templates|C5DEF5|.*$#scope:templates|C5DEF5|templates/ — the box seeds#' \
+  "$ROOT/.github/labels.conf" > "$SCOPEWORK/oldtpl.conf"
+check "scope: labels.conf omitting profiles/ from scope:templates reds" 1 "does not name 'profiles/'" \
+  scope_definitions_name_their_surfaces "$SCOPEWORK/oldtpl.conf" "$ROOT/CONTRIBUTING.md"
+# Every scope description still fits GitHub's 100-character cap, which is not
+# decoration: the labels bootstrap aborted on the `operator` row at 106 on
+# 2026-08-29, and this diff lengthens three of these six.
+scope_descriptions_fit_githubs_cap() {   # [<labels.conf>]
+  awk -F'|' '
+    /^scope:/ && length($3) > 100 { printf "%s: %d chars\n", $1, length($3); bad = 1 }
+    END { exit bad ? 1 : 0 }' "${1:-$ROOT/.github/labels.conf}"
+}
+check "scope: every description fits GitHub's 100-char cap" 0 "" \
+  scope_descriptions_fit_githubs_cap
+rm -rf "$SCOPEWORK"
+
+# ---------------------------------------------------------------------------
 # One pin, everywhere this repository writes it (#219). ceremony's docs-sync
 # reads the ref from the single `uses:` line in release.yml and verifies
 # `.ceremony/` against that one line. Nothing reads the other eleven callers,

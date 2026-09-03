@@ -17,6 +17,11 @@
 "scope:templates":
   - changed-files:
       - any-glob-to-any-file: ["templates/**", "profiles/**"]
+# drill/ and drills/ are two directories, not a typo for one: drill/ is the
+# rehearsal machinery (drill.sh, doctor.sh, RUNS.md) and drills/ is the run
+# evidence (0.9.0.md, 0.9.1.md, …). Both definitions of this scope have always
+# said "run evidence"; only the glob was short, so a PR whose whole diff is the
+# next release's drill record landed with no scope at all (#275).
 "scope:drill":
   - changed-files:
-      - any-glob-to-any-file: ["drill/**"]
+      - any-glob-to-any-file: ["drill/**", "drills/**"]

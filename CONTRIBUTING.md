@@ -101,9 +101,9 @@ to reopen on. A box drill’s record names one candidate ref, box’s own.
 
 ## Scope labels
 
-- `scope:cli` — `bin/box`, the command surface
+- `scope:cli` — `bin/box` and its test harness `test/cli.sh`, the command surface
 - `scope:installer` — `install.sh`, versioned installs, upgrade/uninstall
 - `scope:host` — host setup, teardown, firewall, and isolation stack
 - `scope:tiers` — grant/revoke and multi-user boundaries
 - `scope:templates` — template and profile seeds
-- `scope:drill` — rehearsals, doctor, and run evidence
+- `scope:drill` — rehearsals, doctor, and run evidence: `drill/` and `drills/`
