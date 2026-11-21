@@ -803,18 +803,29 @@ printf '%s' "$out" | grep -q "NOW start (or restart) the service" \
   || no "(q) $ps_ is not boxnet-only"
 # From the service's own side of the socket, the way a daemon would reach it.
 svch="$(mktemp -d)"; chown "$US" "$svch"
-as_svc() { runuser -u "$US" -- env HOME="$svch" INCUS_CONF="$svch/incus" INCUS_SOCKET="$sockdir/unix.socket.user" "$@" </dev/null; }
+# No INCUS_SOCKET pin: a pinned socket asks about 'default' unless --project
+# is given (box itself passes none). Unpinned, the client falls back to
+# incus-user's socket and its own project — exactly what a real daemon does.
+as_svc() { runuser -u "$US" -- env HOME="$svch" INCUS_CONF="$svch/incus" "$@" </dev/null; }
 as_svc incus --project "$ps_" profile show box-profile >/dev/null 2>&1 \
   && ok "(q) the service reads its own box-profile over unix.socket.user" \
   || no "(q) the service cannot reach $ps_ over unix.socket.user"
-as_svc incus --project "$ps_" profile create drill-hostpath >/dev/null 2>&1
-as_svc incus --project "$ps_" profile device add drill-hostpath leak disk source=/etc path=/mnt/etc >/dev/null 2>&1 \
-  && no "(q) the service attached a HOST PATH (/etc) — managed-only is not enforced" \
-  || ok "(q) a host-path disk is refused from the service's side"
-as_svc incus --project "$ps_" profile delete drill-hostpath >/dev/null 2>&1
+# The path incus-user's DEFAULT would allow (the user's recorded home), so only
+# restricted.devices.disk=managed refuses it — /etc would be refused anyway.
+svchome="$(getent passwd "$US" | cut -d: -f6)"
+mkdir -p "$svchome"
+if as_svc incus --project "$ps_" profile create drill-hostpath >/dev/null 2>&1; then
+  as_svc incus --project "$ps_" profile device add drill-hostpath leak disk source="$svchome" path=/mnt/home >/dev/null 2>&1 \
+    && no "(q) the service attached its HOME ($svchome) — managed-only is not enforced" \
+    || ok "(q) a host-path disk is refused from the service's side, even under its own home"
+  as_svc incus --project "$ps_" profile delete drill-hostpath >/dev/null 2>&1
+else
+  no "(q) the service could not create a profile in its own project — the host-path probe proves nothing"
+fi
+rmdir "$svchome" 2>/dev/null
 # Minting through box itself, as the service: the same 'box new' a person
 # runs, honoring this drill's container mode.
-if as_svc box new drill-svc "${MODE[@]}" >/dev/null 2>&1; then
+if as_svc box new --name drill-svc "${MODE[@]}" >/dev/null 2>&1; then
   ok "(q) the service mints a box on boxnet through its grant (box new)"
   as_svc box rm drill-svc --force >/dev/null 2>&1
 else

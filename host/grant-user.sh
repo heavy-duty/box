@@ -207,12 +207,16 @@ backout() {
   fi
 }
 # A service's throwaway home, owned by it (the CLI writes its config there).
+# Under /tmp explicitly: root's own $TMPDIR may be a 0700 per-user dir
+# (libpam-tmpdir's /tmp/user/0) the service could never enter. Every step is
+# $SUDO's: a non-root admin runs this script too. The trap is set FIRST, and
+# a failed cleanup can never skip the group backout.
+cleanup_svc_home() { [ -z "$svc_home" ] || $SUDO rm -rf -- "$svc_home" || true; }
+trap 'cleanup_svc_home || true; backout' EXIT
 if [ "$service" -eq 1 ]; then
-  svc_home="$(mktemp -d)"
-  chown "$user" "$svc_home"
+  svc_home="$($SUDO mktemp -d /tmp/box-grant.XXXXXX)"
+  $SUDO chown "$user" "$svc_home"
 fi
-cleanup_svc_home() { [ -z "$svc_home" ] || rm -rf -- "$svc_home"; }
-trap 'cleanup_svc_home; backout' EXIT
 
 if id -nG "$user" | tr ' ' '\n' | grep -qx incus; then
   was_member=1
@@ -274,18 +278,25 @@ run_as_incus() {
 # 2. The project is created LAZILY, on the user's first contact with
 # incus-user — an admin cannot pre-create it (incus-user would fight over
 # it), so make that first contact happen now, as the user.
+preexisting=0
 if ! incus project show "$project" >/dev/null 2>&1 </dev/null; then
   echo "project: touching incus-user as $user to create $project..."
   # The touch's own stderr is kept (#281): swallowed, a client that failed
   # before it ever connected (no home for its config) read as incus-user's fault.
-  touch_err="$(run_as_incus timeout 60 incus project list 2>&1 >/dev/null)" || true
+  touch_rc=0
+  touch_err="$(run_as_incus timeout 60 incus project list 2>&1 >/dev/null)" || touch_rc=$?
   if ! incus project show "$project" >/dev/null 2>&1 </dev/null; then
     echo "box grant: incus-user did not create $project — is incus-user.socket healthy? (journalctl -u incus-user)" >&2
-    [ -z "$touch_err" ] || echo "  the touch as $user said: $touch_err" >&2
+    if [ "$touch_rc" -eq 124 ]; then
+      echo "  the touch as $user timed out after 60s" >&2
+    elif [ -n "$touch_err" ]; then
+      echo "  the touch as $user said: $touch_err" >&2
+    fi
     exit 1
   fi
   echo "project: $project created"
 else
+  preexisting=1
   echo "project: $project already exists"
 fi
 
@@ -335,12 +346,22 @@ incus project set "$project" restricted.backups allow </dev/null
 echo "backups: allowed ('box export' rides them, #70)"
 
 if [ "$service" -eq 1 ]; then
-  # No host paths for a service (#281): managed volumes only.
-  incus project set "$project" restricted.devices.disk managed </dev/null
+  # No host paths for a service (#281): managed volumes only. An instance that
+  # already carries a host-path disk blocks this — say which way out.
+  if ! err="$(incus project set "$project" restricted.devices.disk managed 2>&1 </dev/null)"; then
+    echo "box grant --service: could not limit $project to managed disks:" >&2
+    echo "  $err" >&2
+    echo "  (an instance with a host-path disk blocks this — remove the device or the instance, then re-run)" >&2
+    exit 1
+  fi
   echo "disks: managed volumes only (a service never mounts host paths)"
-  # The marker revoke and doctor read to tell a service from a person.
+  # The marker that tells a service grant from a person's (revoke reads it
+  # with #285; tools such as gig check it before they act).
   incus project set "$project" user.box.service true </dev/null
   echo "service: $project marked as a service grant"
+  if [ "$preexisting" -eq 1 ]; then
+    echo "service: $project existed before this grant — every step above re-hardened it"
+  fi
 fi
 
 # 7. The placement contract itself, installed into their project. Created if
@@ -367,7 +388,7 @@ else
 fi
 
 trap - EXIT   # converged and verified: the grant stands
-cleanup_svc_home
+cleanup_svc_home || true
 if [ "$service" -eq 1 ]; then
   echo "granted: service $user has its own project $project (boxnet-only, managed disks, box-profile)."
   echo "         It reaches it through incus-user's socket (unix.socket.user) with project=$project;"

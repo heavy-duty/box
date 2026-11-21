@@ -2424,7 +2424,12 @@ check "grant: the touch's stderr is kept, not swallowed (#281)" 0 "" \
 check "grant: the old swallowing touch is gone" 1 "" \
   grep -qF 'incus project list >/dev/null 2>&1 || true' "$ROOT/host/grant-user.sh"
 check "grant --service: the throwaway home is removed on every exit" 0 "" \
-  grep -qF "trap 'cleanup_svc_home; backout' EXIT" "$ROOT/host/grant-user.sh"
+  grep -qF "trap 'cleanup_svc_home || true; backout' EXIT" "$ROOT/host/grant-user.sh"
+check "grant --service: the throwaway home lives under /tmp, never root's TMPDIR" 0 "" \
+  grep -qF 'mktemp -d /tmp/box-grant.XXXXXX' "$ROOT/host/grant-user.sh"
+# shellcheck disable=SC2016  # the $-strings are literals in the target file
+check "grant --service: the home is made and handed over through \$SUDO" 0 "" \
+  grep -qF '$SUDO chown "$user" "$svc_home"' "$ROOT/host/grant-user.sh"
 check "revoke: group removal is the lockout" 0 "" \
   grep -qF 'gpasswd -d' "$ROOT/host/revoke-user.sh"
 # Group membership is read at login: purge must terminate live sessions (a
@@ -2441,7 +2446,7 @@ check "revoke: the purge asserts the certificate's absence too" 0 "" \
 # A failed grant must not leave a half-granted user: if THIS run added the
 # group, the exit path takes it back (and the trap disarms only on success).
 check "grant: backs out its own group-add on failure" 0 "" \
-  grep -qE "^trap '([a-z_]+; )?backout' EXIT" "$ROOT/host/grant-user.sh"
+  grep -qE "^trap '([a-z_]+( \|\| true)?; )?backout' EXIT" "$ROOT/host/grant-user.sh"
 check "grant: the back-out disarms on success" 0 "" \
   grep -qF 'trap - EXIT' "$ROOT/host/grant-user.sh"
 # The backout must VERIFY the removal and scream when it cannot — an
