@@ -38,6 +38,10 @@
 #      other user's RUNNING, an admin's stops the admin's own box in 'default'
 #      and reaches into no user-<uid> project, and 'all' is refused as a box
 #      name (#179)
+#   q. a SERVICE grant (#281): a --system user with no home and no shell is
+#      granted, its project is marked a service with managed disks only, a
+#      host-path disk is refused from its side, it mints on boxnet, and
+#      --service refuses an incus-admin member
 #
 # ok/no/note return 0 by design — the 'A && ok || no' idiom below is the
 # same one drill.sh is built on (and the reason for the SC2015 disable).
@@ -175,7 +179,7 @@ cleanup() {
   # when the drill dies before it gets there.
   box rm "$ADMINBOX" --force >/dev/null 2>&1 \
     && echo "  removed the admin's $ADMINBOX (criterion p)"
-  for u in "$U1" "$U2" boxdrill3 boxdrill4 boxdrill5; do
+  for u in "$U1" "$U2" boxdrill3 boxdrill4 boxdrill5 boxdrillsvc; do
     id "$u" >/dev/null 2>&1 || continue
     # A half-failed purge followed by userdel leaves a project owned by
     # nobody — and doctor's leftover check keys on the USER existing. Keep
@@ -766,6 +770,65 @@ else
   no "(o) after dropping incus-admin they see: '$(printf '%s' "$projects5" | tr '\n' ' ')' — grant's no-re-grant promise is false"
 fi
 aud "o. incus-admin-only grant: in-'incus'=$(id -nG "$U5" 2>/dev/null | tr ' ' '\n' | grep -cx incus), project '$p5' access='$acc5', post-drop projects='$(printf '%s' "$projects5" | tr '\n' ' ')'"
+
+phase "q. a service grant — no home, managed disks, fenced like a person (#281)"
+# A real service account: --system, no home, no login shell. A person's grant
+# died on it (the CLI wants ~/.config/incus before it connects, and the
+# swallowed touch blamed incus-user); --service gives the touch a throwaway
+# HOME and pins what a service must never do.
+US=boxdrillsvc
+useradd --system --no-create-home --shell /usr/bin/false "$US" 2>/dev/null
+uids="$(id -u "$US")"; ps_="user-$uids"
+[ ! -d "$(getent passwd "$US" | cut -d: -f6)" ] \
+  && ok "(q) $US has no home directory (the precondition this phase is for)" \
+  || note "(q) $US has a home after all — the no-home path is not exercised"
+out="$(box grant --service "$US" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "(q) box grant --service converges a homeless --system user (rc=0)"
+else
+  no "(q) box grant --service FAILED (rc=$rc):"
+  printf '%s\n' "$out" | tail -4 | sed 's/^/        /'
+fi
+printf '%s' "$out" | grep -q "NOW start (or restart) the service" \
+  && ok "(q) the grant states the grant-then-start contract" \
+  || no "(q) the grant never told the operator to start the service after it"
+[ "$(incus project get "$ps_" user.box.service 2>/dev/null)" = true ] \
+  && ok "(q) $ps_ is marked user.box.service=true" \
+  || no "(q) $ps_ carries no service marker"
+[ "$(incus project get "$ps_" restricted.devices.disk 2>/dev/null)" = managed ] \
+  && ok "(q) $ps_ allows managed disks only" \
+  || no "(q) $ps_ restricted.devices.disk = '$(incus project get "$ps_" restricted.devices.disk 2>/dev/null)'"
+[ "$(incus project get "$ps_" restricted.networks.access 2>/dev/null)" = boxnet ] \
+  && ok "(q) $ps_ is narrowed to boxnet like any granted project" \
+  || no "(q) $ps_ is not boxnet-only"
+# From the service's own side of the socket, the way a daemon would reach it.
+svch="$(mktemp -d)"; chown "$US" "$svch"
+as_svc() { runuser -u "$US" -- env HOME="$svch" INCUS_CONF="$svch/incus" INCUS_SOCKET="$sockdir/unix.socket.user" "$@" </dev/null; }
+as_svc incus --project "$ps_" profile show box-profile >/dev/null 2>&1 \
+  && ok "(q) the service reads its own box-profile over unix.socket.user" \
+  || no "(q) the service cannot reach $ps_ over unix.socket.user"
+as_svc incus --project "$ps_" profile create drill-hostpath >/dev/null 2>&1
+as_svc incus --project "$ps_" profile device add drill-hostpath leak disk source=/etc path=/mnt/etc >/dev/null 2>&1 \
+  && no "(q) the service attached a HOST PATH (/etc) — managed-only is not enforced" \
+  || ok "(q) a host-path disk is refused from the service's side"
+as_svc incus --project "$ps_" profile delete drill-hostpath >/dev/null 2>&1
+# Minting through box itself, as the service: the same 'box new' a person
+# runs, honoring this drill's container mode.
+if as_svc box new drill-svc "${MODE[@]}" >/dev/null 2>&1; then
+  ok "(q) the service mints a box on boxnet through its grant (box new)"
+  as_svc box rm drill-svc --force >/dev/null 2>&1
+else
+  no "(q) the service could not 'box new' in its granted project"
+fi
+rm -rf "$svch"
+# --service refuses an incus-admin member: nothing could fence it.
+usermod -aG incus-admin "$US"
+out="$(box grant --service "$US" 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "which no grant can fence" \
+  && ok "(q) --service refuses an incus-admin member, by name" \
+  || no "(q) --service granted an incus-admin member (rc=$rc) — a fence that binds nothing"
+gpasswd -d "$US" incus-admin >/dev/null 2>&1
+aud "q. service grant: project '$ps_' service=$(incus project get "$ps_" user.box.service 2>/dev/null) disk=$(incus project get "$ps_" restricted.devices.disk 2>/dev/null) access=$(incus project get "$ps_" restricted.networks.access 2>/dev/null)"
 
 echo
 echo "════════════════════════════════════════════"

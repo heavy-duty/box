@@ -175,7 +175,7 @@ CMDS=(
   "incus^<box> -- <args...>^box^Escape hatch: run any incus command against a box^fn:cmd_incus^"
   "doctor^[--fix | --pin-dns]^^Is this host fit to mint boxes? Diagnose the daemon, network, DNS, isolation^fn:cmd_doctor^"
   "setup-host^^^One-time host setup: Incus, the boxnet stack, the profile, the firewall^fn:cmd_setup_host^"
-  "grant^<user>^^Admin: give a host user the restricted tier — their own boxes, on the hardened boxnet^fn:cmd_grant^"
+  "grant^[--service] <user>^^Admin: give a host user (or a service, --service) the restricted tier — their own boxes, on the hardened boxnet^fn:cmd_grant^"
   "revoke^<user> [--purge]^^Admin: take the restricted tier back (--purge also deletes their boxes)^fn:cmd_revoke^"
   "teardown-host^[--purge-incus]^^Remove the box host stack (both name generations)^fn:cmd_teardown_host^"
   "versions^^^List the installed box versions — the current default and the running one^fn:cmd_versions^"
@@ -940,7 +940,20 @@ import/rm on their own boxes. Not theirs: expose (edits daemon-global
 state), setup-host, grant. Admin boxes and other users' boxes are invisible to them, and the
 existing box-to-box drop means even their instances cannot reach a sibling.
 
+--service grants a SERVICE: a no-login system account a daemon runs as (a
+CI runner manager, say), fenced to its own project like any person (#281):
+  · no home needed — the grant's own incus calls run with a throwaway HOME
+  · managed disks only (restricted.devices.disk=managed): a service never
+    mounts host paths, so its secrets cannot ride into an instance
+  · the project is marked user.box.service=true
+  · refused for an incus-admin member: nothing could fence it
+A service reaches its project through incus-user's socket (unix.socket.user)
+with project=user-<uid>. Grant FIRST, then start the service: a service reads
+its groups once, at start, and one that touches incus-user before the grant
+creates an unhardened project.
+
   box grant dev1
+  box grant --service garm
 EOF
 ;;
     revoke) cat <<'EOF'

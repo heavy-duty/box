@@ -2344,6 +2344,11 @@ rm -f "$BINFN" "$HOSTFN"
 # The tier scripts parse and refuse bad usage without a daemon — drive them.
 check "grant: no argument is a usage error"      2 "usage: box grant"  bash "$ROOT/host/grant-user.sh"
 check "grant: a flag is not a user"              2 "usage: box grant"  bash "$ROOT/host/grant-user.sh" --frob
+check "grant: --service alone is a usage error"  2 "usage: box grant [--service] <user>"  bash "$ROOT/host/grant-user.sh" --service
+check "grant: two users is a usage error"        2 "usage: box grant"  bash "$ROOT/host/grant-user.sh" a b
+check "help grant documents --service (#281)"    0 "box grant --service garm" "$BOX" help grant
+check "help grant: a service gets managed disks only" 0 "restricted.devices.disk=managed" "$BOX" help grant
+check "help grant: grant first, then start the service" 0 "Grant FIRST, then start the service" "$BOX" help grant
 check "revoke: no argument is a usage error"     2 "usage: box revoke" bash "$ROOT/host/revoke-user.sh"
 check "revoke: two users is a usage error"       2 "usage: box revoke" bash "$ROOT/host/revoke-user.sh" a b
 check "box grant with no user exits 2 (via the CLI table)"  2 "usage: box grant"  "$BOX" grant
@@ -2402,6 +2407,24 @@ check "grant: unpins the private-bridge eth0 from the default profile" 0 "" \
   grep -qF 'profile device remove default eth0' "$ROOT/host/grant-user.sh"
 check "grant: an incus-admin member is provisioned, not refused (#99)" 1 "" \
   grep -qF 'there is nothing tighter to grant' "$ROOT/host/grant-user.sh"
+# --service (#281): the three differences from a person's grant, and the
+# refusal that keeps the fence honest.
+check "grant --service: pins managed disks (no host paths)" 0 "" \
+  grep -qE 'restricted\.devices\.disk managed' "$ROOT/host/grant-user.sh"
+check "grant --service: marks the project a service grant" 0 "" \
+  grep -qE 'user\.box\.service true' "$ROOT/host/grant-user.sh"
+check "grant --service: refuses an incus-admin member" 0 "" \
+  grep -qF 'which no grant can fence' "$ROOT/host/grant-user.sh"
+# shellcheck disable=SC2016  # the $-strings are literals in the target file
+check "grant --service: user-side calls run with a throwaway HOME" 0 "" \
+  grep -qF 'env HOME="$svc_home" INCUS_CONF="$svc_home/incus"' "$ROOT/host/grant-user.sh"
+# shellcheck disable=SC2016  # the $-strings are literals in the target file
+check "grant: the touch's stderr is kept, not swallowed (#281)" 0 "" \
+  grep -qF 'the touch as $user said' "$ROOT/host/grant-user.sh"
+check "grant: the old swallowing touch is gone" 1 "" \
+  grep -qF 'incus project list >/dev/null 2>&1 || true' "$ROOT/host/grant-user.sh"
+check "grant --service: the throwaway home is removed on every exit" 0 "" \
+  grep -qF "trap 'cleanup_svc_home; backout' EXIT" "$ROOT/host/grant-user.sh"
 check "revoke: group removal is the lockout" 0 "" \
   grep -qF 'gpasswd -d' "$ROOT/host/revoke-user.sh"
 # Group membership is read at login: purge must terminate live sessions (a
@@ -2418,7 +2441,7 @@ check "revoke: the purge asserts the certificate's absence too" 0 "" \
 # A failed grant must not leave a half-granted user: if THIS run added the
 # group, the exit path takes it back (and the trap disarms only on success).
 check "grant: backs out its own group-add on failure" 0 "" \
-  grep -qF 'trap backout EXIT' "$ROOT/host/grant-user.sh"
+  grep -qE "^trap '([a-z_]+; )?backout' EXIT" "$ROOT/host/grant-user.sh"
 check "grant: the back-out disarms on success" 0 "" \
   grep -qF 'trap - EXIT' "$ROOT/host/grant-user.sh"
 # The backout must VERIFY the removal and scream when it cannot — an

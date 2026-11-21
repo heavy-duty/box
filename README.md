@@ -333,6 +333,18 @@ shipped profile is installed into their project. Re-run
 `box grant <user>` after upgrading box to refresh the profile, like
 `setup-host` for the stack.
 
+**Services get the same tier** (#281). `box grant --service garm` grants a
+no-login system account a daemon runs as: its project is fenced exactly like a
+person's, plus managed disks only (`restricted.devices.disk=managed`, so a
+service never mounts host paths into an instance) and the
+`user.box.service=true` marker. The grant needs no home for the account, and
+it refuses an `incus-admin` member, whom nothing could fence. The service
+reaches its project through incus-user's socket (`unix.socket.user`) with
+`project=user-<uid>`. **Grant first, then start the service:** a service reads
+its groups once at start, and one that reaches incus-user before the grant
+creates an unhardened project. This is how other tools mint instances under
+box's contract without admin rights (heavy-duty/handbook proposal 0011).
+
 What a restricted user gets is the full contract: same ACL, same DNS
 isolation, same pinned resolver, same port isolation, same box↔box drop —
 and their boxes cannot reach another user's box, which is the same

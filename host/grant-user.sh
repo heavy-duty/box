@@ -33,11 +33,30 @@ set -euo pipefail
 self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 here="$(dirname "$(dirname "$self")")"
 
-usage() { echo "usage: box grant <user>" >&2; exit 2; }
+usage() { echo "usage: box grant [--service] <user>" >&2; exit 2; }
 
-[ $# -eq 1 ] || usage
-user="$1"
-case "$user" in -*) usage ;; esac
+# --service (#281): the user is a SERVICE, not a person — a no-login system
+# account a daemon runs as (gig's garm, heavy-duty/handbook proposal 0011).
+# Three things differ, each bought by how a person's grant would break it:
+#   · no usable home: the user-side incus calls get a throwaway HOME and
+#     INCUS_CONF, because the CLI wants ~/.config/incus before it connects and
+#     a --system account has none (the old '|| true' then blamed incus-user);
+#   · no host paths: incus-user's default lets a user attach disks under its
+#     home, which for a service means its own secrets mounted into an untrusted
+#     instance — the project is pinned to restricted.devices.disk=managed;
+#   · grant-then-start: a systemd service reads its groups once, at start, and
+#     a service that touches incus-user before the grant creates an unhardened
+#     project — the grant says so, and warns if the user already runs.
+service=0
+user=""
+for a in "$@"; do
+  case "$a" in
+    --service) service=1 ;;
+    -*) usage ;;
+    *) [ -z "$user" ] || usage; user="$a" ;;
+  esac
+done
+[ -n "$user" ] || usage
 
 # Root, or sudo — same decision, same reasons as setup-host.sh: granting
 # needs usermod and a run-as-the-user touch, both root's to give.
@@ -55,8 +74,12 @@ fi
 # exist there), sudo -u otherwise. -H so incus's client state lands in THEIR
 # home, not the admin's. stdin pinned: an incus client with a terminal on
 # stdin can go interactive and wedge a script that will never answer it.
+# The throwaway home a service's user-side incus calls run with (#281): made
+# below, once the user is known, and removed on every exit path.
+svc_home=""
 run_as() {
   local u="$1"; shift
+  if [ -n "$svc_home" ]; then set -- env HOME="$svc_home" INCUS_CONF="$svc_home/incus" "$@"; fi
   if [ -n "$SUDO" ]; then $SUDO -u "$u" -H -- "$@" </dev/null
   else runuser -u "$u" -- "$@" </dev/null
   fi
@@ -94,6 +117,18 @@ uid="$(id -u "$user")"
 admin_member=0
 if id -nG "$user" | tr ' ' '\n' | grep -qx incus-admin; then
   admin_member=1
+fi
+# A service in incus-admin is not fenced by anything this grant converges: the
+# admin socket wins (see the caveat at the end). The whole point of a service
+# grant is the fence, so refuse rather than hand out a project that binds
+# nothing (#281).
+if [ "$service" -eq 1 ] && [ "$admin_member" -eq 1 ]; then
+  echo "box grant --service: $user is in 'incus-admin', which no grant can fence; remove it first:  gpasswd -d $user incus-admin" >&2
+  exit 1
+fi
+if [ "$service" -eq 1 ] && pgrep -u "$user" >/dev/null 2>&1; then
+  echo "box grant --service: WARNING — processes owned by $user are running; they hold the groups they" >&2
+  echo "           started with. Restart the service after this grant (a service reads its groups at start)." >&2
 fi
 
 # The stack the tier converges ONTO must exist first. Checked via the daemon,
@@ -171,7 +206,13 @@ backout() {
     fi
   fi
 }
-trap backout EXIT
+# A service's throwaway home, owned by it (the CLI writes its config there).
+if [ "$service" -eq 1 ]; then
+  svc_home="$(mktemp -d)"
+  chown "$user" "$svc_home"
+fi
+cleanup_svc_home() { [ -z "$svc_home" ] || rm -rf -- "$svc_home"; }
+trap 'cleanup_svc_home; backout' EXIT
 
 if id -nG "$user" | tr ' ' '\n' | grep -qx incus; then
   was_member=1
@@ -235,9 +276,14 @@ run_as_incus() {
 # it), so make that first contact happen now, as the user.
 if ! incus project show "$project" >/dev/null 2>&1 </dev/null; then
   echo "project: touching incus-user as $user to create $project..."
-  run_as_incus timeout 60 incus project list >/dev/null 2>&1 || true
-  incus project show "$project" >/dev/null 2>&1 </dev/null \
-    || { echo "box grant: incus-user did not create $project — is incus-user.socket healthy? (journalctl -u incus-user)" >&2; exit 1; }
+  # The touch's own stderr is kept (#281): swallowed, a client that failed
+  # before it ever connected (no home for its config) read as incus-user's fault.
+  touch_err="$(run_as_incus timeout 60 incus project list 2>&1 >/dev/null)" || true
+  if ! incus project show "$project" >/dev/null 2>&1 </dev/null; then
+    echo "box grant: incus-user did not create $project — is incus-user.socket healthy? (journalctl -u incus-user)" >&2
+    [ -z "$touch_err" ] || echo "  the touch as $user said: $touch_err" >&2
+    exit 1
+  fi
   echo "project: $project created"
 else
   echo "project: $project already exists"
@@ -288,6 +334,15 @@ echo "snapshots: allowed"
 incus project set "$project" restricted.backups allow </dev/null
 echo "backups: allowed ('box export' rides them, #70)"
 
+if [ "$service" -eq 1 ]; then
+  # No host paths for a service (#281): managed volumes only.
+  incus project set "$project" restricted.devices.disk managed </dev/null
+  echo "disks: managed volumes only (a service never mounts host paths)"
+  # The marker revoke and doctor read to tell a service from a person.
+  incus project set "$project" user.box.service true </dev/null
+  echo "service: $project marked as a service grant"
+fi
+
 # 7. The placement contract itself, installed into their project. Created if
 # missing, refreshed unconditionally — same convergence discipline as
 # setup-host's own profile handling, so a box upgrade propagates by re-run.
@@ -312,6 +367,14 @@ else
 fi
 
 trap - EXIT   # converged and verified: the grant stands
+cleanup_svc_home
+if [ "$service" -eq 1 ]; then
+  echo "granted: service $user has its own project $project (boxnet-only, managed disks, box-profile)."
+  echo "         It reaches it through incus-user's socket (unix.socket.user) with project=$project;"
+  echo "         a Go client needs no config directory."
+  echo "         NOW start (or restart) the service: a service reads its groups when it starts."
+  exit 0
+fi
 if [ "$admin_member" -eq 1 ]; then
   # The honest version of what the old refusal was gesturing at. The project
   # is real, converged and theirs — that is what they were missing and what
