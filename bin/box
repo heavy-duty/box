@@ -197,7 +197,7 @@ CMDS=(
   "shell^<box>^box^Open a shell in a box, as its template's user^fn:cmd_shell^"
   "root^<box>^box^Open a root shell in a box — authorized by the host's Incus socket^fn:cmd_root^"
   "exec^<box> -- <cmd...>^box^Run a command inside a box^fn:cmd_exec^"
-  "tmux^<box> [<session>]^box^Attach or create a tmux session in a box — survives disconnects^fn:cmd_tmux^"
+  "tmux^^^Removed in 0.11.0 — see 'box help tmux' for the replacement^fn:cmd_tmux^"
   "snapshot^<box> [<label>]^box^Checkpoint a box (label defaults to manual-<epoch>)^fn:cmd_snapshot^"
   "restore^<box> <snapshot> [--force]^box,arg2,confirm^Roll a box back to one of its snapshots — irreversible, and it asks first^incus:snapshot restore^restored {} to {1}^roll {} back to snapshot '{1}' and discard everything in the box since it was taken"
   "export^<box> [<file>] [--instance-only]^box^Export a stopped box to one portable file — it survives 'box rm' and this host^fn:cmd_export^"
@@ -612,28 +612,22 @@ Run a command inside a box as its tenant user (default: 'dev', or whatever
 --user set at mint). Everything after -- is passed through untouched; the --
 is required, or box will read your command's flags as its own.
 
-  box exec work -- tmux ls
-  box exec work -- shellcheck --version
+  box exec work -- uname -a
+  box exec work -- cat /etc/os-release
 
 A blank box carries the seed and nothing else, so anything else — git, gh, an
 agent CLI — runs here only once you have converged it onto the box.
 EOF
 ;;
     tmux) cat <<'EOF'
-A shell that survives you. 'shell' is a child of the exec connection — if your
-terminal or SSH session drops, everything running in it is SIGHUP'd, and a
-long agent run dies with it. This attaches a tmux session instead
-(new-session -A): created if new, reattached if it exists — so starting work
-and resuming after a disconnect are the same command, with no state to
-remember.
+Removed in 0.11.0 (#253 D7, #289), with the tmux package. A session manager
+is operator convenience, not machine posture, so box neither installs nor
+drives one. The reason the verb existed still holds: a shell is a child of the
+exec connection, so when your terminal drops everything in it is SIGHUP'd and
+a long agent run dies with it. Run long work in a session manager your
+converger installed (an APT_EXTRAS entry in your role):
 
-The session name (default: main) buys parallel streams in one box:
-
-  box tmux work            # attach or create 'main'
-  box tmux work run-1      # a second, independent stream, same box
-
-Detach with Ctrl-b d; 'exit' ends the session. For a plain shell with none of
-tmux's semantics, 'box shell' is unchanged.
+  box exec --user <user> work -- tmux new-session -A -s main
 EOF
 ;;
     snapshot) cat <<'EOF'
@@ -962,7 +956,7 @@ they can step outside at will, and their own client keeps resolving to the
 admin socket (and the default project) until incus-admin is taken away. The
 grant says all of that out loud when it lands.
 
-The user's surface: new/list/info/shell/exec/tmux/snapshot/restore/export/
+The user's surface: new/list/info/shell/exec/snapshot/restore/export/
 import/rm on their own boxes. Not theirs: expose (edits daemon-global
 state), setup-host, grant. Admin boxes and other users' boxes are invisible to them, and the
 existing box-to-box drop means even their instances cannot reach a sibling.
@@ -2482,7 +2476,7 @@ cmd_new() {
     # it, the same scripting knob shape as BOX_CPU / BOX_MEMORY. The drill's
     # lore applies verbatim (RUNS.md trap 13): 'timeout -k' so a launch that
     # shrugs off TERM still dies, and stdin pinned like every other
-    # non-interactive incus call — only shell/exec/tmux may own the terminal.
+    # non-interactive incus call — only shell/exec may own the terminal.
     local budget="${BOX_LAUNCH_TIMEOUT:-600}" rc=0
     echo "box: launching instance $instance (incus launch, $m mode)..."
     timeout -k 5 "$budget" incus launch "$T_IMAGE" "$instance" --profile box-profile \
@@ -2550,7 +2544,7 @@ cmd_new() {
     # goes interactive — and when box's own output is redirected (a script, the
     # drill), the session can wedge open after the remote command has exited,
     # blocking forever on a websocket that will never close. Caught live: a
-    # mint stuck at 'status: done'. Only shell/exec/tmux may own the terminal.
+    # mint stuck at 'status: done'. Only shell/exec may own the terminal.
     # PYTHONUNBUFFERED: cloud-init's progress dots are block-buffered the
     # moment stdout is not a tty — a redirected mint (a script, the drill)
     # shows NOTHING for the whole install and then one burst at the end,
@@ -2901,18 +2895,14 @@ cmd_root()  { incus exec "$inst" -- bash -l; }
 # environment explicitly, but let the inner shell exec the original argv.
 cmd_exec()  { incus exec "$inst" -- sudo -u "$(box_user "$inst")" -H bash -lc 'cd ~ && exec "$@"' _ "${args[@]:1}"; }
 
-# A shell is a child of the exec connection: drop the terminal and everything
-# in it is SIGHUP'd — a long Claude run dies with it. tmux 'new-session -A'
-# attaches when the session exists and creates it when it doesn't, so starting
-# work and reattaching after a disconnect are the same command. 'shell' stays
-# bare on purpose — two verbs, two contracts. Unlike cmd_exec, tmux has no
-# caller-supplied command payload; its session name is validated below.
+# Removed with the tmux package (#289, #253 D7(a)): the verb goes with it, and
+# stays one release as a refusal carrying the replacement and the reason.
 cmd_tmux() {
-  local session="${args[1]:-main}"
-  case "$session" in
-    *[!A-Za-z0-9_-]*) usage_error "session names are letters, digits, '-' and '_' — got '$session'" ;;
-  esac
-  incus exec "$inst" -- sudo -u "$(box_user "$inst")" -i tmux new-session -A -s "$session"
+  echo "box: 'box tmux' is gone since 0.11.0 (#253) — box no longer installs tmux." >&2
+  echo "box: a shell dies with its exec connection (SIGHUP), so run long work in a" >&2
+  echo "box: session manager your converger installed:" >&2
+  echo "  box exec --user <user> <box> -- tmux new-session -A -s main" >&2
+  exit 2
 }
 
 cmd_snapshot() {

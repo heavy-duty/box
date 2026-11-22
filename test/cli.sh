@@ -82,6 +82,10 @@ check "new: ...and the refusal says to omit it and converge a role" 2 \
 check "new: --template staging-box teaches the flags that replace it (#288)" 2 \
   "box new --name staging-box --size medium --autostart --require-vm" \
   "$BOX" new --name work --template staging-box
+check "box tmux is refused, carrying the replacement (#289)" 2 \
+  "box exec --user <user> <box> -- tmux new-session -A -s main" "$BOX" tmux work
+check "box tmux: ...and the reason the verb existed (SIGHUP)" 2 "SIGHUP" "$BOX" tmux work
+check "help: no tmux verb in the listing's live commands (#289)" 1 "" bash -c '"$1" help | grep -E "^  tmux " | grep -qv "Removed"' _ "$BOX"
 check "box templates is refused, naming where roles live (#288)" 2 \
   "box has no templates since 0.11.0" "$BOX" templates
 check "new: --from refuses --autostart (the source's boot demands ride along)" 2 \
@@ -1555,8 +1559,8 @@ check "tenant seed: chrony and its makestep drop-in ship (#174)" 0 "" \
 check "tenant seed: the container-aware chrony start survives (#174)" 0 "" \
   grep -q 'systemd-detect-virt --quiet --container || systemctl start chrony' "$SEEDLOG"
 # shellcheck disable=SC2016  # $1 expands in the child shell, by design
-check "tenant seed: tmux, curl and ca-certificates ship (#65, #214)" 0 "" \
-  bash -c 'for pkg in tmux curl ca-certificates; do
+check "tenant seed: curl and ca-certificates ship (#214)" 0 "" \
+  bash -c 'for pkg in curl ca-certificates; do
              grep -qE "^[[:space:]]*-[[:space:]]+$pkg\$" "$1" || exit 1; done' _ "$SEEDLOG"
 check "tenant seed: package_update is on — the seed installs packages (#214)" 0 "" \
   grep -qE '^package_update: true$' "$SEEDLOG"
@@ -1648,9 +1652,8 @@ for d in "$ROOT"/seed/; do
   # unlocked would trade one door for another.
   check "template '$t': the tenant password stays locked (#177)" 0 "" \
     grep -qE '^[[:space:]]*lock_passwd: true$' "$d/user-data.yaml"
-  # #65: 'box tmux' runs 'tmux new-session' INSIDE the box, so every
-  # template's package list must carry tmux or the verb dies inside.
-  check "template '$t': installs tmux (#65)" 0 "" \
+  # #289: 'box tmux' went with the package (#253 D7(a)); the seed carries none.
+  check "template '$t': installs no tmux (#289)" 1 "" \
     grep -qE '^[[:space:]]*-[[:space:]]+tmux$' "$d/user-data.yaml"
   # #174: host suspend can leave a guest hours adrift. Every discovered
   # template therefore installs chrony, gives it an unlimited post-start

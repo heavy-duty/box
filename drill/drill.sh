@@ -1844,9 +1844,9 @@ box info drill | grep -q 'pristine' && ok "info lists the automatic pristine sna
 # that directly ("blank box has no claude — nobody home, as designed"). What
 # the tenant seed itself ships is the thin floor, so probe THAT instead: it is
 # box's own payload, and the one the seed can still be held to.
-box exec drill -- tmux -V >/dev/null 2>&1 \
-  && ok "tmux is installed in the box — 'box tmux' has something to run (#65)" \
-  || no "'tmux -V' failed inside the box — the seed's own payload did not land"
+box exec drill -- sh -c 'command -v tmux' >/dev/null 2>&1 \
+  && no "tmux is still in a fresh mint — the seed should carry none since #289" \
+  || ok "a fresh mint carries no tmux — 'box tmux' left with the package (#289)"
 box exec drill -- shellcheck --version >/dev/null 2>&1 \
   && ok "the seed's unprivileged toolchain landed (shellcheck, #177 decision 3)" \
   || no "'shellcheck --version' failed inside the box — the seed's toolchain did not land"

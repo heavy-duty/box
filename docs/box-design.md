@@ -80,7 +80,7 @@ instead of pretending to sanitize it.
 ## One seed: box mints, it does not converge (#81, #159, #214)
 
 Every ordinary mint uses one **thin, creds-free seed** — base image, the tenant
-user (`dev`, or `--user`), tmux, curl, ca-certificates, chrony, and the
+user (`dev`, or `--user`), curl, ca-certificates, chrony, and the
 unprivileged tool floor: no sudoers entry, `python3-venv`, `shellcheck`, a
 fixed 1GiB `/tmp` and a 4GiB swapfile in VM mode. There is no role axis and no
 second shape; the seed collapsed to the agent-class hygiene because that is the

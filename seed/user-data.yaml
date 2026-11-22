@@ -24,7 +24,6 @@ users:
     shell: /bin/bash
     lock_passwd: true
 package_update: true
-# tmux: 'box tmux' runs 'tmux new-session' INSIDE the box (#65).
 # curl + ca-certificates: they no longer carry box's installer — they carry
 # the OPERATOR's (#214). The first line of the by-hand converge is a
 # 'curl … | bash' run as root inside this box, so a seed that dropped them
@@ -106,7 +105,6 @@ write_files:
       q /tmp     1777 root root 1d
       q /var/tmp 1777 root root 30d
 packages:
-  - tmux
   - curl
   - ca-certificates
   - chrony

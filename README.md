@@ -417,7 +417,7 @@ box shell work                      # enter as the tenant user (default: dev)
 ```
 
 **That box is blank, and blank is literal.** The seed carries a tenant user, a
-fixed 1GiB `/tmp`, swap, chrony, `tmux`, `curl`, `ca-certificates`,
+fixed 1GiB `/tmp`, swap, chrony, `curl`, `ca-certificates`,
 `python3-venv` and `shellcheck` — that list is the whole of it. There is no
 coding agent on it, and **no `gh`**; the tenant has no sudo, so it cannot
 `apt install` one either. Authenticating is therefore not the first thing you
@@ -473,7 +473,7 @@ There is no role axis and no `--role` flag. The public mint shapes are:
 | `--size medium --autostart --require-vm` | The old `staging-box` template as flags (#288): VM-only, back after a host reboot |
 
 **The seed is thin and it is the whole of what box installs.** It carries the
-tenant user, `tmux`, `curl`, `ca-certificates`, `chrony`, `python3-venv` and
+tenant user, `curl`, `ca-certificates`, `chrony`, `python3-venv` and
 `shellcheck`, caps `/tmp` at a fixed 1GiB and lays a 4GiB swapfile in VM mode
 — and nothing that joins a tailnet or admits a credential. `curl` and
 `ca-certificates` are there for **your** installer, not box's: the first line
@@ -545,7 +545,7 @@ form). Resolution is `--cpu/--memory/--disk` > `BOX_*` environment >
 The default mint path defaults to `small`. Named sizes apply to fresh mints; `--from` clones keep the explicit
 `--cpu`/`--memory`/`--disk` override surface.
 The selected seed, its generation and the resolved user are stamped onto the
-instance, so `shell`, `exec` and `tmux` land in the right user — and a clone
+instance, so `shell` and `exec` land in the right user — and a clone
 still knows, because `incus copy` carries the metadata. `box checkup <box>`
 reports that generation; an older box with no marker says it is unknown rather
 than guessing from the guest's current contents.
@@ -576,7 +576,7 @@ Every fresh mint marks a snapshot called `pristine`
 ([#104](https://github.com/heavy-duty/box/issues/104)) at the one moment it
 is true: **after cloud-init, before anything converges the box.** At that
 instant the guest is pristine Debian plus box's thin seed — the tenant user,
-tmux, the toolchain — and nothing else. It exists for a few seconds on every
+the toolchain — and nothing else. It exists for a few seconds on every
 mint, so box captures it rather than asking you to be quick.
 
 ```sh
@@ -672,7 +672,6 @@ box info <box>               # one box: state, IP, exposures, provenance, snapsh
 box shell <box>              # enter as the stamped tenant user
 box root <box>               # enter as root through the host's Incus authorization
 box exec <box> -- <cmd...>   # run a command in the box
-box tmux <box> [session]     # attach/create a tmux session — survives disconnects
 box snapshot <box> [label]   # checkpoint (label defaults to manual-<epoch>)
 box restore <box> <snap> [--force]
                              # roll back to a snapshot — destructive, asks first
