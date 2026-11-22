@@ -874,13 +874,13 @@ as_svc incus --project "$ps_" storage volume create default drill-vol size=8MiB 
 as_svc incus --project "$ps_" storage volume create "$POOL" drill-vol size=8MiB >/dev/null 2>&1 \
   && ok "(r) a volume on its own pool works" \
   || no "(r) the service could not create a volume on its own pool $POOL"
-if as_svc box new --name drill-pool "${MODE[@]}" --memory 1GiB --cpu 1 --disk 2GiB >/dev/null 2>&1; then
+if out="$(as_svc box new --name drill-pool "${MODE[@]}" --memory 1GiB --cpu 1 --disk 2GiB 2>&1)"; then
   rp="$(as_svc incus --project "$ps_" config device get drill-pool root pool 2>/dev/null \
         || as_svc incus --project "$ps_" profile device get box-profile root pool 2>/dev/null)"
   [ "$rp" = "$POOL" ] && ok "(r) box new as the service lands on $POOL" || no "(r) box new landed on '$rp', not $POOL"
   as_svc box rm drill-pool --force >/dev/null 2>&1
 else
-  no "(r) box new as a capped, pooled service failed"
+  no "(r) box new as a capped, pooled service failed:"; printf '%s\n' "$out" | tail -5 | sed 's/^/        /'
 fi
 as_svc incus --project "$ps_" profile create drill-tool >/dev/null 2>&1
 # A unit running AS the service: revoke must refuse and name it.
@@ -914,7 +914,7 @@ if printf '%s' "$sout" | grep -q drill-secret; then
   no "(s) a granted user READ another project's profile — incus-user does not confine projects"
   second_project="readable"
 elif [ "$src" -ne 0 ]; then
-  ok "(s) a second project is HARD-REFUSED to a granted user (rc=$src: $(printf '%s' "$sout" | head -1))"
+  ok "(s) a second project is HARD-REFUSED to a granted user (rc=$src: $(printf '%s' "$sout" | grep -v 'first time running Incus' | tail -1))"
   second_project="hard-refused"
 else
   ok "(s) a second project answers a granted user with its OWN project's view, never the other's"
@@ -931,14 +931,18 @@ else
   useradd -m boxdrillm 2>/dev/null; useradd -m boxdrillo 2>/dev/null
   usermod -aG boxdrillgrp boxdrillm
   out="$(box grant --service "$US" --share boxdrillgrp 2>&1)"; rc=$?
-  [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "holds EVERYTHING" \
-    && ok "(t) --share converges and SHOUTS the credential blast radius" \
-    || no "(t) --share failed or never warned (rc=$rc)"
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "holds EVERYTHING"; then
+    ok "(t) --share converges and SHOUTS the credential blast radius"
+  else
+    no "(t) --share failed or never warned (rc=$rc):"; printf '%s\n' "$out" | tail -6 | sed 's/^/        /'
+  fi
   visudo -cf "/etc/sudoers.d/box-share-$US" >/dev/null 2>&1 \
     && ok "(t) the sudoers rule validates" || no "(t) the sudoers rule does not validate"
-  runuser -u boxdrillm -- box --as "$US" list >/dev/null 2>&1 \
-    && ok "(t) a group member acts as the tenant (box --as $US list)" \
-    || no "(t) a group member could not 'box --as $US list'"
+  if out="$(runuser -u boxdrillm -- box --as "$US" list 2>&1)"; then
+    ok "(t) a group member acts as the tenant (box --as $US list)"
+  else
+    no "(t) a group member could not 'box --as $US list':"; printf '%s\n' "$out" | tail -5 | sed 's/^/        /'
+  fi
   if runuser -u boxdrillm -- box --as "$US" new --name drill-shared "${MODE[@]}" >/dev/null 2>&1; then
     incus --project "$ps_" list --format csv -c n 2>/dev/null | grep -qx drill-shared \
       && ok "(t) a member's box lands in the tenant's project $ps_" \

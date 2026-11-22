@@ -441,8 +441,16 @@ if [ -n "$pool" ]; then
     if [ -z "$other" ] || [ "$other" = "$pool" ]; then continue; fi
     incus project set "$project" "limits.disk.pool.$other" 0 </dev/null
   done < <(incus storage list --format csv -c n </dev/null)
+  # Incus enforces per-pool limits ONLY when the project also sets limits.disk
+  # (AllowVolumeCreation returns early without it — measured in the
+  # rehearsal, and read in internal/server/project/permissions.go). So the
+  # pool's size is the project's total disk budget too; without it the zero
+  # limits above would bind nothing.
+  if ! err="$(incus project set "$project" limits.disk "$pool_size" </dev/null 2>&1)"; then
+    echo "box grant --pool: could not set limits.disk=$pool_size on $project: $err" >&2; exit 1
+  fi
   incus project set "$project" user.box.pool "$pool" </dev/null
-  echo "pool: $project confined to $pool (every other pool's limit is 0; re-run the grant after adding a pool)"
+  echo "pool: $project confined to $pool (limits.disk=$pool_size, every other pool's limit is 0; re-run the grant after adding a pool)"
 fi
 
 # 6c. Caps (#283): the project's own limits.* — 'none' unsets. Incus then

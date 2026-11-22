@@ -2485,6 +2485,7 @@ check "grant --pool: the pool is created at the asked size" 0 "storage create gi
 check "grant --pool: the pool is marked as this user's" 0 "storage set gig user.box.grant svc" gs_log
 check "grant --pool: every other pool is limited to 0" 0 "project set user-1500 limits.disk.pool.default 0" gs_log
 check "grant --pool: its own pool is never limited" 1 "" grep -q "limits.disk.pool.gig 0" "$GS/log"
+check "grant --pool: limits.disk is the pool size — Incus enforces per-pool limits only under it" 0 "project set user-1500 limits.disk 200GiB" gs_log
 check "grant --pool: the project carries the pool marker" 0 "project set user-1500 user.box.pool gig" gs_log
 check "grant --pool: box-profile roots on the grant pool" 0 "--project user-1500 profile device set box-profile root pool gig" gs_log
 : >"$GS/log"
@@ -2576,6 +2577,21 @@ rm -rf "$AS"
 # shellcheck disable=SC2016  # the $-strings expand in the child shell or stub, by design
 check "box: with no writable home, INCUS_CONF is a private per-uid directory" 0 "box-incus-" \
   env HOME=/nonexistent TMPDIR="$(mktemp -d)" bash -c '"$1" version >/dev/null; ls "$TMPDIR"' _ "$BOX"
+# The CLI layer (#282, #283): 'box grant'/'box revoke' hand every argument to
+# their script verbatim. box's own --memory/--cpu/--force must not be parsed
+# out first — the rehearsal on real Incus found 'box grant --memory 3GiB'
+# landing with no cap, because box had eaten the flag.
+PT="$(mktemp -d)"; mkdir -p "$PT/bin" "$PT/host"; cp "$ROOT/bin/box" "$PT/bin/box"; cp "$ROOT/VERSION" "$PT/VERSION"
+printf '#!/usr/bin/env bash\necho "SCRIPT-ARGS: $*"\n' >"$PT/host/grant-user.sh"
+printf '#!/usr/bin/env bash\necho "SCRIPT-ARGS: $*"\n' >"$PT/host/revoke-user.sh"
+check "box grant passes --memory/--cpu/--instances through verbatim (#283)" 0 \
+  "SCRIPT-ARGS: --service gig --memory 16GiB --cpu 6 --instances 6 --name x gig" \
+  bash "$PT/bin/box" grant --service gig --memory 16GiB --cpu 6 --instances 6 --name x gig
+check "box revoke passes --force through verbatim (#285)" 0 "SCRIPT-ARGS: gig --force" \
+  bash "$PT/bin/box" revoke gig --force
+check "box grant --help is still box's help" 0 "--pool NAME --pool-size SIZE gives the grant" \
+  bash "$PT/bin/box" grant --help
+rm -rf "$PT"
 check "help grant documents --pool and the caps" 0 "--pool NAME --pool-size SIZE gives the grant a storage pool" "$BOX" help grant
 # shellcheck disable=SC2016  # the $-strings are literals in the target file
 check "new: a pooled grant sizes a container's root too (#282)" 0 "" bash -c '
@@ -2606,7 +2622,9 @@ case "$*" in
   "image list --format csv --columns f") : ;;
   "profile list --format csv --columns n") printf "default\nbox-profile\ngig-untrusted\n" ;;
   "profile delete "*) log "--project $p $*" ;;
-  "storage volume list --format csv --columns ptn") printf "gig,custom,cache\ngig,container,r1\n" ;;
+  "storage list --format csv --columns n") printf "default\ngig\n" ;;
+  "storage volume list gig --format csv --columns tn") printf "custom,cache\ncontainer,r1\n" ;;
+  "storage volume list default --format csv --columns tn") : ;;
   "storage volume delete "*) log "--project $p $*" ;;
   "project delete user-1500") log "$*"; : >"$st/project-gone" ;;
   "network delete "*|"network show "*) exit 1 ;;

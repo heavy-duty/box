@@ -1165,6 +1165,15 @@ case "$cmd" in
 esac
 
 args=()
+# The host verbs hand EVERY argument to the script they wrap, verbatim
+# (#282, #283): box's own flags (--memory, --cpu, --force, --name …) must not
+# be parsed out first, or 'box grant --memory 16GiB' silently loses its cap —
+# the rehearsal caught exactly that. Only a help request is box's.
+case "$cmd" in
+  setup-host|teardown-host|grant|revoke)
+    for a in "$@"; do case "$a" in --help|-h) want_help=1 ;; esac; done
+    args=("$@"); set -- ;;
+esac
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) [ $# -ge 2 ] || usage_error "--name needs a value"; name="$2"; shift 2 ;;

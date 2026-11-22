@@ -241,11 +241,17 @@ if incus project show "$project" >/dev/null 2>&1 </dev/null; then
       echo "purge: deleting profile $prof"
       incus --project "$project" profile delete "$prof" </dev/null
     done < <(incus --project "$project" profile list --format csv --columns n 2>/dev/null)
-    while IFS=, read -r vpool vtype vname _; do
-      [ "$vtype" = custom ] || continue
-      echo "purge: deleting custom volume $vpool/$vname"
-      incus --project "$project" storage volume delete "$vpool" "$vname" </dev/null
-    done < <(incus --project "$project" storage volume list --format csv --columns ptn 2>/dev/null)
+    # Pool by pool: a pool-less 'storage volume list' is not in every 6.0.x
+    # client, and a listing that errors into /dev/null deletes nothing — the
+    # rehearsal's purge then died on "Only empty projects can be removed".
+    while IFS=, read -r vpool _; do
+      [ -n "$vpool" ] || continue
+      while IFS=, read -r vtype vname _; do
+        [ "$vtype" = custom ] || continue
+        echo "purge: deleting custom volume $vpool/$vname"
+        incus --project "$project" storage volume delete "$vpool" "$vname" </dev/null
+      done < <(incus --project "$project" storage volume list "$vpool" --format csv --columns tn 2>/dev/null)
+    done < <(incus storage list --format csv --columns n 2>/dev/null)
   fi
 
   # Both names, for one release (#229 D7). install.sh skips host setup on an
