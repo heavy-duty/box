@@ -177,6 +177,16 @@ if pgrep -u "$user" >/dev/null 2>&1; then
   fi
 fi
 
+# A shared tenant's sudoers rule and share record (#287) go with ANY revoke:
+# the tier is what they gave a group access to.
+sudoers_d="${BOX_SUDOERS_D:-/etc/sudoers.d}"; share_dir="${BOX_SHARE_DIR:-/etc/box/shares}"
+# Keyed on the world-readable record the grant writes beside the rule, so a
+# revoke with nothing to remove makes no privileged call to find that out.
+if [ -e "$share_dir/$user" ]; then
+  $SUDO rm -f -- "$sudoers_d/box-share-$user" "$share_dir/$user"
+  echo "share: removed — 'box --as $user' refuses everyone now"
+fi
+
 if [ "$purge" -eq 0 ]; then
   if incus project show "$project" >/dev/null 2>&1 </dev/null; then
     echo "kept: project $project and its boxes (still running — revoking a person does not kill their workloads)"

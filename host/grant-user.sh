@@ -34,7 +34,7 @@ self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]
 here="$(dirname "$(dirname "$self")")"
 
 usage() {
-  echo "usage: box grant [--service] [--pool NAME --pool-size SIZE] [--memory SIZE|none] [--cpu N|none] [--instances N|none] <user>" >&2
+  echo "usage: box grant [--service [--share GROUP | --unshare]] [--pool NAME --pool-size SIZE] [--memory SIZE|none] [--cpu N|none] [--instances N|none] <user>" >&2
   exit 2
 }
 
@@ -56,6 +56,9 @@ user=""
 # re-run without them leaves what an earlier grant set (the pool is read back
 # from the project's user.box.pool marker for the profile's root, below).
 pool=""; pool_size=""; cap_memory=""; cap_cpu=""; cap_instances=""
+# --share GROUP / --unshare (#287): a shared tenant is a service grant a group
+# operates through 'box --as'. Converged only when given, like the pool.
+share_group=""; unshare=0
 need_val() {
   if [ "$#" -lt 2 ] || [ -z "$2" ] || [ "${2#-}" != "$2" ]; then echo "box grant: $1 needs a value" >&2; usage; fi
 }
@@ -67,12 +70,25 @@ while [ "$#" -gt 0 ]; do
     --memory)      need_val "$@"; cap_memory="$2"; shift ;;
     --cpu)         need_val "$@"; cap_cpu="$2"; shift ;;
     --instances)   need_val "$@"; cap_instances="$2"; shift ;;
+    --share)       need_val "$@"; share_group="$2"; shift ;;
+    --unshare)     unshare=1 ;;
     -*) usage ;;
     *) [ -z "$user" ] || usage; user="$1" ;;
   esac
   shift
 done
 [ -n "$user" ] || usage
+
+if [ -n "$share_group" ] || [ "$unshare" -eq 1 ]; then
+  [ "$service" -eq 1 ] || { echo "box grant: --share and --unshare are for service grants (--service): a person's project is theirs alone" >&2; exit 2; }
+  if [ -n "$share_group" ] && [ "$unshare" -eq 1 ]; then echo "box grant: --share and --unshare together make no sense" >&2; exit 2; fi
+fi
+if [ -n "$share_group" ]; then
+  [[ "$share_group" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "box grant: --share needs a group name, got '$share_group'" >&2; exit 2; }
+fi
+share_bin="${BOX_SHARE_BIN:-/usr/local/bin/box}"
+share_dir="${BOX_SHARE_DIR:-/etc/box/shares}"
+sudoers_d="${BOX_SUDOERS_D:-/etc/sudoers.d}"
 
 # Sizes are Incus's own spelling (bytes, or N with kB/MB/GB/TB or KiB/MiB/GiB/
 # TiB); to_bytes is the one reader, so a check and a comparison never disagree.
@@ -464,6 +480,41 @@ if [ "$service" -eq 1 ]; then
   if [ "$preexisting" -eq 1 ]; then
     echo "service: $project existed before this grant — every step above re-hardened it"
   fi
+fi
+
+# 6d. Sharing (#287). The group may run box — only box, the global install's
+# stable path — as this service, and nothing else: no shell, no other command.
+# The sudoers drop-in is validated by visudo before it is moved into place, so
+# a bad write can never break sudo for the host. The share record beside it is
+# world-readable on purpose: 'box --as' reads it to tell a refused user which
+# group to join, and sudoers itself is root's to read.
+if [ -n "$share_group" ]; then
+  getent group "$share_group" >/dev/null || { echo "box grant --share: no such group: $share_group (box never creates host groups; groupadd it first)" >&2; exit 1; }
+  [ -x "$share_bin" ] || { echo "box grant --share: $share_bin is not there — sharing needs box installed globally (sudo install.sh), so every member runs the same path" >&2; exit 1; }
+  tmp_rule="$sudoers_d/.box-share-$user.tmp"
+  printf '# Written by box grant --share (#287); removed by --unshare and revoke.\n%%%s ALL=(%s) NOPASSWD: %s\n' "$share_group" "$user" "$share_bin" \
+    | $SUDO tee "$tmp_rule" >/dev/null
+  $SUDO chmod 0440 "$tmp_rule"
+  if ! $SUDO visudo -cf "$tmp_rule" >/dev/null 2>&1; then
+    $SUDO rm -f -- "$tmp_rule"
+    echo "box grant --share: the sudoers rule did not validate (visudo -cf) — nothing written" >&2; exit 1
+  fi
+  $SUDO mv -f -- "$tmp_rule" "$sudoers_d/box-share-$user"
+  $SUDO install -d -m 0755 "$share_dir"
+  printf '%s\n' "$share_group" | $SUDO tee "$share_dir/$user" >/dev/null
+  $SUDO chmod 0644 "$share_dir/$user"
+  echo "share: '$share_group' may act as $user through 'box --as $user …' (box only, never a shell)"
+  {
+    echo "box: ============================== WARNING =============================="
+    echo "box: everyone in '$share_group' holds EVERYTHING put inside $user's boxes:"
+    echo "box: agent logins, git credentials, SSH keys, shell history — whatever"
+    echo "box: anyone left there. A shared box is shared all the way down."
+    echo "box: share only what that whole group may hold."
+    echo "box: ====================================================================="
+  } >&2
+elif [ "$unshare" -eq 1 ]; then
+  $SUDO rm -f -- "$sudoers_d/box-share-$user" "$share_dir/$user"
+  echo "share: $user is no longer shared ('box --as $user' now refuses everyone)"
 fi
 
 # 7. The placement contract itself, installed into their project. Created if

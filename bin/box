@@ -183,7 +183,7 @@ CMDS=(
   "incus^<box> -- <args...>^box^Escape hatch: run any incus command against a box^fn:cmd_incus^"
   "doctor^[--fix | --pin-dns]^^Is this host fit to mint boxes? Diagnose the daemon, network, DNS, isolation^fn:cmd_doctor^"
   "setup-host^^^One-time host setup: Incus, the boxnet stack, the profile, the firewall^fn:cmd_setup_host^"
-  "grant^[--service] [--pool NAME --pool-size SIZE] [--memory SIZE] [--cpu N] [--instances N] <user>^^Admin: give a host user (or a service, --service) the restricted tier — their own boxes, on the hardened boxnet^fn:cmd_grant^"
+  "grant^[--service [--share GROUP|--unshare]] [--pool NAME --pool-size SIZE] [--memory SIZE] [--cpu N] [--instances N] <user>^^Admin: give a host user (or a service, --service) the restricted tier — their own boxes, on the hardened boxnet^fn:cmd_grant^"
   "revoke^<user> [--purge [--purge-pool]] [--force]^^Admin: take the restricted tier back (--purge also deletes their boxes)^fn:cmd_revoke^"
   "teardown-host^[--purge-incus]^^Remove the box host stack (both name generations)^fn:cmd_teardown_host^"
   "versions^^^List the installed box versions — the current default and the running one^fn:cmd_versions^"
@@ -249,6 +249,7 @@ box — trust-less, network-isolated Incus VMs, creds-free.
 
 USAGE
   box <command> [<args>] [options]
+  box --as <tenant> <command> …   act as a shared tenant you are a member of (#287)
 
 COMMANDS
 EOF
@@ -977,9 +978,18 @@ instance that does not set limits.cpu and limits.memory itself or by
 profile: 'box new' always stamps both, and a tool minting through the API
 must too. A re-run without a flag leaves that setting as it is.
 
+--share GROUP (with --service) makes a SHARED TENANT (#287): GROUP may run
+box itself, and nothing else, as the service, through a visudo-checked
+sudoers rule; a member then acts as it with 'box --as NAME <command>' and is
+never prompted, while anyone else is refused and told which group to join.
+--unshare (or revoke) takes it away. Everyone in GROUP holds every
+credential inside every box of the tenant, and the grant says so. Needs box
+installed globally (/usr/local/bin/box).
+
   box grant dev1
   box grant --service gig
   box grant --service gig --pool gig --pool-size 200GiB --memory 16GiB --cpu 6 --instances 6
+  box grant --service stage --share staging   # then: box --as stage new --name web
 EOF
 ;;
     revoke) cat <<'EOF'
@@ -1097,6 +1107,43 @@ show_help() {   # "" → general help
     *) is_command "$1" || unknown_command "$1"; help_cmd "$1" ;;
   esac
 }
+
+# --- Acting as a shared tenant: box --as NAME <verb> … (#287) ----------------
+# A shared tenant is a service grant (#281) that a GROUP operates: 'box grant
+# --service NAME --share GROUP' lets that group run box itself, and only box,
+# as NAME through sudo. This re-runs the same command as NAME; nothing is
+# prompted for — a refusal names the group to join, read from the world-
+# readable share record the grant wrote (sudoers itself is root's to read).
+SHARE_BIN="${BOX_SHARE_BIN:-/usr/local/bin/box}"
+SHARE_DIR="${BOX_SHARE_DIR:-/etc/box/shares}"
+if [ "${1:-}" = --as ]; then
+  as_user="${2:-}"
+  [[ "$as_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || usage_error "--as needs a tenant name, e.g. 'box --as stage list'"
+  shift 2
+  if ! sudo -n -u "$as_user" -l "$SHARE_BIN" >/dev/null 2>&1; then
+    share_group="$(cat "$SHARE_DIR/$as_user" 2>/dev/null || true)"
+    if [ -n "$share_group" ]; then
+      echo "box --as $as_user: you may not act as $as_user — it is shared with the group '$share_group'; ask an admin to add you:  sudo usermod -aG $share_group $(id -un)" >&2
+    else
+      echo "box --as $as_user: $as_user is not a shared tenant on this host (an admin shares one with: box grant --service $as_user --share <group>)" >&2
+    fi
+    exit 2
+  fi
+  exec sudo -n -u "$as_user" -H -- "$SHARE_BIN" "$@"
+fi
+
+# A service or shared tenant has no writable home (#281, #287): the incus CLI
+# wants a config directory before it connects, so give it a private one —
+# per uid and reused, since verbs that exec a host script would leak a
+# per-run temp dir. Refused if something else already holds the name.
+if [ -z "${INCUS_CONF:-}" ] && [ ! -w "${HOME:-/nonexistent}" ]; then
+  INCUS_CONF="${TMPDIR:-/tmp}/box-incus-$(id -u)"
+  if [ ! -e "$INCUS_CONF" ]; then mkdir -m 700 "$INCUS_CONF" 2>/dev/null || true; fi
+  if [ -L "$INCUS_CONF" ] || [ ! -d "$INCUS_CONF" ] || [ ! -O "$INCUS_CONF" ]; then
+    die "no writable home and $INCUS_CONF is not a directory of this user's — set INCUS_CONF to a private directory"
+  fi
+  export INCUS_CONF
+fi
 
 cmd="${1:-help}"; shift || true
 case "$cmd" in

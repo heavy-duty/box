@@ -179,6 +179,11 @@ cleanup() {
   # when the drill dies before it gets there.
   box rm "$ADMINBOX" --force >/dev/null 2>&1 \
     && echo "  removed the admin's $ADMINBOX (criterion p)"
+  systemctl stop boxdrill-svc >/dev/null 2>&1 || true
+  incus project delete boxdrill-shared >/dev/null 2>&1 || true
+  for u in boxdrillm boxdrillo; do id "$u" >/dev/null 2>&1 && userdel -r "$u" >/dev/null 2>&1; done
+  groupdel boxdrillgrp >/dev/null 2>&1 || true
+  rm -f /etc/sudoers.d/box-share-boxdrillsvc /etc/box/shares/boxdrillsvc
   for u in "$U1" "$U2" boxdrill3 boxdrill4 boxdrill5 boxdrillsvc; do
     id "$u" >/dev/null 2>&1 || continue
     # A half-failed purge followed by userdel leaves a project owned by
@@ -191,6 +196,8 @@ cleanup() {
       echo "  WARNING: purge FAILED for $u — kept the account so 'box doctor' can name it; project user-$(id -u "$u") may survive"
     fi
   done
+  # (r)'s grant pool, if the drill died before (r) purged it.
+  incus storage delete boxdrillpool >/dev/null 2>&1 && echo "  removed the grant pool boxdrillpool (criterion r)"
 }
 trap cleanup EXIT
 
@@ -840,6 +847,119 @@ out="$(box grant --service "$US" 2>&1)"; rc=$?
   || no "(q) --service granted an incus-admin member (rc=$rc) — a fence that binds nothing"
 gpasswd -d "$US" incus-admin >/dev/null 2>&1
 aud "q. service grant: project '$ps_' service=$(incus project get "$ps_" user.box.service 2>/dev/null) disk=$(incus project get "$ps_" restricted.devices.disk 2>/dev/null) access=$(incus project get "$ps_" restricted.networks.access 2>/dev/null)"
+
+phase "r. a grant's pool and caps, and revoking a service (#282, #283, #285)"
+POOL=boxdrillpool
+out="$(box grant --service "$US" --pool "$POOL" --pool-size 3GiB --memory 3GiB --cpu 2 --instances 3 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "(r) the grant converges a pool and caps (rc=0)"
+else
+  no "(r) box grant --pool/caps FAILED (rc=$rc):"; printf '%s\n' "$out" | tail -4 | sed 's/^/        /'
+fi
+[ "$(incus storage get "$POOL" user.box.grant 2>/dev/null)" = "$US" ] \
+  && ok "(r) $POOL exists and is marked $US's grant pool" \
+  || no "(r) $POOL carries no user.box.grant=$US"
+[ "$(incus project get "$ps_" limits.disk.pool.default 2>/dev/null)" = 0 ] \
+  && ok "(r) $ps_ cannot place anything on 'default' (limits.disk.pool.default=0)" \
+  || no "(r) $ps_ limits.disk.pool.default = '$(incus project get "$ps_" limits.disk.pool.default 2>/dev/null)'"
+for kv in "memory 3GiB" "cpu 2" "instances 3"; do
+  [ "$(incus project get "$ps_" "limits.${kv% *}" 2>/dev/null)" = "${kv#* }" ] \
+    && ok "(r) $ps_ limits.${kv% *} = ${kv#* }" \
+    || no "(r) $ps_ limits.${kv% *} = '$(incus project get "$ps_" "limits.${kv% *}" 2>/dev/null)', wanted ${kv#* }"
+done
+svch="$(mktemp -d)"; chown "$US" "$svch"
+as_svc incus --project "$ps_" storage volume create default drill-vol size=8MiB >/dev/null 2>&1 \
+  && no "(r) the service created a volume on 'default' — the pool confinement does not bind" \
+  || ok "(r) a volume on 'default' is refused from the service's side"
+as_svc incus --project "$ps_" storage volume create "$POOL" drill-vol size=8MiB >/dev/null 2>&1 \
+  && ok "(r) a volume on its own pool works" \
+  || no "(r) the service could not create a volume on its own pool $POOL"
+if as_svc box new --name drill-pool "${MODE[@]}" --memory 1GiB --cpu 1 --disk 2GiB >/dev/null 2>&1; then
+  rp="$(as_svc incus --project "$ps_" config device get drill-pool root pool 2>/dev/null \
+        || as_svc incus --project "$ps_" profile device get box-profile root pool 2>/dev/null)"
+  [ "$rp" = "$POOL" ] && ok "(r) box new as the service lands on $POOL" || no "(r) box new landed on '$rp', not $POOL"
+  as_svc box rm drill-pool --force >/dev/null 2>&1
+else
+  no "(r) box new as a capped, pooled service failed"
+fi
+as_svc incus --project "$ps_" profile create drill-tool >/dev/null 2>&1
+# A unit running AS the service: revoke must refuse and name it.
+systemd-run --quiet --uid="$US" --unit=boxdrill-svc sleep 600 >/dev/null 2>&1
+out="$(BOX_YES=1 box revoke "$US" --purge --purge-pool 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "boxdrill-svc.service" \
+  && ok "(r) revoke refuses while boxdrill-svc.service runs as the service, by name" \
+  || no "(r) revoke did not refuse under a running unit (rc=$rc)"
+systemctl stop boxdrill-svc >/dev/null 2>&1
+out="$(BOX_YES=1 box revoke "$US" --purge --purge-pool 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "(r) stopped, the service revokes with --purge --purge-pool (a tool profile and a custom volume inside)"
+else
+  no "(r) revoke --purge --purge-pool FAILED (rc=$rc):"; printf '%s\n' "$out" | tail -4 | sed 's/^/        /'
+fi
+incus project show "$ps_" >/dev/null 2>&1 && no "(r) $ps_ survived the purge" || ok "(r) $ps_ is gone"
+incus storage show "$POOL" >/dev/null 2>&1 && no "(r) $POOL survived --purge-pool" || ok "(r) $POOL is gone"
+rm -rf "$svch"
+aud "r. pool+caps: pool=$POOL, revoke under a unit rc refused, purge-pool leaves nothing"
+
+phase "s. can a granted user reach a SECOND project? (#253 member 2, measured)"
+# The whole price of a shared-project design turned on this, and it was read
+# from documentation. Measured here on the real daemon: a hand-made project
+# with a profile in it, read by a granted user over incus-user's socket.
+box grant --service "$US" >/dev/null 2>&1
+svch="$(mktemp -d)"; chown "$US" "$svch"
+incus project create boxdrill-shared >/dev/null 2>&1
+incus --project boxdrill-shared profile create drill-secret >/dev/null 2>&1
+sout="$(as_svc incus --project boxdrill-shared profile list --format csv 2>&1)"; src=$?
+if printf '%s' "$sout" | grep -q drill-secret; then
+  no "(s) a granted user READ another project's profile — incus-user does not confine projects"
+  second_project="readable"
+elif [ "$src" -ne 0 ]; then
+  ok "(s) a second project is HARD-REFUSED to a granted user (rc=$src: $(printf '%s' "$sout" | head -1))"
+  second_project="hard-refused"
+else
+  ok "(s) a second project answers a granted user with its OWN project's view, never the other's"
+  second_project="silently-scoped"
+fi
+incus project delete boxdrill-shared >/dev/null 2>&1 || { incus --project boxdrill-shared profile delete drill-secret >/dev/null 2>&1; incus project delete boxdrill-shared >/dev/null 2>&1; }
+aud "s. second project to a granted user: $second_project (rc=$src) — docs/plans/multi-owner-boxes.md cites this"
+
+phase "t. a shared tenant — a group acts as a service through box --as (#287)"
+if [ ! -x /usr/local/bin/box ]; then
+  note "(t) box is not installed globally (/usr/local/bin/box) — sharing needs it; phase skipped"
+else
+  groupadd boxdrillgrp 2>/dev/null
+  useradd -m boxdrillm 2>/dev/null; useradd -m boxdrillo 2>/dev/null
+  usermod -aG boxdrillgrp boxdrillm
+  out="$(box grant --service "$US" --share boxdrillgrp 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "holds EVERYTHING" \
+    && ok "(t) --share converges and SHOUTS the credential blast radius" \
+    || no "(t) --share failed or never warned (rc=$rc)"
+  visudo -cf "/etc/sudoers.d/box-share-$US" >/dev/null 2>&1 \
+    && ok "(t) the sudoers rule validates" || no "(t) the sudoers rule does not validate"
+  runuser -u boxdrillm -- box --as "$US" list >/dev/null 2>&1 \
+    && ok "(t) a group member acts as the tenant (box --as $US list)" \
+    || no "(t) a group member could not 'box --as $US list'"
+  if runuser -u boxdrillm -- box --as "$US" new --name drill-shared "${MODE[@]}" >/dev/null 2>&1; then
+    incus --project "$ps_" list --format csv -c n 2>/dev/null | grep -qx drill-shared \
+      && ok "(t) a member's box lands in the tenant's project $ps_" \
+      || no "(t) the member's box is not in $ps_"
+    runuser -u boxdrillm -- box --as "$US" rm drill-shared --force >/dev/null 2>&1
+  else
+    no "(t) a group member could not mint as the tenant"
+  fi
+  out="$(runuser -u boxdrillo -- box --as "$US" list 2>&1)"; rc=$?
+  [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "boxdrillgrp" \
+    && ok "(t) an outsider is refused (exit 2), told the group to join" \
+    || no "(t) an outsider was not refused properly (rc=$rc)"
+  runuser -u boxdrillm -- sudo -n -u "$US" /bin/sh -c true >/dev/null 2>&1 \
+    && no "(t) a member got a SHELL as the tenant — the rule is wider than box" \
+    || ok "(t) a member gets box as the tenant, never a shell"
+  box grant --service "$US" --unshare >/dev/null 2>&1
+  [ ! -e "/etc/sudoers.d/box-share-$US" ] && ok "(t) --unshare removes the rule" || no "(t) --unshare left the rule"
+  userdel -r boxdrillm >/dev/null 2>&1; userdel -r boxdrillo >/dev/null 2>&1; groupdel boxdrillgrp >/dev/null 2>&1
+fi
+rm -rf "$svch"
+aud "t. shared tenant via box --as: $([ -x /usr/local/bin/box ] && echo measured || echo skipped-no-global-install)"
 
 echo
 echo "════════════════════════════════════════════"

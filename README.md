@@ -365,6 +365,39 @@ user, all see them. Setting it is a contract. The profile carries the
 NIC, and attaches no host-path disk. A service grant already refuses host
 paths.
 
+### Sharing boxes (#287)
+
+One box per owner is the default. Two ways to share, and which to pick:
+
+- **(a) incus-admin.** Put the staging users in `incus-admin` and they share
+  the `default` project with every admin. It works today, and it costs the
+  **full daemon socket**: `setup-host`, `teardown-host` and every project on
+  the host are within their reach. Right only when they are admins anyway.
+- **(b) A shared tenant (recommended).** A service grant that a host group
+  operates:
+
+  ```
+  sudo groupadd staging; sudo usermod -aG staging alice
+  sudo useradd --system --no-create-home --shell /usr/sbin/nologin stage
+  box grant --service stage --share staging
+  box --as stage new --name web      # alice, from her own shell
+  ```
+
+  `--share GROUP` writes a sudoers rule, validated by `visudo` before it
+  lands, that lets GROUP run **box itself, and nothing else,** as the
+  service. `box --as NAME …` re-runs the command that way and never prompts
+  for a password. Someone outside the group is refused and told which group to
+  join. The boxes live in the service's fenced project like any grant's
+  (boxnet only, managed disks). `--unshare`, or `box revoke stage`, takes the
+  rule away. Sharing needs box installed globally (`/usr/local/bin/box`).
+
+  **Everyone in the group holds everything inside every box in the tenant:**
+  agent logins, git credentials, SSH keys, shell history. The grant says so
+  every time it shares.
+
+Per-box co-ownership, with visibility, access and lifecycle as separate
+rights, is planned in `docs/plans/multi-owner-boxes.md` and not built.
+
 What a restricted user gets is the full contract: same ACL, same DNS
 isolation, same pinned resolver, same port isolation, same box↔box drop —
 and their boxes cannot reach another user's box, which is the same

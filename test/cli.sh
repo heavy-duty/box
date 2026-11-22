@@ -2344,7 +2344,7 @@ rm -f "$BINFN" "$HOSTFN"
 # The tier scripts parse and refuse bad usage without a daemon — drive them.
 check "grant: no argument is a usage error"      2 "usage: box grant"  bash "$ROOT/host/grant-user.sh"
 check "grant: a flag is not a user"              2 "usage: box grant"  bash "$ROOT/host/grant-user.sh" --frob
-check "grant: --service alone is a usage error"  2 "usage: box grant [--service]"  bash "$ROOT/host/grant-user.sh" --service
+check "grant: --service alone is a usage error"  2 "usage: box grant [--service [--share"  bash "$ROOT/host/grant-user.sh" --service
 check "grant: two users is a usage error"        2 "usage: box grant"  bash "$ROOT/host/grant-user.sh" a b
 check "help grant documents --service (#281)"    0 "box grant --service gig" "$BOX" help grant
 check "help grant: a service gets managed disks only" 0 "restricted.devices.disk=managed" "$BOX" help grant
@@ -2527,6 +2527,56 @@ check "grant caps: a cap below use is refused with the reason" 1 "Incus refuses 
 check "grant caps: --cpu must be a whole number" 2 "--cpu must be a whole number" gs_grant --cpu 2.5 svc
 check "grant caps: --instances must be a whole number" 2 "--instances must be a whole number" gs_grant --instances 0 svc
 check "grant caps: --memory must be a size" 2 "--memory must be a size" gs_grant --memory 16G svc
+# --share / --unshare (#287): sudoers drop-in validated before it lands, the
+# world-readable share record, the warning, and the refusals.
+mkdir -p "$GS/sudoers.d" "$GS/shares"; : >"$GS/box"; chmod +x "$GS/box"
+# shellcheck disable=SC2016  # the $-strings expand in the child shell or stub, by design
+gs_stub visudo '[ -z "${GS_VISUDO_FAIL:-}" ] || exit 1; grep -q "^%[a-z_][a-z0-9_-]* ALL=([a-z_][a-z0-9_-]*) NOPASSWD: /" "$2"'
+# shellcheck disable=SC2016  # the $-strings expand in the child shell or stub, by design
+gs_stub tee 'cat >"$1"'
+# shellcheck disable=SC2016  # the $-strings expand in the child shell or stub, by design
+gs_stub getent 'case "$1 $2" in "passwd svc"|"group staging") exit 0 ;; *) exit 2 ;; esac'
+gs_share() { env BOX_SHARE_BIN="$GS/box" BOX_SHARE_DIR="$GS/shares" BOX_SUDOERS_D="$GS/sudoers.d" PATH="$GS/bin:$PATH" GS="$GS" GS_VISUDO_FAIL="${GS_VISUDO_FAIL:-}" bash "$ROOT/host/grant-user.sh" "$@"; }
+gs_reset
+check "grant --share: lets the group act as the service" 0 "share: 'staging' may act as svc" gs_share --service --share staging svc
+check "grant --share: the sudoers rule allows box only, as the service, for the group" 0 "%staging ALL=(svc) NOPASSWD: $GS/box" cat "$GS/sudoers.d/box-share-svc"
+check "grant --share: the rule is 0440" 0 "440" stat -c %a "$GS/sudoers.d/box-share-svc"
+check "grant --share: the share record names the group" 0 "staging" cat "$GS/shares/svc"
+check "grant --share: no temp rule is left behind" 1 "" test -e "$GS/sudoers.d/.box-share-svc.tmp"
+check "grant --share: SHOUTS the credential blast radius" 0 "holds EVERYTHING put inside svc's boxes" gs_share --service --share staging svc
+# shellcheck disable=SC2016  # the $-strings expand in the child shell or stub, by design
+check "grant: a re-run without --share keeps the share" 0 "" bash -c 'env BOX_SHARE_BIN="'"$GS"'/box" BOX_SHARE_DIR="'"$GS"'/shares" BOX_SUDOERS_D="'"$GS"'/sudoers.d" PATH="'"$GS"'/bin:$PATH" GS="'"$GS"'" bash "'"$ROOT"'/host/grant-user.sh" --service svc >/dev/null 2>&1; test -e "'"$GS"'/sudoers.d/box-share-svc"'
+check "grant --unshare removes the rule and the record" 0 "no longer shared" gs_share --service --unshare svc
+check "grant --unshare: the rule is gone" 1 "" test -e "$GS/sudoers.d/box-share-svc"
+check "grant --share: a missing group is refused" 1 "no such group: nobodies" gs_share --service --share nobodies svc
+check "grant --share: refused when visudo rejects the rule, writing nothing" 1 "did not validate" env GS_VISUDO_FAIL=1 bash -c "$(declare -f gs_share); GS='$GS' ROOT='$ROOT'; gs_share --service --share staging svc"
+# shellcheck disable=SC2016  # the $-strings expand in the child shell or stub, by design
+check "grant --share: ...and no rule file exists after the refusal" 1 "" bash -c 'test -e "$1" || test -e "$2"' _ "$GS/sudoers.d/box-share-svc" "$GS/sudoers.d/.box-share-svc.tmp"
+check "grant --share without --service is refused" 2 "for service grants" gs_share --share staging svc
+check "grant --share with --unshare is refused" 2 "together make no sense" gs_share --service --share staging --unshare svc
+check "grant --share: refused without a global install" 1 "needs box installed globally" \
+  env BOX_SHARE_BIN="$GS/nope" BOX_SHARE_DIR="$GS/shares" BOX_SUDOERS_D="$GS/sudoers.d" PATH="$GS/bin:$PATH" GS="$GS" bash "$ROOT/host/grant-user.sh" --service --share staging svc
+
+# box --as NAME (#287): the re-exec through sudo, never a prompt, and the two
+# refusals — a share the caller is not in (naming the group), and no share.
+AS="$(mktemp -d)"; mkdir -p "$AS/bin" "$AS/shares"
+# shellcheck disable=SC2016  # stub body expands when it runs
+printf '#!/usr/bin/env bash\necho "sudo $*" >>"%s/log"\ncase "$*" in *" -l "*) [ -n "${AS_ALLOWED:-}" ] ;; *) exit 0 ;; esac\n' "$AS" >"$AS/bin/sudo"
+chmod +x "$AS/bin/sudo"
+asbox() { env PATH="$AS/bin:$PATH" BOX_SHARE_BIN=/usr/local/bin/box BOX_SHARE_DIR="$AS/shares" "$BOX" "$@"; }
+: >"$AS/log"
+check "box --as: a member re-runs the command as the tenant" 0 "" env AS_ALLOWED=1 bash -c "$(declare -f asbox); AS='$AS' BOX='$BOX'; asbox --as stage list"
+check "box --as: ...through sudo -n, as the tenant, with its home, running box only" 0 "sudo -n -u stage -H -- /usr/local/bin/box list" cat "$AS/log"
+echo staging >"$AS/shares/stage"
+check "box --as: a non-member is refused (exit 2), told which group to join" 2 "shared with the group 'staging'" asbox --as stage list
+check "box --as: no share at all says so" 2 "is not a shared tenant on this host" asbox --as other list
+check "box --as: a bad tenant name is a usage error" 2 "--as needs a tenant name" asbox --as 'Bad;x' list
+check "box --as: never prompts (sudo is always -n)" 1 "" grep -vq -- "sudo -n " "$AS/log"
+rm -rf "$AS"
+# No writable home (#281, #287): a private per-uid INCUS_CONF, never a shared one.
+# shellcheck disable=SC2016  # the $-strings expand in the child shell or stub, by design
+check "box: with no writable home, INCUS_CONF is a private per-uid directory" 0 "box-incus-" \
+  env HOME=/nonexistent TMPDIR="$(mktemp -d)" bash -c '"$1" version >/dev/null; ls "$TMPDIR"' _ "$BOX"
 check "help grant documents --pool and the caps" 0 "--pool NAME --pool-size SIZE gives the grant a storage pool" "$BOX" help grant
 # shellcheck disable=SC2016  # the $-strings are literals in the target file
 check "new: a pooled grant sizes a container's root too (#282)" 0 "" bash -c '
@@ -2590,6 +2640,10 @@ check "revoke --purge-pool: the refusal deleted nothing" 1 "" grep -q "delete" "
 rs_reset; echo other >"$RS/state/pool-owner"
 check "revoke --purge-pool: someone else's pool is never deleted" 1 "is not svc's grant pool" rs_revoke svc --purge --purge-pool
 check "revoke: --purge-pool without --purge is a usage error" 2 "--purge-pool goes with --purge" rs_revoke svc --purge-pool
+rs_reset; mkdir -p "$RS/sudoers.d" "$RS/shares"; echo rule >"$RS/sudoers.d/box-share-svc"; echo staging >"$RS/shares/svc"
+check "revoke: a shared tenant's sudoers rule and record go with the revoke (#287)" 0 "share: removed" \
+  env BOX_SUDOERS_D="$RS/sudoers.d" BOX_SHARE_DIR="$RS/shares" PATH="$RS/bin:$PATH" RS="$RS" bash "$ROOT/host/revoke-user.sh" svc
+check "revoke: ...the rule file is gone" 1 "" test -e "$RS/sudoers.d/box-share-svc"
 rs_reset; : >"$RS/state/service"; : >"$RS/state/pool"
 check "revoke: --force on a person's grant is refused" 2 "for service grants" rs_revoke svc --force
 printf 'something.service\n' >"$RS/state/units"
