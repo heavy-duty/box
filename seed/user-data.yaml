@@ -30,23 +30,10 @@ package_update: true
 # would break the path this release replaced the mint hook with, on a bare
 # cloud image that is not guaranteed to ship either.
 # chrony: step resumed guests back to real UTC even after startup (#174).
-# The unprivileged toolchain (#177 decision 3). With no sudo, 'apt install' is
-# no longer the tenant's escape hatch, so what it reaches for ships here or is
-# reachable user-locally. Measured, not guessed: over three weeks of duty in a
-# live agent box, the tenant-initiated installs recorded in
-# /var/log/apt/history.log were shellcheck,
-# then a Chromium/Playwright dependency set, then chromium. The browser stack
-# stays OUT — task-specific, hundreds of megabytes on every mint, and 'box
-# root' is the path for it; a shell linter is small and generic, so it is in.
-# Everything else an agent used came from what the operator converges (git,
-# gh, ripgrep, jq, build-essential, node), which is where the toolchain
-# belongs; re-listing it here would only thicken the seed (#81).
-# python3-venv: Debian 13 ships no pip and marks the system environment
-# externally-managed, so 'python3 -m venv' — the user-local Python route the
-# ruling leans on — dies on a bare guest with "install the python3-venv
-# package". Measured in the same box. Without it, losing sudo means losing
-# every route to a Python package, which is the silently-crippled tenant this
-# change must not produce.
+# The unprivileged toolchain (python3-venv, shellcheck) and the swapfile are
+# NOT here since 0.11.0 (#290, #253 D6/D9): they are convergence, so a role
+# installs them (APT_EXTRAS, SWAP_SIZE). An unconverged box has neither, and
+# that is the stated cost, not an oversight.
 write_files:
   - path: /etc/chrony/conf.d/box-makestep.conf
     permissions: "0644"
@@ -108,8 +95,6 @@ packages:
   - curl
   - ca-certificates
   - chrony
-  - python3-venv
-  - shellcheck
 runcmd:
   - systemctl enable chrony
   # Containers share the host clock; VM guests must start chrony (#174).
@@ -122,26 +107,3 @@ runcmd:
   # remount that means nothing there.
   - systemctl daemon-reload
   - test "$(findmnt -no FSTYPE /tmp)" != tmpfs || mount -o remount,size=1G /tmp
-  # 4GiB of swap on the selected disk, so a memory spike degrades instead of
-  # OOM-killing with no grace period and no warning — swap-in is observable,
-  # where a kill is a process that was there and then was not (#178).
-  # Container-guarded for chrony's reason one line up, not a different one: a
-  # container shares the host's swap and cannot swapon at all, so the file
-  # would be 4GiB of nothing and the fstab line a failure at every boot. The
-  # /swapfile test keeps a re-run idempotent, and the dd fallback is
-  # cloud-init's own (cc_mounts.create_swapfile): fallocate is refused on some
-  # filesystems and dd always works.
-  - |
-    if ! systemd-detect-virt --quiet --container && [ ! -e /swapfile ]; then
-      fallocate -l 4G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=4096
-      chmod 600 /swapfile
-      mkswap /swapfile
-      swapon /swapfile
-      # Close the line first if fstab has no trailing newline: appending onto
-      # a half-line would fuse the swap entry to the ROOT entry, and a box
-      # whose / is unparseable does not boot. The test reads the last byte —
-      # command substitution eats a trailing newline, so an empty result IS
-      # the newline and nothing is added.
-      [ -s /etc/fstab ] && [ -n "$(tail -c1 /etc/fstab)" ] && printf '\n' >> /etc/fstab
-      printf '%s\n' '/swapfile none swap sw 0 0' >> /etc/fstab
-    fi

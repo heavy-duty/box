@@ -417,8 +417,9 @@ box shell work                      # enter as the tenant user (default: dev)
 ```
 
 **That box is blank, and blank is literal.** The seed carries a tenant user, a
-fixed 1GiB `/tmp`, swap, chrony, `curl`, `ca-certificates`,
-`python3-venv` and `shellcheck` — that list is the whole of it. There is no
+fixed 1GiB `/tmp`, chrony, `curl` and `ca-certificates` — that list is the
+whole of it. No swap, no `python3-venv`, no `shellcheck`: since 0.11.0 those
+come from convergence (#290). There is no
 coding agent on it, and **no `gh`**; the tenant has no sudo, so it cannot
 `apt install` one either. Authenticating is therefore not the first thing you
 do on a fresh box. Converging is.
@@ -473,9 +474,13 @@ There is no role axis and no `--role` flag. The public mint shapes are:
 | `--size medium --autostart --require-vm` | The old `staging-box` template as flags (#288): VM-only, back after a host reboot |
 
 **The seed is thin and it is the whole of what box installs.** It carries the
-tenant user, `curl`, `ca-certificates`, `chrony`, `python3-venv` and
-`shellcheck`, caps `/tmp` at a fixed 1GiB and lays a 4GiB swapfile in VM mode
-— and nothing that joins a tailnet or admits a credential. `curl` and
+tenant user, `curl`, `ca-certificates` and `chrony`, and caps `/tmp` at a
+fixed 1GiB — and nothing that joins a tailnet or admits a credential. **An
+unconverged box has no swap and no Python venv or shellcheck** (#290, #253
+D6/D9): the rig-templates agent roles install `python3-venv` and `shellcheck`
+(`APT_EXTRAS`) and lay swap (`SWAP_SIZE`), so a box you never converge
+degrades under a memory spike straight to an OOM kill. That is the stated cost
+of box not converging, not an oversight. `curl` and
 `ca-certificates` are there for **your** installer, not box's: the first line
 of the converge above is a `curl … | bash` inside the box, and a bare cloud
 image is not guaranteed to ship either.
@@ -988,8 +993,9 @@ never remounts, provisions, deletes, writes a file or changes configuration.
 
 An empty readable kernel journal is reported explicitly as “no OOM kill
 logged”; an unreadable journal is reported as unknown, never clean. A legacy
-ordinary VM with no swap or a 50%-of-memory `/tmp` points to the current #178
-seed and reminting, not to a `--fix`: those findings can have different owners,
+ordinary VM with no swap or a 50%-of-memory `/tmp` points to the #178 seed and
+reminting, not to a `--fix`; a `seed/3` VM (0.11.0) with no swap gets a note,
+not a finding, because box lays none since #290: those findings can have different owners,
 and `checkup` does not guess which state it may change.
 
 `checkup` exits `0` when every check is clean and `1` when it reports a

@@ -126,10 +126,10 @@ checkup_row() {
   case "$row" in *"fn:cmd_checkup"*) printf checkup ;; *) return 1 ;; esac
 }
 check "checkup: is a separate command from doctor" 0 "checkup" checkup_row
-check "checkup: current mints carry the #178 seed generation" 0 "user.box.seed" \
+check "checkup: current mints carry a seed generation" 0 "user.box.seed" \
   grep -F 'user.box.seed=' "$BOX"
-check "checkup: tenant is the #178 generation" 0 "tenant/2" \
-  grep -F 'seed_generation=tenant/2' "$BOX"
+check "checkup: 0.11.0 mints are the seed/3 generation (#290, #291)" 0 "seed/3" \
+  grep -F 'seed_generation=seed/3' "$BOX"
 
 CHECKUP="$ROOT/guest/checkup.sh"
 check "checkup: guest probe exists" 0 "" test -f "$CHECKUP"
@@ -220,7 +220,7 @@ run_checkup_command() {
 check "checkup: full CLI resolves the box and streams the guest probe" 0 \
   "8.0 GiB available of 40.0 GiB" run_checkup_command
 
-check "checkup: legacy VM names missing swap and #178's seed as the fix" 1 "seed #178" \
+check "checkup: legacy VM names missing swap and #178's seed as the fix" 1 "tenant seed of #178" \
   run_checkup vm unknown
 check "checkup: legacy VM names the 50%-of-RAM /tmp finding" 1 "50% of VM memory" \
   run_checkup vm unknown
@@ -249,7 +249,16 @@ checkup_current_vm_quiet() {
   local out; out="$(checkup_current_vm)"
   ! grep -q "FIX" <<<"$out" && grep -q "4.0 GiB" <<<"$out" && grep -q "1.0 GiB" <<<"$out"
 }
-check "checkup: current VM seed is quiet on swap and /tmp" 0 "" checkup_current_vm_quiet
+check "checkup: a tenant/2 VM with its swapfile is quiet on swap and /tmp" 0 "" checkup_current_vm_quiet
+# seed/3 (#290): box lays no swap, so a VM with none is a NOTE, never a FIX.
+checkup_seed3_no_swap() {
+  local out rc=0
+  out="$(FAKE_TMP_SIZE=1073741824 FAKE_SWAP_TOTAL=0 run_checkup vm seed/3)" || rc=$?
+  [ "$rc" -eq 0 ] && grep -q '^NOTE.*lays no swap since 0.11.0' <<<"$out" && ! grep -q '^FIX' <<<"$out"
+}
+check "checkup: a seed/3 VM with no swap is a note, not a fault (#290)" 0 "" checkup_seed3_no_swap
+checkup_tenant2_no_swap() { FAKE_TMP_SIZE=1073741824 FAKE_SWAP_TOTAL=0 run_checkup vm tenant/2; }
+check "checkup: a tenant/2 VM with no swap is still a fault" 1 "missing swap" checkup_tenant2_no_swap
 checkup_current_small_vm_quiet() {
   local out
   out="$(FAKE_MEM_TOTAL=2147483648 FAKE_MEM_AVAILABLE=1073741824 \
@@ -1545,14 +1554,17 @@ check "render_userdata: no token survives the render (#214)" 1 "" \
 # against the RENDERED payload — the thing cloud-init is handed.
 check "tenant seed: the tenant has no sudoers entry (#177)" 1 "" \
   grep -qE '^[[:space:]]*sudo:' "$SEEDLOG"
-check "tenant seed: shellcheck ships (#177 decision 3)" 0 "" \
+check "tenant seed: shellcheck is convergence now, not seed (#290)" 1 "" \
   grep -qE '^[[:space:]]*-[[:space:]]+shellcheck$' "$SEEDLOG"
-check "tenant seed: python3-venv ships (#177 decision 3)" 0 "" \
+check "tenant seed: python3-venv is convergence now, not seed (#290)" 1 "" \
   grep -qE '^[[:space:]]*-[[:space:]]+python3-venv$' "$SEEDLOG"
+# shellcheck disable=SC2016  # $1 expands in the child shell, by design
+check "tenant seed: packages are exactly curl, ca-certificates, chrony (#290)" 0 "curl ca-certificates chrony" \
+  bash -c 'awk "/^packages:/{p=1;next} p&&/^[^ ]/{p=0} p&&/^  - /{print \$2}" "$1" | tr "\n" " " | sed "s/ \$//"' _ "$SEEDLOG"
 check "tenant seed: /tmp is capped at a FIXED 1GiB (#178)" 0 "" \
   grep -q 'size=1G' "$SEEDLOG"
-check "tenant seed: a 4GiB swapfile is laid on the disk (#178)" 0 "" \
-  grep -q 'fallocate -l 4G /swapfile' "$SEEDLOG"
+check "tenant seed: lays no swapfile — swap is convergence (#290, #253 D9)" 1 "" \
+  grep -q '/swapfile' "$SEEDLOG"
 # shellcheck disable=SC2016  # $1 expands in the child shell, by design
 check "tenant seed: chrony and its makestep drop-in ship (#174)" 0 "" \
   bash -c 'grep -q "box-makestep.conf" "$1" && grep -qE "^[[:space:]]*-[[:space:]]+chrony$" "$1"' _ "$SEEDLOG"
@@ -1744,34 +1756,13 @@ for d in "$ROOT"/seed/; do
       # message anywhere — the silent regression this check exists for (#208).
       check "template '$t': restates /var/tmp at its stock 30d — the file MASKS Debian's (#208)" 0 "" \
         grep -qE '^[[:space:]]+q[[:space:]]+/var/tmp[[:space:]]+1777[[:space:]]+root[[:space:]]+root[[:space:]]+30d$' "$d/user-data.yaml"
-      # #178 D2: no swap means every spike is a hard OOM-kill with no grace
-      # period. Four greps, because the four halves fail independently — a
-      # swapfile that is not made, not sized, not activated at boot, or made
-      # in a container that cannot swapon at all.
-      # shellcheck disable=SC2016  # $1 expands in the child shell, by design
-      check "template '$t': provisions a 4GiB swapfile (#178)" 0 "" \
-        bash -c 'grep -v "^[[:space:]]*#" "$1" | grep -qF "fallocate -l 4G /swapfile"' _ "$d/user-data.yaml"
+      # #290: the swapfile left the seed (#253 D9) — convergence lays it.
+      check "template '$t': provisions no swapfile (#290)" 1 "" \
+        grep -qF "/swapfile" "$d/user-data.yaml"
+      # The /tmp fact still belongs next to the line that causes it (#178 D3).
       # shellcheck disable=SC2016
-      check "template '$t': the swapfile is formatted and activated (#178)" 0 "" \
-        bash -c 'grep -v "^[[:space:]]*#" "$1" | grep -qF "mkswap /swapfile" &&
-                 grep -v "^[[:space:]]*#" "$1" | grep -qF "swapon /swapfile"' _ "$d/user-data.yaml"
-      # shellcheck disable=SC2016
-      check "template '$t': the swapfile survives a reboot (fstab, #178)" 0 "" \
-        bash -c 'grep -v "^[[:space:]]*#" "$1" | grep -qF "/swapfile none swap sw 0 0"' _ "$d/user-data.yaml"
-      # Guarded for chrony's reason, not a different one: a container shares
-      # the host's swap and cannot swapon at all, so an unguarded seed writes
-      # 4GiB of nothing into every container mint — CI's own rehearsal
-      # included — and adds an fstab line that fails at every boot.
-      # shellcheck disable=SC2016
-      check "template '$t': swap provisioning is container-guarded (#174's guard, #178)" 0 "" \
-        bash -c 'grep -v "^[[:space:]]*#" "$1" |
-                 grep -qF "! systemd-detect-virt --quiet --container && [ ! -e /swapfile ]"' _ "$d/user-data.yaml"
-      # #178 D3: the fact belongs next to the line that causes it. box.env
-      # already carries a long explanatory header; this asserts it names both
-      # halves and cites the incident, per CONTRIBUTING's comment rule.
-      # shellcheck disable=SC2016
-      check "template '$t': box.env states the /tmp and swap shape it causes (#178)" 0 "" \
-        bash -c 'grep -qE "^#.*/tmp" "$1" && grep -qE "^#.*swap" "$1" && grep -qF "#178" "$1"' _ "$d/box.env" ;;
+      check "template '$t': box.env states the /tmp shape it causes (#178)" 0 "" \
+        bash -c 'grep -qE "^#.*/tmp" "$1" && grep -qF "#178" "$1"' _ "$d/box.env" ;;
   esac
   # A dedicated seed duplicates BOX_USER into cloud-init. box's own tenant seed
   # instead carries exactly the token render_userdata replaces at mint.
@@ -1845,7 +1836,7 @@ check "tenant: permits only an explicit container override (BOX_NO_CONTAINER_FAL
 # box's one tenant seed carries the unprivileged tool floor unconditionally
 # (#214): there is no second shape and no role that could select one.
 for p in python3-venv shellcheck; do
-  check "tenant: ships '$p' — an unprivileged tenant cannot apt-install it (#177)" 0 "" \
+  check "seed: '$p' is not in it — a role installs it (#290)" 1 "" \
     grep -qE "^[[:space:]]*-[[:space:]]+$p\$" "$ROOT/seed/user-data.yaml"
 done
 for retired in claude-box codex-box grok-box kimi-box; do

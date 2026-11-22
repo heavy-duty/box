@@ -80,9 +80,9 @@ instead of pretending to sanitize it.
 ## One seed: box mints, it does not converge (#81, #159, #214)
 
 Every ordinary mint uses one **thin, creds-free seed** — base image, the tenant
-user (`dev`, or `--user`), curl, ca-certificates, chrony, and the
-unprivileged tool floor: no sudoers entry, `python3-venv`, `shellcheck`, a
-fixed 1GiB `/tmp` and a 4GiB swapfile in VM mode. There is no role axis and no
+user (`dev`, or `--user`), curl, ca-certificates, chrony, no sudoers entry,
+and a fixed 1GiB `/tmp`. The toolchain (`python3-venv`, `shellcheck`) and the
+swapfile left in 0.11.0 (#290): they are convergence. There is no role axis and no
 second shape; the seed collapsed to the agent-class hygiene because that is the
 one the fleet measured.
 

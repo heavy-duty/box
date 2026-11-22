@@ -2450,9 +2450,12 @@ cmd_new() {
     # which box_tier() derives from whoever is ASKING, not from the box.
     # tenant/2 is the generation that introduced #178's bounded /tmp and VM
     # swapfile; older boxes have no marker and checkup reports that honestly.
-    # The seed moved to seed/ in #288 with its content unchanged, so the
-    # generation is still tenant/2's — checkup keys on that value.
-    local seed_generation=tenant/2
+    # seed/3 (0.11.0): the seed lost the toolchain and the swapfile (#290) and
+    # its users (#291). tenant/2 is the generation that introduced #178's
+    # bounded /tmp and VM swapfile; older boxes have no marker and checkup
+    # reports that honestly — and reads the generation to know whether a VM
+    # with no swap is a defect (tenant/2) or the design (seed/3).
+    local seed_generation=seed/3
     local stamp=(
       --config user.box.schema="$BOX_STAMP_SCHEMA"
       --config user.box.version="$(box_version)"

@@ -89,8 +89,17 @@ else
     problems=$((problems + 1))
   elif [ "$swap_total" -eq 0 ]; then
     echo "SWAP     none"
-    echo "FIX       missing swap; remint with tenant seed #178 for its 4.0 GiB swapfile."
-    problems=$((problems + 1))
+    case "$seed" in
+      seed/*)
+        # Since seed/3 (0.11.0, #290) box lays no swap: convergence does. An
+        # unconverged box has none by design, so this is a note, not a fault.
+        echo "NOTE      box lays no swap since 0.11.0 — a converged role provides it (SWAP_SIZE); an unconverged box has none." ;;
+      *)
+        # tenant/2 laid a 4 GiB swapfile (#178), and an unmarked box predates
+        # even that: for either, none is a defect.
+        echo "FIX       missing swap; the tenant seed of #178 laid a 4.0 GiB swapfile — remint, or converge a role that sets swap."
+        problems=$((problems + 1)) ;;
+    esac
   else
     printf '%-9s%s total\n' SWAP "$(gib "$swap_total")"
   fi

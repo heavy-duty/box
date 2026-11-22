@@ -1847,9 +1847,9 @@ box info drill | grep -q 'pristine' && ok "info lists the automatic pristine sna
 box exec drill -- sh -c 'command -v tmux' >/dev/null 2>&1 \
   && no "tmux is still in a fresh mint — the seed should carry none since #289" \
   || ok "a fresh mint carries no tmux — 'box tmux' left with the package (#289)"
-box exec drill -- shellcheck --version >/dev/null 2>&1 \
-  && ok "the seed's unprivileged toolchain landed (shellcheck, #177 decision 3)" \
-  || no "'shellcheck --version' failed inside the box — the seed's toolchain did not land"
+box exec drill -- sh -c 'command -v shellcheck' >/dev/null 2>&1 \
+  && no "shellcheck is still in a fresh mint — the toolchain is convergence since #290" \
+  || ok "a fresh mint carries no shellcheck — the toolchain is a role's (#290)"
 
 # --- the snapshot → clone workflow, which is the whole point of the tool ---
 box snapshot drill authed 2>&1 | grep -q authed && ok "snapshot drill authed" || no "snapshot failed"
