@@ -883,7 +883,9 @@ as_svc incus --project "$ps_" storage volume create default drill-vol size=8MiB 
 as_svc incus --project "$ps_" storage volume create "$POOL" drill-vol size=8MiB >/dev/null 2>&1 \
   && ok "(r) a volume on its own pool works" \
   || no "(r) the service could not create a volume on its own pool $POOL"
-if out="$(as_svc box new --name drill-pool "${MODE[@]}" --memory 1GiB --cpu 1 --disk 2GiB 2>&1)"; then
+# No sizing flags on purpose (#283): a capped, pooled grant must mint with a
+# plain 'box new' — box clamps what the caller did not choose to the caps.
+if out="$(as_svc box new --name drill-pool "${MODE[@]}" 2>&1)"; then
   rp="$(as_svc incus --project "$ps_" config device get drill-pool root pool 2>/dev/null \
         || as_svc incus --project "$ps_" profile device get box-profile root pool 2>/dev/null)"
   [ "$rp" = "$POOL" ] && ok "(r) box new as the service lands on $POOL" || no "(r) box new landed on '$rp', not $POOL"
@@ -935,6 +937,13 @@ elif [ "$src" -ne 0 ]; then
 else
   ok "(s) a second project answers a granted user with its OWN project's view, never the other's"
   second_project="silently-scoped"
+fi
+# The admins' own project too: a granted service must not see 'default'.
+dout="$(as_svc incus --project default list --format csv -c n 2>&1)"; drc=$?
+if [ "$drc" -ne 0 ] || [ -z "$dout" ]; then
+  ok "(s) the 'default' project is closed to a granted user too (rc=$drc)"
+else
+  no "(s) a granted user LISTED the default project: $(printf '%s' "$dout" | head -3 | tr '\n' ' ')"
 fi
 incus project delete boxdrill-shared >/dev/null 2>&1 || { incus --project boxdrill-shared profile delete drill-secret >/dev/null 2>&1; incus project delete boxdrill-shared >/dev/null 2>&1; }
 aud "s. second project to a granted user: $second_project (rc=$src) — docs/plans/multi-owner-boxes.md cites this"

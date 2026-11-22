@@ -85,6 +85,9 @@ if [ -n "$share_group" ] || [ "$unshare" -eq 1 ]; then
 fi
 if [ -n "$share_group" ]; then
   [[ "$share_group" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "box grant: --share needs a group name, got '$share_group'" >&2; exit 2; }
+  # The tenant's name lands in a sudoers.d file name and in 'box --as', both of
+  # which take this charset only (sudo's includedir skips a name with a dot).
+  [[ "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "box grant --share: '$user' is not a name sudoers.d and 'box --as' can carry (lowercase letters, digits, _ and -)" >&2; exit 2; }
 fi
 share_bin="${BOX_SHARE_BIN:-/usr/local/bin/box}"
 share_dir="${BOX_SHARE_DIR:-/etc/box/shares}"
@@ -274,7 +277,14 @@ backout() {
 # $SUDO's: a non-root admin runs this script too. The trap is set FIRST, and
 # a failed cleanup can never skip the group backout.
 cleanup_svc_home() { [ -z "$svc_home" ] || $SUDO rm -rf -- "$svc_home" || true; }
-trap 'cleanup_svc_home || true; backout' EXIT
+# A share this run wrote, backed out with the rest when the grant fails (#287).
+share_written=0
+backout_share() {
+  [ "$share_written" -eq 1 ] || return 0
+  $SUDO rm -f -- "$sudoers_d/box-share-$user" "$sudoers_d/.box-share-$user.tmp" "$share_dir/$user" || true
+  echo "box grant: FAILED — the share this run wrote was removed again" >&2
+}
+trap 'cleanup_svc_home || true; backout_share || true; backout' EXIT
 if [ "$service" -eq 1 ]; then
   svc_home="$($SUDO mktemp -d /tmp/box-grant.XXXXXX)"
   $SUDO chown "$user" "$svc_home"
@@ -446,11 +456,6 @@ if [ -n "$pool" ]; then
     incus storage set "$pool" user.box.grant "$user" </dev/null
     echo "pool: created $pool ($pool_size btrfs loop file) for $user"
   fi
-  incus project unset "$project" "limits.disk.pool.$pool" </dev/null 2>/dev/null || true
-  while read -r other; do
-    if [ -z "$other" ] || [ "$other" = "$pool" ]; then continue; fi
-    incus project set "$project" "limits.disk.pool.$other" 0 </dev/null
-  done < <(incus storage list --format csv -c n </dev/null)
   # Incus enforces per-pool limits ONLY when the project also sets limits.disk
   # (AllowVolumeCreation returns early without it — measured in the
   # rehearsal, and read in internal/server/project/permissions.go). So the
@@ -460,7 +465,22 @@ if [ -n "$pool" ]; then
     echo "box grant --pool: could not set limits.disk=$pool_size on $project: $err" >&2; exit 1
   fi
   incus project set "$project" user.box.pool "$pool" </dev/null
-  echo "pool: $project confined to $pool (limits.disk=$pool_size, every other pool's limit is 0; re-run the grant after adding a pool)"
+fi
+# The confinement itself runs on EVERY grant of a pooled project — given
+# --pool or read back from the marker — so a pool added to the host since is
+# zeroed by a plain re-run, exactly as the help promises.
+confine_pool="${pool:-$(incus project get "$project" user.box.pool </dev/null 2>/dev/null || true)}"
+if [ -n "$confine_pool" ]; then
+  incus project unset "$project" "limits.disk.pool.$confine_pool" </dev/null 2>/dev/null || true
+  while read -r other; do
+    if [ -z "$other" ] || [ "$other" = "$confine_pool" ]; then continue; fi
+    if ! err="$(incus project set "$project" "limits.disk.pool.$other" 0 </dev/null 2>&1)"; then
+      echo "box grant: could not confine $project away from pool '$other': $err" >&2
+      echo "  (something of $project's already lives on '$other' — move or delete it, then re-run)" >&2
+      exit 1
+    fi
+  done < <(incus storage list --format csv -c n </dev/null)
+  echo "pool: $project confined to $confine_pool (every other pool's limit is 0)"
 fi
 
 # 6c. Caps (#283): the project's own limits.* — 'none' unsets. Incus then
@@ -509,6 +529,12 @@ fi
 if [ -n "$share_group" ]; then
   getent group "$share_group" >/dev/null || { echo "box grant --share: no such group: $share_group (box never creates host groups; groupadd it first)" >&2; exit 1; }
   [ -x "$share_bin" ] || { echo "box grant --share: $share_bin is not there — sharing needs box installed globally (sudo install.sh), so every member runs the same path" >&2; exit 1; }
+  # The record FIRST: revoke and doctor key on it, so a rule can never be live
+  # without one. Both are removed again if this grant fails after writing them.
+  $SUDO install -d -m 0755 "$share_dir"
+  printf '%s\n' "$share_group" | $SUDO tee "$share_dir/$user" >/dev/null
+  $SUDO chmod 0644 "$share_dir/$user"
+  share_written=1
   tmp_rule="$sudoers_d/.box-share-$user.tmp"
   printf '# Written by box grant --share (#287); removed by --unshare and revoke.\n%%%s ALL=(%s) NOPASSWD: %s\n' "$share_group" "$user" "$share_bin" \
     | $SUDO tee "$tmp_rule" >/dev/null
@@ -518,9 +544,6 @@ if [ -n "$share_group" ]; then
     echo "box grant --share: the sudoers rule did not validate (visudo -cf) — nothing written" >&2; exit 1
   fi
   $SUDO mv -f -- "$tmp_rule" "$sudoers_d/box-share-$user"
-  $SUDO install -d -m 0755 "$share_dir"
-  printf '%s\n' "$share_group" | $SUDO tee "$share_dir/$user" >/dev/null
-  $SUDO chmod 0644 "$share_dir/$user"
   echo "share: '$share_group' may act as $user through 'box --as $user …' (box only, never a shell)"
   {
     echo "box: ============================== WARNING =============================="

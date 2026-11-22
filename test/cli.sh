@@ -86,7 +86,6 @@ check "box tmux is refused, carrying the replacement (#289)" 2 \
   "box exec --user <user> <box> -- tmux new-session -A -s main" "$BOX" tmux work
 check "box tmux: ...and the reason the verb existed (SIGHUP)" 2 "SIGHUP" "$BOX" tmux work
 # shellcheck disable=SC2016  # $1 expands in the child shell, by design
-check "help: no tmux verb in the listing's live commands (#289)" 1 "" bash -c '"$1" help | grep -E "^  tmux " | grep -qv "Removed"' _ "$BOX"
 check "box templates is refused, naming where roles live (#288)" 2 \
   "box has no templates since 0.11.0" "$BOX" templates
 check "new: --from refuses --autostart (the source's boot demands ride along)" 2 \
@@ -350,17 +349,19 @@ awk '/^cmd_exec\(\) \{/,/^\}/' "$BOX" > "$EXECFN"
 check "box exec: cmd_exec extracted (guards the grep)" 0 "exec \"\$@\"" cat "$EXECFN"
 check "box exec: extracted function is valid bash" 0 "" bash -n "$EXECFN"
 check "box exec: command argv never rides sudo -i" 1 "" grep -q -- ' -i ' "$EXECFN"
+check "box exec: --user enters through runuser, never guest sudo (#291 review)" 1 "" grep -q 'sudo' "$EXECFN"
 
 exec_fixture() { # exec_fixture <command> [arg...]
   bash -c '
     set -e
     . "$0"
     require_guest_user() { :; }
+    # Strict: an && chain does not abort under set -e, so a mismatch must exit
+    # explicitly or the fixture passes by running the payload anyway.
     incus() {
-      [ "$1" = exec ] && [ "$2" = fixture ] && [ "$3" = -- ]
+      if ! { [ "$1" = exec ] && [ "$2" = fixture ] && [ "$3" = -- ]; }; then echo "BAD WRAPPER: $*" >&2; exit 9; fi
       shift 3
-      [ "$1" = sudo ] && [ "$2" = -u ] && [ "$3" = fixture-user ] &&
-        [ "$4" = -H ]
+      if ! { [ "$1" = runuser ] && [ "$2" = -u ] && [ "$3" = fixture-user ] && [ "$4" = -- ]; }; then echo "BAD WRAPPER: $*" >&2; exit 9; fi
       shift 4
       "$@"
     }
@@ -376,7 +377,7 @@ exec_root_fixture() {
     set -e
     . "$0"
     incus() {
-      [ "$1" = exec ] && [ "$2" = fixture ] && [ "$3" = -- ] && [ "$4" = bash ] && [ "$5" = -lc ]
+      if ! { [ "$1" = exec ] && [ "$2" = fixture ] && [ "$3" = -- ] && [ "$4" = bash ] && [ "$5" = -lc ]; }; then echo "BAD WRAPPER: $*" >&2; exit 9; fi
       shift 3
       "$@"
     }
@@ -765,8 +766,11 @@ rm -f "$SFPRE"
 sf_region_only_prints() {
   local stray
   stray="$(awk '/^# box-strong-form-prose-begin$/,/^# box-strong-form-prose-end$/' "$1" \
-    | grep -vE '^#|^[[:space:]]*$|^refuse_(role|template_[a-z]+)\(\)[[:space:]]*\{$|^\}$|^[[:space:]]+echo([[:space:]]|$)|^[[:space:]]+exit[[:space:]]+[0-9]+$')"
+    | grep -vE '^#|^[[:space:]]*$|^refuse_(role|template_staging|template_any|template_verb)\(\)[[:space:]]*\{$|^\}$|^[[:space:]]+echo([[:space:]]|$)|^[[:space:]]+exit[[:space:]]+[0-9]+$')"
   [ -z "$stray" ] || { printf 'acting line inside the prose region:\n%s\n' "$stray"; return 1; }
+  # An echo is prose only if it runs nothing: no command substitution inside.
+  stray="$(awk '/^# box-strong-form-prose-begin$/,/^# box-strong-form-prose-end$/' "$1" | grep -E '\$\(|`' || true)"
+  [ -z "$stray" ] || { printf 'a command substitution inside the prose region:\n%s\n' "$stray"; return 1; }
 }
 check "strong form: the prose region only prints and exits (#214)" 0 "" \
   sf_region_only_prints "$ROOT/bin/box"
@@ -2448,7 +2452,7 @@ check "grant: the touch's stderr is kept, not swallowed (#281)" 0 "" \
 check "grant: the old swallowing touch is gone" 1 "" \
   grep -qF 'incus project list >/dev/null 2>&1 || true' "$ROOT/host/grant-user.sh"
 check "grant --service: the throwaway home is removed on every exit" 0 "" \
-  grep -qF "trap 'cleanup_svc_home || true; backout' EXIT" "$ROOT/host/grant-user.sh"
+  grep -qF "trap 'cleanup_svc_home || true; backout_share || true; backout' EXIT" "$ROOT/host/grant-user.sh"
 check "grant --service: the throwaway home lives under /tmp, never root's TMPDIR" 0 "" \
   grep -qF 'mktemp -d /tmp/box-grant.XXXXXX' "$ROOT/host/grant-user.sh"
 # shellcheck disable=SC2016  # the $-strings are literals in the target file
@@ -2517,6 +2521,8 @@ check "grant --pool: box-profile roots on the grant pool" 0 "--project user-1500
 check "grant: a re-run without --pool keeps the profile's root on the grant pool" 0 "rooted on gig" gs_grant --service svc
 check "grant: the re-run re-points the refreshed profile" 0 "profile device set box-profile root pool gig" gs_log
 check "grant: the re-run creates no pool" 1 "" grep -q "storage create" "$GS/log"
+check "grant: a plain re-run re-applies the zero limits to every other pool (#282 T2)" 0 "project set user-1500 limits.disk.pool.default 0" gs_log
+
 : >"$GS/log"
 check "grant --pool: re-run adopts the user's own pool" 0 "pool: gig already exists (200GiB, btrfs, svc's)" \
   gs_grant --service --pool gig --pool-size 100GiB svc
@@ -2598,10 +2604,30 @@ check "box --as: no share at all says so" 2 "is not a shared tenant on this host
 check "box --as: a bad tenant name is a usage error" 2 "--as needs a tenant name" asbox --as 'Bad;x' list
 check "box --as: never prompts (sudo is always -n)" 1 "" grep -vq -- "sudo -n " "$AS/log"
 rm -rf "$AS"
-# No writable home (#281, #287): a private per-uid INCUS_CONF, never a shared one.
-# shellcheck disable=SC2016  # the $-strings expand in the child shell or stub, by design
-check "box: with no writable home, INCUS_CONF is a private per-uid directory" 0 "box-incus-" \
-  env HOME=/nonexistent TMPDIR="$(mktemp -d)" bash -c '"$1" version >/dev/null; ls "$TMPDIR"' _ "$BOX"
+# No writable home (#281, #287): a private, unpredictable INCUS_CONF for the
+# run — never a fixed per-uid name a local user could squat or share — and it
+# is gone afterwards.
+# shellcheck disable=SC2016  # a literal in the target file
+check "box: with no writable home, INCUS_CONF is a per-run mktemp dir" 0 "" \
+  grep -qF 'mktemp -d "${TMPDIR:-/tmp}/box-incus.XXXXXXXX"' "$BOX"
+# shellcheck disable=SC2016  # the $-strings expand in the child shell, by design
+check "box: ...and the run leaves nothing behind" 0 "[]" \
+  env HOME=/nonexistent TMPDIR="$(mktemp -d)" bash -c '"$1" help >/dev/null; printf "[%s]" "$(ls -A "$TMPDIR")"' _ "$BOX"
+# Acting AS a shared tenant (#287, review round): a member reached this through
+# sudo, so only the box surface runs — never the incus escape hatch (an editor
+# is a host shell as the tenant; file push/pull reads its files), export/import
+# or the host verbs.
+SA="$(mktemp -d)"; : >"$SA/$(id -un)"
+sabox() { env SUDO_USER=boxmember BOX_SHARE_DIR="$SA" "$BOX" "$@"; }
+check "--as: a member cannot reach 'box incus' (an editor is a host shell)" 2 "not available to a shared tenant's members" \
+  sabox incus work -- config edit {}
+check "--as: ...nor export to a host path as the tenant" 2 "not available" sabox export work /tmp/x.tar.gz
+check "--as: ...nor import from one" 2 "not available" sabox import /tmp/x.tar.gz
+check "--as: ...nor the host verbs" 2 "not available" sabox grant someone
+check "--as: the box surface itself still runs (help)" 0 "USAGE" sabox help
+check "--as: an ordinary sudo user who is not a shared tenant is untouched" 0 "USAGE" \
+  env SUDO_USER=boxmember BOX_SHARE_DIR="$(mktemp -d)" "$BOX" help
+rm -rf "$SA"
 # The CLI layer (#282, #283): 'box grant'/'box revoke' hand every argument to
 # their script verbatim. box's own --memory/--cpu/--force must not be parsed
 # out first — the rehearsal on real Incus found 'box grant --memory 3GiB'
@@ -2617,6 +2643,36 @@ check "box revoke passes --force through verbatim (#285)" 0 "SCRIPT-ARGS: gig --
 check "box grant --help is still box's help" 0 "--pool NAME --pool-size SIZE gives the grant" \
   bash "$PT/bin/box" grant --help
 rm -rf "$PT"
+# clamp_to_grant_caps (#283, review round): a capped grant's plain 'box new'
+# mints inside the caps; a resource the caller chose is never touched.
+CLFN="$(mktemp)"
+awk '/^size_bytes\(\) \{/,/^\}/; /^clamp_to_grant_caps\(\) \{/,/^\}/' "$BOX" > "$CLFN"
+# shellcheck disable=SC2016  # $-strings expand in the child shell, by design
+clamp() { env "$@" bash -c '
+  . "$0"
+  box_tier() { echo restricted; }
+  id() { echo 1500; }
+  incus() { case "$*" in
+      "project get user-1500 limits.cpu") echo "${CAP_CPU:-}" ;;
+      "project get user-1500 limits.memory") echo "${CAP_MEM:-}" ;;
+      "project get user-1500 limits.disk") echo "${CAP_DISK:-}" ;;
+    esac; }
+  T_CPU=2 T_MEMORY=2GiB T_DISK=20GiB
+  clamp_to_grant_caps
+  printf "CPU=%s MEM=%s DISK=%s\n" "$T_CPU" "$T_MEMORY" "$T_DISK"' "$CLFN"; }
+check "clamp: defaults above the caps are clamped to them, each said once" 0 "CPU=1 MEM=1GiB DISK=3GiB" \
+  clamp CAP_CPU=1 CAP_MEM=1GiB CAP_DISK=3GiB cpu= memory= disk= size=
+check "clamp: ...and the operator is told" 0 "your grant caps CPU at 1" \
+  clamp CAP_CPU=1 CAP_MEM=1GiB CAP_DISK=3GiB cpu= memory= disk= size=
+check "clamp: caps above the defaults change nothing" 0 "CPU=2 MEM=2GiB DISK=20GiB" \
+  clamp CAP_CPU=8 CAP_MEM=16GiB CAP_DISK=200GiB cpu= memory= disk= size=
+check "clamp: a resource the caller chose is left for Incus to judge" 0 "CPU=2 MEM=1GiB DISK=3GiB" \
+  clamp CAP_CPU=1 CAP_MEM=1GiB CAP_DISK=3GiB cpu=2 memory= disk= size=
+check "clamp: no caps, no change" 0 "CPU=2 MEM=2GiB DISK=20GiB" clamp cpu= memory= disk= size=
+# shellcheck disable=SC2016  # $-strings expand in the child shell, by design
+check "new: cmd_new clamps after load_seed" 0 "" bash -c '
+  awk "/^cmd_new\(\) \{/,/^\}/" "$1" | grep -A1 "^    load_seed$" | grep -q "clamp_to_grant_caps"' _ "$BOX"
+rm -f "$CLFN"
 check "help grant documents --pool and the caps" 0 "--pool NAME --pool-size SIZE gives the grant a storage pool" "$BOX" help grant
 # shellcheck disable=SC2016  # the $-strings are literals in the target file
 check "new: a pooled grant sizes a container's root too (#282)" 0 "" bash -c '
@@ -2640,6 +2696,8 @@ case "$*" in
   "project get user-1500 user.box.service") cat "$st/service" 2>/dev/null; exit 0 ;;
   "project get user-1500 user.box.pool") cat "$st/pool" 2>/dev/null; exit 0 ;;
   "storage get gig user.box.grant") cat "$st/pool-owner" 2>/dev/null; exit 0 ;;
+  "storage get default user.box.grant") exit 0 ;;
+  "storage list --format csv -c n") printf "default\ngig\n" ;;
   "storage show gig") printf "name: gig\nused_by:\n- /1.0/instances/r1?project=user-1500\n%s\nstatus: Created\n" "$(cat "$st/foreign" 2>/dev/null)" ;;
   "storage delete gig") log "$*" ;;
   "list --format csv --columns n") echo r1 ;;
@@ -2686,6 +2744,13 @@ check "revoke --purge-pool: refused while the pool is shared, before anything is
 check "revoke --purge-pool: the refusal deleted nothing" 1 "" grep -q "delete" "$RS/log"
 rs_reset; echo other >"$RS/state/pool-owner"
 check "revoke --purge-pool: someone else's pool is never deleted" 1 "is not svc's grant pool" rs_revoke svc --purge --purge-pool
+# A PERSON's grant can own a pool too (#282): --purge-pool works for it (#285).
+rs_reset; : >"$RS/state/service"
+check "revoke --purge-pool works for a person's pooled grant too" 0 "purge: grant pool gig removed" rs_revoke svc --purge --purge-pool
+# The pool is found by its own marker, so a purge that lost the project and
+# then failed on the pool can be finished by a re-run.
+rs_reset; : >"$RS/state/project-gone"; : >"$RS/state/pool"
+check "revoke: a re-run after the project is gone still finds and removes the grant pool" 0 "purge: grant pool gig removed" rs_revoke svc --purge --purge-pool
 check "revoke: --purge-pool without --purge is a usage error" 2 "--purge-pool goes with --purge" rs_revoke svc --purge-pool
 rs_reset; mkdir -p "$RS/sudoers.d" "$RS/shares"; echo rule >"$RS/sudoers.d/box-share-svc"; echo staging >"$RS/shares/svc"
 check "revoke: a shared tenant's sudoers rule and record go with the revoke (#287)" 0 "share: removed" \
@@ -2712,7 +2777,7 @@ check "revoke: the purge asserts the certificate's absence too" 0 "" \
 # A failed grant must not leave a half-granted user: if THIS run added the
 # group, the exit path takes it back (and the trap disarms only on success).
 check "grant: backs out its own group-add on failure" 0 "" \
-  grep -qE "^trap '([a-z_]+( \|\| true)?; )?backout' EXIT" "$ROOT/host/grant-user.sh"
+  grep -qE "^trap '([a-z_]+( \|\| true)?; )*backout' EXIT" "$ROOT/host/grant-user.sh"
 check "grant: the back-out disarms on success" 0 "" \
   grep -qF 'trap - EXIT' "$ROOT/host/grant-user.sh"
 # The backout must VERIFY the removal and scream when it cannot — an
@@ -2998,7 +3063,9 @@ case "$*" in
     uid=1000; for u in ${FAKE_GUEST_USERS:-}; do echo "$u:x:$uid:$uid::/home/$u:/bin/bash"; uid=$((uid+1)); done
     echo "root:x:0:0:root:/root:/bin/bash" ;;
   "exec work -- getent passwd "*)
+    [ -z "${FAKE_EXEC_DOWN:-}" ] || { echo "Error: Instance is not running" >&2; exit 1; }
     want="${*: -1}"; for u in ${FAKE_GUEST_USERS:-}; do [ "$u" = "$want" ] && { echo "$u:x:1000:1000::/home/$u:/bin/bash"; exit 0; }; done; exit 2 ;;
+  "config get work user.box.user") echo "${FAKE_LEGACY_STAMP:-}" ;;
   "config get "*)             exit 1 ;;
 esac
 exit 0
@@ -3046,7 +3113,7 @@ shell_two_users_no_hint() { ! FAKE_GUEST_USERS="claude ops" runbox "$SHLOG" shel
 check "shell: two regular users, no hint" 0 "" shell_two_users_no_hint
 shell_as_claude() { FAKE_GUEST_USERS=claude runbox "$SHLOG" shell --user claude work; }
 check "shell --user claude enters as claude" 0 "" shell_as_claude
-check "shell --user: ...through a login shell as that user" 0 "" grep -qFx 'incus exec work -- sudo -u claude -i' "$SHLOG"
+check "shell --user: ...through a login shell as that user, via runuser (no guest sudo needed)" 0 "" grep -qFx 'incus exec work -- runuser -l claude' "$SHLOG"
 shell_as_ghost() { FAKE_GUEST_USERS="claude ops" runbox "$SHLOG" shell --user ghost work; }
 check "shell --user ghost refuses (exit 2), naming who exists" 2 "no user 'ghost' in work — it has: claude ops" shell_as_ghost
 check "shell --user ghost: ...and never fell back to root" 1 "" grep -q 'bash -l' "$SHLOG"
@@ -3058,6 +3125,23 @@ check "exec --user ghost: ...nothing ran" 1 "" grep -q 'bash -lc' "$SHLOG"
 exec_root() { runbox "$SHLOG" exec work -- id -u; }
 check "exec runs as root by default (#291)" 0 "" exec_root
 check "exec: ...with no sudo in the way" 0 "" grep -qF 'incus exec work -- bash -lc cd ~ && exec "$@" _ id -u' "$SHLOG"
+shell_zero_users_no_hint() { ! runbox "$SHLOG" shell work | grep -q "entering as root"; }
+check "shell: a root-only box prints no hint" 0 "" shell_zero_users_no_hint
+legacy_box() { FAKE_LEGACY_STAMP=claude FAKE_GUEST_USERS=claude runbox "$SHLOG" shell work; }
+check "shell: a pre-0.11 box stamped user.box.user=claude enters as ROOT by default (#291)" 0 "" legacy_box
+check "shell: ...the stamp was not even read to choose" 1 "" grep -q 'config get work user.box.user' "$SHLOG"
+legacy_box_as_claude() { FAKE_LEGACY_STAMP=claude FAKE_GUEST_USERS=claude runbox "$SHLOG" shell --user claude work; }
+check "shell: ...and --user claude enters as claude" 0 "" legacy_box_as_claude
+check "shell: ...via runuser -l claude" 0 "" grep -qFx 'incus exec work -- runuser -l claude' "$SHLOG"
+user_down() { FAKE_EXEC_DOWN=1 runbox "$SHLOG" shell --user claude work; }
+check "shell --user on a box whose agent is down says so (exit 1), not 'no such user'" 1 "could not look up user 'claude' in work (is it running?)" user_down
+check "--user with an empty value is refused, never a root entry (#291 review)" 2 "--user needs a value" "$BOX" exec --user "" work -- id -u
+check "box root --user is refused, pointing at box shell --user" 2 "box shell --user claude <box>" "$BOX" root --user claude work
+check "--user on another verb is refused, not ignored" 2 "--user is for 'box shell' and 'box exec'" "$BOX" info --user claude work
+check "--autostart on a verb other than new is refused" 2 "are 'box new' flags" "$BOX" import --autostart x.tar.gz
+# shellcheck disable=SC2016  # $-strings expand in the child shell, by design
+check "box help lists no removed verb (tmux, templates) (#289, #288)" 1 "" bash -c '"$1" help | grep -qE "^  (tmux|templates) "' _ "$BOX"
+check "box help tmux still explains the removal" 0 "Removed in 0.11.0" "$BOX" help tmux
 check "box_user() is gone — nothing reads user.box.user to pick an entry (#291)" 1 "" \
   grep -qE '^box_user\(\)' "$BOX"
 check "root: live rehearsal proves the tenant holds no sudoers entry" 0 "" \
@@ -3536,6 +3620,10 @@ done
 # The staging box WITHOUT its template (#288): the flags reproduce what
 # staging-box's box.env carried — VM only, autostart, medium — through the
 # same mint path every box takes.
+RVLOG="$MWORK/require-vm-container.log"
+check "mint: --require-vm --container is refused when driven (#68, #288)" 2 "--require-vm refuses container mode" \
+  mintbox "$RVLOG" new --name rv --require-vm --container
+check "mint: ...and nothing was launched" 1 "" grep -q 'incus launch' "$RVLOG"
 STAGINGLOG="$MWORK/staging-template.log"
 mintbox "$STAGINGLOG" new --name staging --size medium --autostart --require-vm >/dev/null 2>&1
 check "mint staging: --autostart stamps the server autostart demand (#68, #288)" 0 "" \
@@ -7683,14 +7771,14 @@ check "probe ledger: the extracted block is valid bash" 0 "" bash -n "$LEDGERFN"
 # script around it, so the harness supplies it, exactly as the drill does.
 led() { bash -c "set -u; findings=(); . '$LEDGERFN'; $1"; }
 # A complete run: every phase emits what it declared.
-FULL='PHASE_RAN=([I]=1 [A]=8 [B]=47 [G]=17 [C]=9 [E]=7 [D]=0 [T]=1)'
+FULL='PHASE_RAN=([I]=1 [A]=8 [B]=47 [G]=16 [C]=9 [E]=7 [D]=0 [T]=1)'
 
 # shellcheck disable=SC2016  # the snippet is evaluated by led(), not here
-check "probe ledger: the declared total is 90" 0 "[90]" led 'printf "[%s]" "$(ledger_declared)"'
+check "probe ledger: the declared total is 89" 0 "[89]" led 'printf "[%s]" "$(ledger_declared)"'
 # The number CONTRIBUTING and drills/README.md have quoted all along with
 # nothing checking it. If a phase gains probes, both move together or this reds.
 check "probe ledger: ...which is the contract CONTRIBUTING states" 0 "" \
-  grep -qF '90-probe' "$ROOT/CONTRIBUTING.md"
+  grep -qF '89-probe' "$ROOT/CONTRIBUTING.md"
 # The README quotes the total too, and it was the ONE copy nothing checked —
 # so it sat at "84 checks, 84 passing" through a cut that moved every other
 # copy to 81. Driven off ledger_declared() like the rest, rather than a
@@ -7737,25 +7825,25 @@ check "probe ledger: ...and the total the README advertises (#214)" 0 "" \
 # The guard's own test, on the axis the round moved it: the denominator is
 # pinned and the numerator is free, so a run that HAD a failure is reportable.
 RQPROBE="$(mktemp)"
-printf 'currently **90 checks, 89 passing**\n' > "$RQPROBE"
-check "probe ledger: ...and a run with a failure is still quotable, 89/90" 0 "" \
+printf 'currently **89 checks, 88 passing**\n' > "$RQPROBE"
+check "probe ledger: ...and a run with a failure is still quotable, 88/89" 0 "" \
   readme_quotes_the_total "$RQPROBE"
 printf 'currently **84 checks, 84 passing**\n' > "$RQPROBE"
 check "probe ledger: ...while the drift that started this, 84/84, reds" 1 "advertises 84" \
   readme_quotes_the_total "$RQPROBE"
-printf 'currently **90 checks, 99 passing**\n' > "$RQPROBE"
+printf 'currently **89 checks, 99 passing**\n' > "$RQPROBE"
 check "probe ledger: ...and so does passing more probes than exist" 1 "more probes than exist" \
   readme_quotes_the_total "$RQPROBE"
 # The second copy, which 'head -1' would have read straight past: the first
 # total is correct here and the guard must still red.
-printf 'currently **90 checks, 89 passing**\nand elsewhere **84 checks, 84 passing**\n' > "$RQPROBE"
+printf 'currently **89 checks, 88 passing**\nand elsewhere **84 checks, 84 passing**\n' > "$RQPROBE"
 check "probe ledger: ...and a second total nothing would have read reds too" 1 "quotes 2 totals" \
   readme_quotes_the_total "$RQPROBE"
 rm -f "$RQPROBE"
 
 check "probe ledger: a complete run is short in nothing" 0 "[]" \
   led "$FULL; printf '[%s]' \"\$(ledger_short)\""
-check "probe ledger: a complete run's floor is the declared total" 0 "[90]" \
+check "probe ledger: a complete run's floor is the declared total" 0 "[89]" \
   led "$FULL; printf '[%s]' \"\$(ledger_expected)\""
 
 # THE regression. A phase that never executed used to be invisible: the pass
@@ -7771,7 +7859,7 @@ check "probe ledger: overshooting a phase is not a shortfall" 0 "[]" \
 
 # A declared skip is honest — it lowers the expectation by exactly its probes
 # and says so. The whole point is that the floor is never tuned down silently.
-check "probe ledger: a declared skip lowers the floor by its probes" 0 "[81]" \
+check "probe ledger: a declared skip lowers the floor by its probes" 0 "[80]" \
   led "$FULL; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; printf '[%s]' \"\$(ledger_expected)\""
 check "probe ledger: ...so a declared skip is not a shortfall" 0 "[]" \
   led "$FULL; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; printf '[%s]' \"\$(ledger_short)\""
@@ -7899,39 +7987,39 @@ summary_lacks() {   # 0 when the composed run does NOT say $1
   local needle="$1"; shift
   ! run_summary "$1" 2>&1 | grep -qF -e "$needle"
 }
-COMPLETE="$FULL; pass=90; fail=0"
+COMPLETE="$FULL; pass=89; fail=0"
 
-check "drill summary: a complete run reports 90/90 and EXITS 0" 0 "90/90 passed, 0 failed" \
+check "drill summary: a complete run reports 89/89 and EXITS 0" 0 "89/89 passed, 0 failed" \
   run_summary "$COMPLETE"
 
 # THE regression, end to end. Phase C never executed: 62 verdicts, none of them
 # failing, and the drill used to leave here 0 with "62 passed, 0 failed" on the
 # line an operator transcribes into drills/<version>.md as proof.
 check "drill summary: a phase that never ran EXITS NON-ZERO" 1 "the drill ran SHORT:" \
-  run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=81"
+  run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
 check "drill summary: ...naming the short phase, against the full denominator" 1 \
-  "short in: C(0/9)" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=81"
-check "drill summary: ...and the record carries 81/90, not a clean 81" 1 \
-  "81/90 passed, 1 failed" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=81"
+  "short in: C(0/9)" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
+check "drill summary: ...and the record carries 80/89, not a clean 80" 1 \
+  "80/89 passed, 1 failed" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
 # The verdict names both roads to a short phase, not just the commoner one.
 check "drill summary: ...and does not diagnose 'never ran' as the only cause" 1 \
-  "or failed before emitting the rest" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=81"
+  "or failed before emitting the rest" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
 
 # A DECLARED skip is the line between honest and tuned-down: same 62 verdicts,
 # but the run said which nine it was not going to emit, and why.
 check "drill summary: a declared skip lowers the floor and EXITS 0" 0 \
-  "81/81 passed, 0 failed" \
-  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=81"
+  "80/80 passed, 0 failed" \
+  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=80"
 check "drill summary: ...and the SKIP survives into the findings block" 0 \
   "SKIP: no isolation stack" \
-  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=81"
+  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=80"
 
 # The other road to non-zero: nothing short, one thing genuinely failed. Both
 # roads have to work, and the second must not be reported as the first.
 check "drill summary: a complete run with one real FAIL EXITS NON-ZERO" 1 \
-  "89/90 passed, 1 failed" run_summary "$COMPLETE; pass=89; fail=1"
+  "88/89 passed, 1 failed" run_summary "$COMPLETE; pass=88; fail=1"
 check "drill summary: ...and is not mislabelled as a short run" 0 "" \
-  summary_lacks "the drill ran SHORT:" "$COMPLETE; pass=89; fail=1"
+  summary_lacks "the drill ran SHORT:" "$COMPLETE; pass=88; fail=1"
 
 # ---------------------------------------------------------------------------
 # The record emitter (#152). drills/README.md asks a record for six things and
@@ -8333,7 +8421,7 @@ check "drill record: a tree dirtied AFTER the install records the clean ref" 0 \
 # --- the record itself ------------------------------------------------------
 # A finished drill, pinned so every field is assertable. record_collect fills
 # only what is not already set, which is what lets a test pin the world away.
-RECSTATE="PHASE_RAN=([I]=1 [A]=8 [B]=47 [G]=17 [C]=9 [E]=7 [D]=0 [M]=10 [T]=1)
+RECSTATE="PHASE_RAN=([I]=1 [A]=8 [B]=47 [G]=16 [C]=9 [E]=7 [D]=0 [M]=10 [T]=1)
 REC_VERSION=9.9.9; REC_DATE=2026-07-21; REC_HOST='bare Debian 13, Incus 6.0.2'
 REC_RUN_ID=drill-9.9.9-20260721-01; REC_TREE_SHA=abc1234
 REC_TREE_REF=release/9.9.9; REC_TREE_REPO=heavy-duty/box
@@ -8343,7 +8431,7 @@ emit() {   # emit <state> → the record that state produces, on stdout
   rec "$RECSTATE; $1; record_write '$RECOUT'" >/dev/null 2>&1
   cat "$RECOUT" 2>/dev/null
 }
-CLEAN='pass=90; fail=0'
+CLEAN='pass=89; fail=0'
 
 # drills/README.md:34-42 asks for six things. One check each, because a record
 # missing one of them is the hand-transcription this replaces, reintroduced.
@@ -8379,15 +8467,15 @@ record_invocation_names_a_tree() { emit "$1" | grep -qE '^`.*--(repo|ref) '; }
 check "drill record: ...and names no repo or ref in it, there being none to get wrong" \
   1 "" record_invocation_names_a_tree "$CLEAN"
 check "drill record: gives the numbers and the wall clock" 0 \
-  "**90/90 passed, 0 failed.** 41 minutes wall clock." emit "$CLEAN"
+  "**89/89 passed, 0 failed.** 41 minutes wall clock." emit "$CLEAN"
 check "drill record: carries the per-phase ledger a single total cannot say" 0 \
   "B 47/47" emit "$CLEAN"
 check "drill record: states the floor and the table's total as two facts" 0 \
-  "Probe floor: 90 expected this run; the table declares 90." emit "$CLEAN"
+  "Probe floor: 89 expected this run; the table declares 89." emit "$CLEAN"
 # DRILL_EXPECT can raise the floor above the table, and the record must not read
 # that as an error — the operator is deliberately demanding more than the table.
 check "drill record: ...which stays readable when DRILL_EXPECT raises the floor" 0 \
-  "Probe floor: 100 expected this run; the table declares 90." \
+  "Probe floor: 100 expected this run; the table declares 89." \
   emit "DRILL_EXPECT=100; $CLEAN"
 # The record is pasted into a file and read months later. Escape codes in it are
 # the peculiar thing this issue found: every script emitted ANSI unconditionally.
@@ -8410,19 +8498,19 @@ check "drill record: ...and says the judgement is the operator's to write" 0 \
 # 62 of 71 and failed none is not "62/62 passed" — and the record is precisely
 # where that fraction used to get written down as proof a release was drilled.
 check "drill record: a short run's denominator is the FLOOR, not what ran" 0 \
-  "**81/90 passed" emit "pass=81; fail=0; PHASE_RAN[C]=0"
+  "**80/89 passed" emit "pass=80; fail=0; PHASE_RAN[C]=0"
 check "drill record: ...and the short phase is named in it" 0 "C 0/9" \
-  emit "pass=81; fail=0; PHASE_RAN[C]=0"
+  emit "pass=80; fail=0; PHASE_RAN[C]=0"
 # A DECLARED skip is the honest half: the floor moves, and the record says which
 # probes were not expected and why — recorded as skipped, never as passing.
 check "drill record: a declared skip lowers the record's denominator" 0 \
-  "**81/81 passed" emit "pass=81; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
+  "**80/80 passed" emit "pass=80; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
 check "drill record: ...and the skip is recorded AS a skip, beside the failures" 0 \
   "- SKIP: no isolation stack" \
-  emit "pass=81; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
+  emit "pass=80; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
 check "drill record: ...and the waived probes are visible in the ledger line" 0 \
   "9 waived by declared skips" \
-  emit "pass=81; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
+  emit "pass=80; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
 check "drill record: failures land in it verbatim, uncoloured" 0 "- FAIL: the boundary held open" \
   emit "pass=86; fail=1; no 'the boundary held open' >/dev/null"
 check "drill record: a clean run says so rather than leaving a bare heading" 0 \
@@ -8463,7 +8551,7 @@ run_emit() {   # run_emit <state> — EXIT STATUS is the drill's own
 }
 check "drill emit: a clean run writes the record and still EXITS 0" 0 \
   "record written:" run_emit "$CLEAN"
-check "drill emit: ...and the file on disk is the record" 0 "**90/90 passed, 0 failed.**" \
+check "drill emit: ...and the file on disk is the record" 0 "**89/89 passed, 0 failed.**" \
   cat "$RECOUT"
 check "drill emit: ...pinned to the run ID the drill announced at install time" 0 \
   "drill-9.9.9-20260721-01" cat "$RECOUT"
@@ -8481,15 +8569,15 @@ check "drill: ...and no phase header sends the operator to the closed audit" 1 "
 # before that `no` fires would put a clean sweep in the record on a short run,
 # which is the defect #153 closed.
 check "drill emit: a short run EXITS NON-ZERO with a record written" 1 \
-  "record written:" run_emit "pass=81; fail=0; PHASE_RAN[C]=0"
+  "record written:" run_emit "pass=80; fail=0; PHASE_RAN[C]=0"
 check "drill emit: ...and the record it wrote carries the shortfall, not a sweep" 0 \
   "FAIL: the drill ran SHORT:" cat "$RECOUT"
-check "drill emit: ...against the full denominator, 81/90" 0 "**81/90 passed" cat "$RECOUT"
+check "drill emit: ...against the full denominator, 80/89" 0 "**80/89 passed" cat "$RECOUT"
 check "drill emit: a short run has no unattributed summary probe" 1 "" \
   grep -q 'unattributed' "$RECOUT"
 short_ledgers_agree() {
   local out terminal emitted
-  out="$(run_emit 'pass=81; fail=0; PHASE_RAN[C]=0')"
+  out="$(run_emit 'pass=80; fail=0; PHASE_RAN[C]=0')"
   terminal="$(printf '%s\n' "$out" | grep '^  probes')"
   # shellcheck disable=SC2016
   emitted="$(sed -n '/^```$/,/^```$/p' "$RECOUT" | grep '^  probes')"

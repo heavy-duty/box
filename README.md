@@ -351,7 +351,8 @@ so a full tenant pool fails that tenant and never `default`. `--memory`,
 `--cpu` and `--instances` set the project's own `limits.*`, so a tenant can
 never starve the host's other guests (`none` unsets one). Under a cap, Incus
 refuses an instance that sets no `limits.cpu`/`limits.memory`: `box new`
-always stamps both, and so must a tool's own profiles. Revoking a service
+always stamps both, clamping any resource you didn't choose to the cap so a
+plain `box new` fits, and a tool's own profiles must set them too. Revoking a service
 (#285) refuses while a unit still runs as it (stop it first, so it drains),
 purges every profile and custom volume with `--purge`, and keeps the pool
 unless `--purge-pool`.
@@ -769,7 +770,6 @@ TYPE       VM
 IPV4       10.x.x.x
 
 MINTED     2026-07-19T14:22:07Z by box 0.8.1
-TEMPLATE   tenant (user dev)
 IMAGE      images:debian/13/cloud @ 8a2f1c9d4e5b…
 MODE       vm (asked: auto)
 ORIGIN     mint
@@ -947,7 +947,7 @@ drill installs the whole stack, mints the seed cold (box has one since
 0.11.0, #288), snapshots and
 clones, probes every boundary from inside the boxes, opens and shuts the
 `expose` door (and checks the contract survives it), and removes what it
-minted — currently **90 checks, 71 passing** in the last record (0.10.0's, taken before 0.11.0 added the guest interiors and the drop-in probes, #292). [drill/RUNS.md](drill/RUNS.md) is the full
+minted — currently **89 checks, 71 passing** in the last record (0.10.0's, taken before 0.11.0 added the guest interiors and the drop-in probes, #292). [drill/RUNS.md](drill/RUNS.md) is the full
 history, including every trap that fooled a run into a wrong verdict.
 
 ### Run the drill yourself

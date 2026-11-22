@@ -511,7 +511,10 @@ FW_BIN=/usr/local/sbin/box-firewall
 [ -x "$FW_BIN" ] || FW_BIN="$(dirname "$0")/../host/box-firewall.sh"
 if [ -d "${BOX_FIREWALL_D:-/etc/box/firewall.d}" ]; then
   head_ "Firewall — drop-in ports (${BOX_FIREWALL_D:-/etc/box/firewall.d})"
-  if ! bash "$FW_BIN" --supports dropins >/dev/null 2>&1; then
+  # READ, never run, to decide: a pre-#279 box-firewall ignores its arguments
+  # and applies the whole firewall — an upgraded host keeps the old binary
+  # until setup-host — so executing it as a probe would re-apply old rules.
+  if ! grep -q -- '--supports)' "$FW_BIN" 2>/dev/null; then
     no "the installed box-firewall does not read drop-ins — re-run setup-host to install this release's"
   else
     dropin_err="$(mktemp)"
@@ -743,7 +746,7 @@ done
 # --- Grants: what each granted project holds (#282, #283, #287) -------------
 # Informational: a grant's pool fill, its caps and current use, whether it is
 # a service and whom it is shared with. An admin reads every project; nothing
-# here is a finding unless a grant pool is missing or a share is half-written.
+# here is a finding unless a grant pool is missing.
 grants="$(incus project list --format csv --columns n 2>/dev/null | sed 's/ (current)$//' | grep '^user-' || true)"
 if [ -n "$grants" ]; then
   head_ "Grants"
@@ -760,14 +763,19 @@ if [ -n "$grants" ]; then
       [ -z "$v" ] || caps="$caps${caps:+, }$k $v"
     done
     inf "$line"
-    [ -z "$caps" ] || inf "  caps: $caps"
+    if [ -n "$caps" ]; then
+      inf "  caps: $caps"
+      # Current use beside the caps (#283): incus's own resource table.
+      while IFS= read -r urow; do inf "    $urow"; done < <(incus project info "$gp" 2>/dev/null \
+        | awk -F'|' 'NF>3 && $2 ~ /[A-Z]/ { gsub(/^ +| +$/,"",$2); gsub(/^ +| +$/,"",$3); gsub(/^ +| +$/,"",$4); if ($2 != "RESOURCE") printf "%s: %s used of %s\n", tolower($2), $4, $3 }')
+    fi
     if [ -n "$g_pool" ]; then
       if pinfo="$(incus storage info "$g_pool" 2>/dev/null)"; then
         used="$(awk -F': ' '/space used:/{print $2; exit}' <<<"$pinfo")"
         total="$(awk -F': ' '/total space:/{print $2; exit}' <<<"$pinfo")"
         inf "  pool: $g_pool — ${used:-?} of ${total:-?} used"
       else
-        no "$gp's grant pool $g_pool is missing — re-run: box grant ${g_user:-<user>} --service --pool $g_pool --pool-size <size>"
+        no "$gp's grant pool $g_pool is missing — re-run: box grant ${g_user:-<user>}$([ "$g_svc" = true ] && echo " --service") --pool $g_pool --pool-size <size>"
       fi
     fi
     if [ -n "$g_user" ] && [ -e "$share_dir/$g_user" ]; then

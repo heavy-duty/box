@@ -58,8 +58,17 @@ if incus project show "$project" >/dev/null 2>&1 </dev/null; then
   [ "$(incus project get "$project" user.box.service </dev/null 2>/dev/null || true)" = true ] && service=1
   grant_pool="$(incus project get "$project" user.box.pool </dev/null 2>/dev/null || true)"
 fi
-if [ "$service" -eq 0 ] && { [ "$force" -eq 1 ] || [ "$purge_pool" -eq 1 ]; }; then
-  echo "box revoke: --force and --purge-pool are for service grants; $project is not one" >&2; exit 2
+# The grant pool is found by its OWN marker (user.box.grant=<user>), not only
+# through the project: a purge that removed the project and then failed to
+# delete the pool must still be able to finish on a re-run (#282, #285).
+if [ -z "$grant_pool" ]; then
+  while read -r p_; do
+    [ -n "$p_" ] || continue
+    if [ "$(incus storage get "$p_" user.box.grant </dev/null 2>/dev/null || true)" = "$user" ]; then grant_pool="$p_"; break; fi
+  done < <(incus storage list --format csv -c n </dev/null 2>/dev/null)
+fi
+if [ "$service" -eq 0 ] && [ "$force" -eq 1 ]; then
+  echo "box revoke: --force is for service grants (it overrides the running-unit refusal); $project is not one" >&2; exit 2
 fi
 if [ "$service" -eq 1 ]; then
   # The units running AS the service, by systemd's own attribution (ps' unit
@@ -75,7 +84,8 @@ if [ "$service" -eq 1 ]; then
       echo "  (systemctl stop ${units//$'\n'/ } — or --force to revoke under it anyway)" >&2
       exit 1
     fi
-    echo "WARNING: --force — revoking $user while ${units//$'\n'/ } still run as it. It will not drain:"
+    echo "WARNING: --force — revoking $user while ${units//$'\n'/ } still run as it. It will not drain, and a unit"
+    echo "         with Restart=always comes straight back — stop it (systemctl stop) rather than force through it:"
     echo "         whatever it registered elsewhere (CI runners, say) stays registered until cleaned by hand."
   fi
 fi
