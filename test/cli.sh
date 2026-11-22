@@ -2666,6 +2666,8 @@ check "caps: defaults above the caps refuse (exit 2), naming every one" 2 "your 
   capcheck CAP_CPU=1 CAP_MEM=1GiB CAP_DISK=3GiB cpu= memory= disk= size=
 check "caps: ...and print the line that fits, leaving disk room for images" 2 "box new --name web --cpu 1 --memory 1GiB --disk <less than 3GiB>" \
   capcheck CAP_CPU=1 CAP_MEM=1GiB CAP_DISK=3GiB cpu= memory= disk= size=
+check "caps: a disk budget EQUAL to the default root refuses too (images count)" 2 "disk 20GiB in total" \
+  capcheck CAP_DISK=20GiB cpu= memory= disk= size=
 caps_never_mint() { ! capcheck CAP_CPU=1 cpu= memory= disk= size= 2>&1 | grep -q MINT; }
 check "caps: ...and never mint anything adjusted" 0 "" caps_never_mint
 check "caps: caps above the defaults pass untouched" 0 "MINT CPU=2 MEM=2GiB DISK=20GiB" \
@@ -3142,6 +3144,14 @@ legacy_box_as_claude() { FAKE_LEGACY_STAMP=claude FAKE_GUEST_USERS=claude runbox
 check "shell: ...and --user claude enters as claude" 0 "" legacy_box_as_claude
 check "shell: ...via runuser -l claude" 0 "" grep -qFx 'incus exec work -- runuser -l claude' "$SHLOG"
 user_down() { FAKE_EXEC_DOWN=1 runbox "$SHLOG" shell --user claude work; }
+# The real require_guest_user's passwd parse: shell field, empty field, nologin.
+RGFN="$(mktemp)"; awk '/^require_guest_user\(\) \{/,/^\}/; /^box_regular_users\(\) \{/,/^\}/' "$BOX" > "$RGFN"
+# shellcheck disable=SC2016  # expands in the child shell
+rgshell() { PWLINE="$1" bash -c '. "$0"; usage_error(){ exit 2; }; incus(){ echo "client warning: x:y" >&2; printf "%s\n" "$PWLINE"; }; require_guest_user i b u; echo "SH=$guest_shell"' "$RGFN"; }
+check "--user: the login shell comes from the passwd line, not from stderr noise" 0 "SH=/bin/zsh" rgshell "u:x:1000:1000::/home/u:/bin/zsh"
+check "--user: an empty shell field becomes /bin/sh" 0 "SH=/bin/sh" rgshell "u:x:1000:1000::/home/u:"
+check "--user: a nologin shell becomes /bin/sh, never \$SHELL=nologin" 0 "SH=/bin/sh" rgshell "u:x:1000:1000::/home/u:/usr/sbin/nologin"
+rm -f "$RGFN"
 check "shell --user on a box whose agent is down says so (exit 1), not 'no such user'" 1 "could not look up user 'claude' in work (is it running?)" user_down
 check "--user with an empty value is refused, never a root entry (#291 review)" 2 "--user needs a value" "$BOX" exec --user "" work -- id -u
 check "box root --user is refused, pointing at box shell --user" 2 "box shell --user claude <box>" "$BOX" root --user claude work

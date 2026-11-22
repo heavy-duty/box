@@ -569,8 +569,8 @@ phase "m. a raw attach to boxnet — the scoped guarantee, measured"
 # container does: Debian 13's systemd stalls without it in an unprivileged
 # container (no D-Bus, networkd stuck 'activating', so no DHCP) — measured on
 # the CI runner. The probe is about NETWORK-level controls, not nesting.
-rawextra=(); case " ${MODE[*]:-} " in *" --container "*) rawextra=(-c security.nesting=true) ;; esac
-[ -e /dev/kvm ] || rawextra=(-c security.nesting=true)
+# The raw launch is ALWAYS a container (no --vm), whatever MODE box uses.
+rawextra=(-c security.nesting=true)
 rawout="$(as_u "$U1" incus launch images:debian/13/cloud esc2 --network boxnet "${rawextra[@]}" 2>&1)"; rawrc=$?
 if [ "$rawrc" -ne 0 ]; then
   # Version fork, measured: 6.0.4 permits a restricted cert a raw --network
@@ -605,7 +605,7 @@ else
     # Hand over the evidence instead of making the next reader re-derive it:
     # what the guest sees, what cloud-init did, and the NIC Incus gave it.
     inf "evidence (esc2):"
-    { incus --project "$p1" exec esc2 -- sh -c 'ip -o addr 2>&1; echo ---; cloud-init status --long 2>&1 | head -8; echo ---; ls /etc/systemd/network /etc/netplan 2>&1; echo ---; networkctl status eth0 --no-pager 2>&1 | head -12; echo ---; systemctl is-active systemd-networkd 2>&1; echo ---; journalctl -b --no-pager 2>/dev/null | grep -iE "dhcp|networkd|eth0|lease" | tail -8' 2>&1
+    { timeout -k 5 60 incus --project "$p1" exec esc2 -- sh -c 'ip -o addr 2>&1; echo ---; cloud-init status --long 2>&1 | head -8; echo ---; ls /etc/systemd/network /etc/netplan 2>&1; echo ---; timeout 10 networkctl status eth0 --no-pager 2>&1 | head -12; echo ---; systemctl is-active systemd-networkd 2>&1; echo ---; journalctl -b --no-pager 2>/dev/null | grep -iE "dhcp|networkd|eth0|lease" | tail -8' 2>&1
       echo ---; incus --project "$p1" config show esc2 --expanded 2>&1 | sed -n '/^devices:/,/^[a-z]/p'
       echo ---; incus network list-leases boxnet 2>&1 | tail -6; } </dev/null | head -60 | sed 's/^/          /'
 
@@ -906,7 +906,11 @@ if [ "$prc" -eq 2 ] && printf '%s' "$pout" | grep -q -- '--disk <less than'; the
 else
   no "(r) a plain box new over the caps did not refuse cleanly (rc=$prc):"; printf '%s\n' "$pout" | tail -3 | sed 's/^/        /'
 fi
-if out="$(as_svc box new --name drill-pool "${MODE[@]}" --disk 1GiB 2>&1)"; then
+# A VM root needs more than the 3GiB budget can hold beside its image; the
+# pool mint is measured in container mode (CI's), skipped honestly otherwise.
+if [ "${MODE[*]:-}" != "--container" ]; then
+  note "(r) the fitting pool mint runs in container mode only (a VM image + root exceed the 3GiB test budget)"
+elif out="$(as_svc box new --name drill-pool "${MODE[@]}" --disk 1GiB 2>&1)"; then
   rp="$(as_svc incus --project "$ps_" config device get drill-pool root pool 2>/dev/null \
         || as_svc incus --project "$ps_" profile device get box-profile root pool 2>/dev/null)"
   [ "$rp" = "$POOL" ] && ok "(r) box new as the service lands on $POOL" || no "(r) box new landed on '$rp', not $POOL"

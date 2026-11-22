@@ -318,17 +318,19 @@ done < <(incus config trust list --format csv --columns nf 2>/dev/null)
 # non-root admin, so an unprivileged stat answers "absent" for a directory
 # that is very much there — the same lie the absence assert below must dodge.
 if $SUDO test -d "/var/lib/incus/users/$uid" 2>/dev/null; then
+  # The running incus-user caches this uid's state and resets every one of
+  # its connections until it restarts (measured: a re-grant right after a
+  # purge failed with "connection reset by peer"). So stop the service FIRST
+  # (never the socket; activation starts a fresh one on the next connection),
+  # then remove the state. The cost, said out loud: every restricted user's
+  # IN-FLIGHT incus-user stream drops — an open 'box shell' included; new
+  # commands reconnect on their own.
+  if $SUDO systemctl is-active --quiet incus-user.service 2>/dev/null; then
+    echo "purge: restarting incus-user (it caches uid $uid's state) — other users' open box shell/exec sessions drop; new commands reconnect"
+    $SUDO systemctl stop incus-user.service 2>/dev/null || true
+  fi
   $SUDO rm -rf "/var/lib/incus/users/$uid"
   echo "purge: incus-user state for uid $uid removed"
-  # The running incus-user still holds that uid's state in memory, and resets
-  # every connection from it until it restarts — measured in the rehearsal: a
-  # re-grant right after a purge failed three times with "connection reset by
-  # peer". Stopping the service (never the socket) lets socket activation
-  # start a fresh one on the next connection; other users reconnect the same.
-  if $SUDO systemctl is-active --quiet incus-user.service 2>/dev/null; then
-    $SUDO systemctl stop incus-user.service 2>/dev/null \
-      && echo "purge: incus-user restarted on demand (it cached uid $uid's state)" || true
-  fi
 fi
 
 # Assert absence rather than trusting exit codes — the wipe.sh discipline.

@@ -148,7 +148,9 @@ check_grant_caps() {
     over="$over memory $m (default $T_MEMORY),"; fit="$fit --memory $m"
   fi
   if [ -z "$disk$size${BOX_DISK:-}" ] && [ -n "$d" ] \
-     && [ "$(size_bytes "$d" || echo 0)" -gt 0 ] && [ "$(size_bytes "$d")" -lt "$(size_bytes "$T_DISK" || echo 0)" ]; then
+     && [ "$(size_bytes "$d" || echo 0)" -gt 0 ] && [ "$(size_bytes "$d")" -le "$(size_bytes "$T_DISK" || echo 0)" ]; then
+    # -le, not -lt: limits.disk counts images too, so a root equal to the
+    # budget is refused by Incus (measured) — refuse it here, loudly, first.
     over="$over disk $d in total (default root $T_DISK),"; fit="$fit --disk <less than $d>"
   fi
   [ -n "$over" ] || return 0
@@ -1037,7 +1039,8 @@ the host's other guests; 'none' unsets one. Under a cap Incus refuses any
 instance that does not set limits.cpu and limits.memory itself or by
 profile: 'box new' always stamps both, and a tool minting through the API
 must too. When a default would exceed a cap, 'box new' refuses before
-minting and prints the sizes that fit — it never adjusts them for you. A re-run without a flag leaves that setting as it is.
+minting and prints the sizes that fit — it never adjusts them for you.
+A re-run without a flag leaves that setting as it is.
 
 --share GROUP (with --service) makes a SHARED TENANT (#287): GROUP may run
 box itself, and nothing else, as the service, through a visudo-checked
@@ -2975,11 +2978,18 @@ box_regular_users() {
 # require_guest_user <inst> <box> <user> — refuse (exit 2) unless it exists.
 require_guest_user() {
   [[ "$3" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || usage_error "--user must be a plain Linux user name, got '$3'"
-  local rc=0 err
-  err="$(incus exec "$1" -- getent passwd "$3" 2>&1 </dev/null)" || rc=$?
+  local rc=0 err pwline errf; errf="$(mktemp)"
+  pwline="$(incus exec "$1" -- getent passwd "$3" 2>"$errf" </dev/null)" || rc=$?
+  err="$(cat "$errf")"; rm -f "$errf"
   # The user's login shell, so --user's environment matches a login (runuser
-  # -u sets USER/LOGNAME/HOME but not SHELL — the rehearsal's #169 diff).
-  if [ "$rc" -eq 0 ]; then guest_shell="${err##*:}"; guest_shell="${guest_shell:-/bin/sh}"; return 0; fi
+  # -u sets USER/LOGNAME/HOME but not SHELL — the rehearsal's #169 diff). A
+  # nologin/false shell would poison anything that spawns $SHELL, so those
+  # (and an empty field) become /bin/sh. Stdout only, first line only.
+  if [ "$rc" -eq 0 ]; then
+    guest_shell="$(printf '%s\n' "$pwline" | head -n1 | cut -d: -f7)"
+    case "$guest_shell" in ""|*/nologin|*/false) guest_shell=/bin/sh ;; esac
+    return 0
+  fi
   # getent's 2 is "not found"; anything else is Incus or the guest failing
   # (a stopped box, an agent not up yet) and must not read as a missing user.
   if [ "$rc" -ne 2 ]; then
