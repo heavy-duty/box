@@ -2842,6 +2842,15 @@ check "setup-host: the restricted gate precedes the sudo resolution" 0 "" bash -
   gate="$(grep -n "restricted tier" "'"$ROOT"'/host/setup-host.sh" | head -1 | cut -d: -f1)"
   sudo="$(grep -n "^elif command -v sudo" "'"$ROOT"'/host/setup-host.sh" | head -1 | cut -d: -f1)"
   [ -n "$gate" ] && [ -n "$sudo" ] && [ "$gate" -lt "$sudo" ]'
+# dnsmasq-base (#280): installed where apt is the manager, skipped once there,
+# and BEFORE the bridge is created (Incus needs it to serve boxnet).
+check "setup-host: installs dnsmasq-base when it is missing" 0 "" \
+  grep -qF 'apt_get install -y dnsmasq-base' "$ROOT/host/setup-host.sh"
+check "setup-host: ...only when /usr/sbin/dnsmasq is absent and apt exists" 0 "" \
+  grep -qF 'if [ ! -x /usr/sbin/dnsmasq ] && command -v apt-get >/dev/null 2>&1; then' "$ROOT/host/setup-host.sh"
+check "setup-host: ...before boxnet is created" 0 "" bash -c '
+  f="'"$ROOT"'/host/setup-host.sh"
+  [ "$(grep -n "install -y dnsmasq-base" "$f" | cut -d: -f1)" -lt "$(grep -n "incus network create boxnet" "$f" | head -1 | cut -d: -f1)" ]'
 check "setup-host: enables incus-user.socket for the tier" 0 "" \
   grep -qF 'incus-user.socket' "$ROOT/host/setup-host.sh"
 check "doctor: honors BOX_TIER" 0 "" \

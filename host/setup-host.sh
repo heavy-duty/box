@@ -259,6 +259,15 @@ if ! command -v incus >/dev/null; then
   apt_get install -y incus
 fi
 
+# dnsmasq-base serves boxnet's DHCP and DNS (#280). The incus package only
+# Recommends it, and Debian cloud images skip Recommends — so a fresh host
+# built a bridge with no dnsmasq, and 'box doctor' flagged what nothing had
+# installed. Before the bridge exists, where apt is the package manager, and a
+# no-op once it is there.
+if [ ! -x /usr/sbin/dnsmasq ] && command -v apt-get >/dev/null 2>&1; then
+  apt_get install -y dnsmasq-base
+fi
+
 if [ "$(id -u)" -eq 0 ]; then
   # Root needs no group: UID 0 opens /var/lib/incus/unix.socket regardless of
   # who owns it, and there is nothing to re-exec into. The HUMAN needs it — and

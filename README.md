@@ -229,9 +229,9 @@ bridge (sibling-name resolution off, resolver pinned to public upstreams —
 `BOX_DNS` overrides), the `box-isolate` ACL (drops all RFC1918/CGNAT/
 link-local egress), the `box-profile` profile (port-isolated NICs — boxes can't
 reach each other), and firewall rules blocking instance → host. All rules
-re-apply at boot via `box-firewall.service` — no post-reboot ritual. If
-the host lacks `dnsmasq-base` (Debian cloud images skip Recommends):
-`sudo apt-get install -y dnsmasq-base`.
+re-apply at boot via `box-firewall.service` — no post-reboot ritual.
+`setup-host` installs `dnsmasq-base` too, which boxnet's DHCP and DNS need and
+Debian cloud images skip as a Recommends (#280).
 
 The stack's subnet is `10.88.0.0/24` when free. setup-host **never builds on
 a subnet something else already claims** — most tellingly when this machine's
