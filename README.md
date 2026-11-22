@@ -470,7 +470,7 @@ There is no role axis and no `--role` flag. The public mint shapes are:
 |---|---|
 | `box new --name <box>` | The tenant seed: an unprivileged user, a thin toolchain, nobody home |
 | `box new --user <name>` | The same seed with a tenant user other than `dev` |
-| `--template staging-box` | Dedicated server seed: VM-only and autostarting |
+| `--size medium --autostart --require-vm` | The old `staging-box` template as flags (#288): VM-only, back after a host reboot |
 
 **The seed is thin and it is the whole of what box installs.** It carries the
 tenant user, `tmux`, `curl`, `ca-certificates`, `chrony`, `python3-venv` and
@@ -493,8 +493,9 @@ the tenant holds it. The seed ships the toolchain instead, user-local installs
 still work unprivileged — `python3 -m venv`, `cargo`, `uv`, and
 `npm install --prefix <dir>` (a *global* `npm -g` writes to `/usr`, so point
 it somewhere the tenant owns once: `npm config set prefix ~/.local`) — and
-anything genuinely needing `apt` is one `box root` away. `staging-box` keeps
-sudo on purpose: it seeds a guest that converges *itself*, from the inside.
+anything genuinely needing `apt` is one `box root` away. A staging box's
+`ops` gets its passwordless sudo from rig-templates' `staging-box` role
+(`USER_SUDO`), not from box: box has no templates since 0.11.0 (#288).
 This is **mint-time only** — cloud-init runs once, so boxes minted before this
 change still have their sudoers entry.
 
@@ -521,14 +522,13 @@ the installer you run inside the box, which is where you pass them. A mint
 makes no network request of its own for a pin, so minting works offline.
 
 ```sh
-box templates                    # list dedicated non-agent templates
 box new --name scratch           # the DEFAULT: bare Debian + the thin seed,
                                  #   same isolation, nobody home
 ```
 
 A seed **cannot** name a network, a profile, or a `security.*` flag —
 there is no key for them. Every box launches with the shared `box-profile`
-profile (the isolated NIC + root disk), so every template gets the identical
+profile (the isolated NIC + root disk), so every box gets the identical
 trust boundary. `--size small|medium|large` selects a resource bundle (small
 is the default), overridable at mint time — inline
 (`--cpu 2 --memory 3GiB --disk 20GiB`) or via
@@ -542,9 +542,7 @@ form). Resolution is `--cpu/--memory/--disk` > `BOX_*` environment >
 | `medium` | 4 | 8GiB | 60GiB |
 | `large` | 8 | 16GiB | 120GiB |
 
-The default mint path defaults to `small`. The dedicated
-`staging-box` seed keeps its existing medium resources when no size is given.
-Named sizes apply to fresh mints; `--from` clones keep the explicit
+The default mint path defaults to `small`. Named sizes apply to fresh mints; `--from` clones keep the explicit
 `--cpu`/`--memory`/`--disk` override surface.
 The selected seed, its generation and the resolved user are stamped onto the
 instance, so `shell`, `exec` and `tmux` land in the right user — and a clone
@@ -668,8 +666,7 @@ the door is per-port, punched and removable at runtime.
 ## Commands
 
 ```
-box new --name <box> [--size small|medium|large] [--user <user>] [--from <src>[/<snap>]] [--cpu <n>] [--memory <size>] [--disk <size>] [--vm|--container]
-box templates                # list dedicated non-agent templates
+box new --name <box> [--size small|medium|large] [--autostart] [--require-vm] [--user <user>] [--from <src>[/<snap>]] [--cpu <n>] [--memory <size>] [--disk <size>] [--vm|--container]
 box list                     # list your boxes
 box info <box>               # one box: state, IP, exposures, provenance, snapshots
 box shell <box>              # enter as the stamped tenant user
@@ -936,8 +933,8 @@ Every clause above is probed live by an end-to-end drill, because the one time
 this contract was reasoned about instead of measured, the reasoning was wrong:
 box→box traffic was "covered" by an L3 drop that L2-switched frames never
 meet — a hole found by probing, not by reading the rules. On a bare host the
-drill installs the whole stack, mints both templates cold — `tenant` and
-`staging-box`, which since #214 is the whole set — snapshots and
+drill installs the whole stack, mints the seed cold (box has one since
+0.11.0, #288), snapshots and
 clones, probes every boundary from inside the boxes, opens and shuts the
 `expose` door (and checks the contract survives it), and removes what it
 minted — currently **71 checks, 71 passing**. [drill/RUNS.md](drill/RUNS.md) is the full

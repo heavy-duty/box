@@ -9,7 +9,7 @@ root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 remote=""; mode="auto"; name=""; from=""; template=""; size=""; user=""
 force=0; json=0; want_help=0
 cpu=""; memory=""; disk=""; instance_only=0
-mint_template=""
+autostart=0; require_vm=0   # boot demands as flags (#288)
 inst=""   # the resolved Incus instance, set by the 'box' precondition
 # Labels snapshot_mark actually CREATED this run, space-separated. Every path
 # through snapshot_mark returns 0 on purpose — the never-fatal contract — so
@@ -55,7 +55,35 @@ refuse_role() {
   echo "try 'box help new'." >&2
   exit 2
 }
+# The template axis's removal (#288, #253 D5(a)) points at the same registry,
+# so its refusals live here too — prose an operator reads, never an act. Each
+# only prints and exits; refuse_template (outside) picks which.
+refuse_template_staging() {
+  echo "box: box has no templates since 0.11.0 (#253) — the staging box is:" >&2
+  echo "  box new --name staging-box --size medium --autostart --require-vm" >&2
+  echo "box: then converge it with heavy-duty/rig-templates' staging-box role inside 'box root staging-box'." >&2
+  echo "try 'box help new'." >&2
+  exit 2
+}
+refuse_template_any() {
+  echo "box: box has no templates since 0.11.0 (#253) — omit --template; a box becomes" >&2
+  echo "box: something by converging a heavy-duty/rig-templates role inside 'box root <box>'." >&2
+  echo "try 'box help new'." >&2
+  exit 2
+}
+refuse_template_verb() {
+  echo "box: box has no templates since 0.11.0 (#253) — it mints one blank seed;" >&2
+  echo "box: roles (what a box becomes) live in heavy-duty/rig-templates." >&2
+  exit 2
+}
 # box-strong-form-prose-end
+refuse_template() {   # $1 = the --template value, or "" for 'box templates'
+  case "$1" in
+    staging-box|staging) refuse_template_staging ;;
+    "") refuse_template_verb ;;
+    *) refuse_template_any ;;
+  esac
+}
 
 # The SHAPE of the mint stamp, not the box version — an integer that changes
 # when a key is REPURPOSED, or when a removal leaves an older reader unable to
@@ -161,8 +189,8 @@ box_tier() {
 # doesn't enforce a box invariant, it is incus's job, not ours — that is
 # what `box incus` is for.
 CMDS=(
-  "new^--name <box> [--size small|medium|large] [--user <user>] [--from <src>[/<snap>]] [--cpu <n>] [--memory <size>] [--disk <size>] [--vm|--container]^^Mint a blank box, or --from an existing box/snapshot^fn:cmd_new^"
-  "templates^^^List the templates this install can mint^fn:cmd_templates^"
+  "new^--name <box> [--size small|medium|large] [--autostart] [--require-vm] [--user <user>] [--from <src>[/<snap>]] [--cpu <n>] [--memory <size>] [--disk <size>] [--vm|--container]^^Mint a blank box, or --from an existing box/snapshot^fn:cmd_new^"
+  "templates^^^Removed in 0.11.0 — box mints one seed; see 'box help templates'^fn:cmd_templates^"
   "list^[--json]^^List your boxes^fn:cmd_list^"
   "info^<box> [--json]^box^One box: state, type, IP, what minted it, snapshot labels^fn:cmd_info^"
   "checkup^<box>^box^Is this guest fit for work? Report seed, storage, memory, swap, and OOM history^fn:cmd_checkup^"
@@ -264,7 +292,8 @@ OPTIONS
   --name <box>          Name for the new box                  (new, import)
   --size <size>         Named resource bundle: small, medium, large   (new)
   --user <user>         Tenant user override (default: dev)           (new)
-  --template <t>        Dedicated non-agent template                  (new)
+  --autostart           Start with the host after a reboot            (new)
+  --require-vm          VM mode only: refuse --container and fallback (new)
   --from <src>[/<snap>] Clone from box <src>, or from its snapshot    (new)
   --vm                  Force VM mode: the trust-less target          (new)
   --container           Force container mode: weaker isolation,       (new)
@@ -295,7 +324,6 @@ EXAMPLES
 
   # the default: a blank box — same isolation, nobody home
   box new --name scratch
-  box templates
 
   # what have I got, and what can I clone?
   box list
@@ -363,15 +391,14 @@ the four-step path verbatim.
   --user <user>          The tenant user cloud-init creates, and the one
                          'box shell' lands in. Default: dev.
   --size <size>          small, medium, or large. Default: small.
-  --template <t>         Dedicated non-agent seed; 'box templates' lists it.
-                         Agent and blank spellings are hard-cut to the
-                         argumentless default. A template sets boot
-                         demands (independently: BOX_REQUIRE_VM insists on
-                         VM mode, BOX_NO_CONTAINER_FALLBACK insists that any
-                         container mode be explicit, BOX_AUTOSTART survives
-                         host reboots) —
-                         never the network: every template gets the same
-                         isolation.
+  --autostart            Stamp boot.autostart: the box comes back after a
+                         host reboot with no operator (#288).
+  --require-vm           The HARD VM demand: refuses --container and any
+                         fallback to one. --vm below is the soft form. Two
+                         traits, two flags (#288).
+  (--template is gone since 0.11.0, #253: box has one seed, and a box
+   becomes something by converging a role inside it — the README has the
+   path. The old staging template is: --size medium --autostart --require-vm.)
   --from <src>[/<snap>]  Clone src's live state, or its snapshot <snap>.
   --cpu <n>              CPUs for this mint (limits.cpu, verbatim to Incus).
   --memory <size>        RAM for this mint, e.g. 3GiB (limits.memory).
@@ -451,22 +478,13 @@ BOX_SNAPSHOT_PRISTINE=0 skips it anywhere.
 EOF
 ;;
     templates) cat <<'EOF'
-List the dedicated templates this install can mint, with their descriptions.
-There is no tenant-role axis to list (#214): every ordinary mint renders box's
-one internal tenant seed, and what a box becomes is installed inside it.
-A dedicated template is a directory under templates/: a box.env (image, user,
-resources, boot demands — parsed against an allowlist, never sourced) and a
-user-data.yaml, passed to Incus verbatim.
-Templates cannot touch the network or security flags — the shared box-profile
-profile is the placement contract, so every template gets the same isolation.
+Removed in 0.11.0 (#253, #288): box has no templates. Every mint renders
+box's one seed (seed/ in the install tree), and what a box becomes is a role
+converged inside it (the README has the path). The verb stays one release as
+a refusal that says so.
 
-The argumentless mint is that tenant seed. Its retired `--template blank`
-spelling refuses and teaches that form; retired agent template spellings do
-the same.
-
-  box templates
-  box new --name scratch
-  box new --name work --size medium
+The old staging-box template is now flags:
+  box new --name staging-box --size medium --autostart --require-vm
 EOF
 ;;
     list) cat <<'EOF'
@@ -1158,6 +1176,8 @@ while [ $# -gt 0 ]; do
     --name) [ $# -ge 2 ] || usage_error "--name needs a value"; name="$2"; shift 2 ;;
     --from) [ $# -ge 2 ] || usage_error "--from needs a value"; from="$2"; shift 2 ;;
     --template) [ $# -ge 2 ] || usage_error "--template needs a value"; template="$2"; shift 2 ;;
+    --autostart) autostart=1; shift ;;
+    --require-vm) require_vm=1; shift ;;
     --role) refuse_role ;;
     --size) [ $# -ge 2 ] || usage_error "--size needs a value"; size="$2"; shift 2 ;;
     --user) [ $# -ge 2 ] || usage_error "--user needs a value"; user="$2"; shift 2 ;;
@@ -1735,18 +1755,17 @@ reset_identity() {
 # There is no convergence key. BOX_BOOTSTRAP_ROLE (#81) named a role box
 # auto-ran after mint; #214 cut the hook it fed, so a box.env carrying that
 # key now fails the allowlist by name — loudly, which is the point.
-load_template() {
-  local t="$1" dir line key val size_cpu="" size_memory="" size_disk=""
-  dir="$root/templates/$t"
-  [ -d "$dir" ] || die "no such template: $t (see 'box templates')"
-  [ -f "$dir/box.env" ] || die "template '$t' has no box.env"
+load_seed() {
+  local t=seed dir line key val size_cpu="" size_memory="" size_disk=""
+  dir="$root/seed"
+  [ -f "$dir/box.env" ] || die "box's seed is missing ($dir/box.env) — re-run install.sh"
   T_DESC=""; T_IMAGE=""; T_USER=""; T_CPU=""; T_MEMORY=""; T_DISK=""
   T_REQUIRE_VM=""; T_NO_CONTAINER_FALLBACK=""; T_AUTOSTART=""
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|\#*) continue ;; esac
     case "$line" in
       *=*) key="${line%%=*}"; val="${line#*=}" ;;
-      *) die "template '$t': not a KEY=\"value\" line: $line" ;;
+      *) die "the seed: not a KEY=\"value\" line: $line" ;;
     esac
     val="${val#\"}"; val="${val%\"}"
     # T_DESC is parsed for symmetry with the other BOX_* keys, but cmd_templates
@@ -1766,14 +1785,14 @@ load_template() {
       BOX_REQUIRE_VM)  T_REQUIRE_VM="$val" ;;
       BOX_NO_CONTAINER_FALLBACK) T_NO_CONTAINER_FALLBACK="$val" ;;
       BOX_AUTOSTART)   T_AUTOSTART="$val" ;;
-      *) die "template '$t': unknown key '$key' — a template sets image, user, resources and boot demands, nothing else (there is no key for a network, and none for convergence, on purpose)" ;;
+      *) die "the seed: unknown key '$key' — it sets image, user, resources and boot demands, nothing else (there is no key for a network, and none for convergence, on purpose)" ;;
     esac
   done <"$dir/box.env"
   # Not 'A && B || die': if T_IMAGE is set but T_USER is not, that idiom still
   # dies (which is what we want) — but it reads as an if-then-else it is not, so
   # spell the guard out (SC2015).
   if [ -z "$T_IMAGE" ] || [ -z "$T_USER" ]; then
-    die "template '$t': BOX_IMAGE and BOX_USER are required"
+    die "the seed: BOX_IMAGE and BOX_USER are required"
   fi
   # One public size table (#159). --size takes the old template-resource rung:
   # explicit resource flag > BOX_* environment > named size > template value
@@ -1791,6 +1810,12 @@ load_template() {
   T_CPU="${cpu:-${BOX_CPU:-${size_cpu:-${T_CPU:-2}}}}"
   T_MEMORY="${memory:-${BOX_MEMORY:-${size_memory:-${T_MEMORY:-2GiB}}}}"
   T_DISK="${disk:-${BOX_DISK:-${size_disk:-${T_DISK:-20GiB}}}}"
+  # Boot demands as flags (#288): what box's staging-box template carried, and
+  # no other flag could express. --require-vm is the HARD form (refuses
+  # --container and any fallback); --vm stays the soft one.
+  [ "${autostart:-0}" != 1 ] || T_AUTOSTART=1
+  [ "${require_vm:-0}" != 1 ] || T_REQUIRE_VM=1
+  [ -n "$t" ]
 }
 
 # The ONE substitution a template gets — user-data.yaml is otherwise passed to
@@ -1823,19 +1848,10 @@ render_userdata() {
   printf '%s\n' "$data"
 }
 
-cmd_templates() {
-  local d t desc
-  echo "TEMPLATES"
-  for d in "$root/templates"/*/; do
-    t="$(basename "$d")"
-    case "$t" in tenant) continue ;; esac
-    desc="$(grep -m1 '^BOX_DESCRIPTION=' "$d/box.env" 2>/dev/null | cut -d= -f2- | tr -d '"')"
-    printf '  %-10s %s\n' "$t" "$desc"
-  done
-  echo
-  echo "the default mint: box new --name <box> [--size <size>]"
-  echo "dedicated seed:  box new --name <box> --template <template>"
-}
+# Removed with the template axis (#288). The verb stays one release as a
+# refusal, so a script that lists templates learns where roles live instead
+# of meeting "unknown command".
+cmd_templates() { refuse_template ""; }
 
 # When this instance came into being. A timestamp in a CONVERGENT file would be
 # churn — the same run writing a different byte every time — but a mint is not
@@ -2184,38 +2200,25 @@ narrate_resources() {   # narrate_resources <instance> <box-name>
 # stack preflight so retired spellings and malformed user input are usage
 # errors on every machine, including one with no Incus client (#159).
 resolve_fresh_intent() {
-  mint_template=""
   case "$size" in ""|small|medium|large) ;; *) usage_error "--size must be small, medium, or large: $size" ;; esac
-  if [ -n "$template" ]; then
-    case "$template" in
-      tenant)
-        usage_error "--template tenant is box's internal seed — omit --template, that IS the default mint" ;;
-      blank)
-        usage_error "--template blank is retired — omit --template for a blank box" ;;
-      claude-box|codex-box|grok-box|kimi-box)
-        usage_error "--template $template is retired — every box is blank now: 'box new --name <box> --size medium', then converge it yourself inside 'box root <box>'" ;;
-    esac
-    # A dedicated seed carries its own user, declared in its box.env and
-    # created by its own cloud-init. --user has nothing to override there
-    # (#159 review round 1): assigning it would break the declared contract on
-    # one side and leave the seed's own 'users:' block untouched on the other.
-    [ -z "$user" ] || usage_error "--user customizes the default mint, not a dedicated template — '$template' declares its own user"
-    mint_template="$template"
-    return
-  fi
+  # The template axis is gone (#288, #253 D5(a)): box keeps one seed, and what a
+  # box BECOMES is a rig-templates role. Every --template spelling is refused
+  # with what to do instead — never "no such template", which would read as a
+  # typo rather than a removal.
+  [ -z "$template" ] || refuse_template "$template"
   # --user survives the role cut (#214 D2): the tenant user was never the
   # role's to derive, and 'dev' is the seed's default with or without one.
   user="${user:-dev}"
   [[ "$user" =~ ^[a-z_][a-z0-9_-]*$ ]] \
     || usage_error "--user must be a plain Linux user name (lowercase letters, digits, _ and -): $user"
-  mint_template=tenant
 }
 
 cmd_new() {
   [ -n "$name" ] || usage_error "usage: $(synopsis_of new)"
   refuse_fleet_word "$name"
   if [ -n "$from" ]; then
-    [ -z "$template" ] || usage_error "--from clones an existing box; its template rides along (drop --template)"
+    [ -z "$template" ] || usage_error "box has no templates since 0.11.0 (#253) — and --from clones an existing box anyway (drop --template)"
+    [ "$autostart$require_vm" = 00 ] || usage_error "--from clones an existing box; its boot demands ride along (drop --autostart/--require-vm)"
     [ -z "$size" ] || usage_error "--from takes explicit --cpu/--memory/--disk overrides, not --size"
     [ -z "$user" ] || usage_error "--from clones an existing box; its user rides along (drop --user)"
   else
@@ -2375,15 +2378,9 @@ cmd_new() {
       echo "box: will not label the source's state as one. 'box info $name' lists what it did inherit."
     fi
   else
-    local t="$mint_template" m extra=()
-    load_template "$t"
-    # Runtime intent belongs only to the internal tenant seed. A dedicated
-    # template carries its own user; assigning the public --user value here
-    # erased staging-box's 'ops' contract after load_template had read it
-    # (#159 review round 1).
-    if [ "$t" = tenant ]; then
-      T_USER="$user"
-    fi
+    local m extra=()
+    load_seed
+    T_USER="$user"
     m="$(pick_mode)"
     # A server-class template (BOX_REQUIRE_VM, #68) has no weaker mode: the VM
     # is its trust boundary, and its guest runs docker. BOX_NO_CONTAINER_FALLBACK
@@ -2392,10 +2389,10 @@ cmd_new() {
     # is a HOST fact on both tiers, so a grant is never the remedy.
     if ! template_mode_allowed "$T_REQUIRE_VM" "$T_NO_CONTAINER_FALLBACK" "$m" "$mode"; then
       if [ "$T_REQUIRE_VM" = 1 ]; then
-        [ "$mode" != container ] || usage_error "template '$t' requires VM mode — it will not mint as a container (drop --container)"
-        die "template '$t' requires VM mode and this host has no /dev/kvm — mint it on a KVM-capable host (or via --remote)"
+        [ "$mode" != container ] || usage_error "--require-vm refuses container mode (drop --container)"
+        die "--require-vm needs VM mode and this host has no /dev/kvm — mint it on a KVM-capable host (or via --remote)"
       fi
-      die "template '$t' defaults to the VM boundary for untrusted code, but this host has no /dev/kvm — enable KVM, mint via --remote, or pass --container to override with weaker isolation"
+      die "box's seed defaults to the VM boundary for untrusted code, but this host has no /dev/kvm — enable KVM, mint via --remote, or pass --container to override with weaker isolation"
     fi
     # shellcheck disable=SC2054 # "root,size=..." is a single incus argument
     # security.secureboot=false: Incus defaults VMs to secureboot ON, and a
@@ -2450,8 +2447,9 @@ cmd_new() {
     # which box_tier() derives from whoever is ASKING, not from the box.
     # tenant/2 is the generation that introduced #178's bounded /tmp and VM
     # swapfile; older boxes have no marker and checkup reports that honestly.
-    local seed_generation="$t/1"
-    [ "$t" != tenant ] || seed_generation=tenant/2
+    # The seed moved to seed/ in #288 with its content unchanged, so the
+    # generation is still tenant/2's — checkup keys on that value.
+    local seed_generation=tenant/2
     local stamp=(
       --config user.box.schema="$BOX_STAMP_SCHEMA"
       --config user.box.version="$(box_version)"
@@ -2489,12 +2487,11 @@ cmd_new() {
     echo "box: launching instance $instance (incus launch, $m mode)..."
     timeout -k 5 "$budget" incus launch "$T_IMAGE" "$instance" --profile box-profile \
       --config user.box=1 \
-      --config user.box.template="$t" \
       --config user.box.user="$T_USER" \
       "${stamp[@]}" \
       --config limits.cpu="$T_CPU" \
       --config limits.memory="$T_MEMORY" \
-      --config cloud-init.user-data="$(render_userdata "$root/templates/$t/user-data.yaml")" \
+      --config cloud-init.user-data="$(render_userdata "$root/seed/user-data.yaml")" \
       "${extra[@]}" </dev/null || rc=$?
     # 124 = the budget fired (TERM landed); 137 = the -k KILL was needed —
     # or, on 137, something external (an OOM kill) beat the budget to it.

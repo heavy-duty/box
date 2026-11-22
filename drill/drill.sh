@@ -1699,22 +1699,21 @@ else
     && ok "empty host: 'no boxes yet', exit 0" || no "empty-host message wrong"
 fi
 
-# --- templates: the mint surface is itself a surface to test ----------------
-tpl_missing=""
-box templates 2>/dev/null | grep -q '^  staging-box' || tpl_missing=" staging-box"
-[ -z "$tpl_missing" ] && ok "templates: lists the dedicated staging-box seed" \
-                      || no "templates listing is missing:$tpl_missing"
-box new --name tpl --template nosuch 2>&1 | grep -q 'no such template' \
-  && ok "unknown template refused, points at 'box templates'" || no "an unknown template was not refused"
-# The one rule that keeps templates honest: no key can name a network. Plant a
-# bad template in the installed tree (the drill owns this host), expect the
-# parser to reject it BY NAME, remove it.
-badt="$BOX_SHARE/current/templates/cbdrill-bad"
-mkdir -p "$badt" && printf 'BOX_IMAGE="x"\nBOX_USER="y"\nBOX_NETWORK="lan"\n' >"$badt/box.env" && : >"$badt/user-data.yaml"
-box new --name tpl --template cbdrill-bad 2>&1 | grep -q "unknown key 'BOX_NETWORK'" \
-  && ok "a template cannot name a network — BOX_NETWORK rejected by name" \
-  || no "a box.env key outside the allowlist was ACCEPTED — a template could weaken isolation"
-rm -rf "$badt"
+# --- the template axis is gone (#288): its spellings refuse, teaching -------
+box templates 2>&1 | grep -q 'box has no templates since 0.11.0' \
+  && ok "box templates refuses, saying box has no templates (#288)" || no "'box templates' did not refuse with the removal"
+box new --name tpl --template staging-box 2>&1 | grep -q -- '--autostart --require-vm' \
+  && ok "--template staging-box refuses, teaching the --autostart --require-vm line (#288)" \
+  || no "--template staging-box did not teach its replacement"
+# The one rule that keeps the seed honest: no key can name a network. Plant a
+# bad key in the INSTALLED seed (the drill owns this host), expect the parser to
+# reject it BY NAME, restore the file.
+seedenv="$BOX_SHARE/current/seed/box.env"
+cp "$seedenv" /tmp/cbdrill-seed.env && printf 'BOX_NETWORK="lan"\n' >>"$seedenv"
+box new --name tpl 2>&1 | grep -q "unknown key 'BOX_NETWORK'" \
+  && ok "the seed cannot name a network — BOX_NETWORK rejected by name" \
+  || no "a box.env key outside the allowlist was ACCEPTED — the seed could weaken isolation"
+cp /tmp/cbdrill-seed.env "$seedenv" && rm -f /tmp/cbdrill-seed.env
 
 # Inline resource flags: honored on a mint, and — since #171 — on a clone too.
 # The mint proof rides the blank box below, and because this drill exports
@@ -1734,10 +1733,10 @@ rm -rf "$badt"
 printf '\n  minting a blank box (the generic seed, no role auto-run)…\n'
 t0=$SECONDS
 if mint_box /tmp/mint-tpl.log --name tpl --cpu 1 --memory 1GiB; then
-  ok "box new --name tpl, no --template  ($((SECONDS - t0))s)"
+  ok "box new --name tpl, the one seed  ($((SECONDS - t0))s)"
   tt="$(incus config get tpl user.box.template 2>/dev/null)"
-  [ "$tt" = tenant ] && ok "the default path uses the generic seed (user.box.template=tenant)" \
-                     || no "default seed is '${tt:-<unset>}' — expected tenant"
+  [ -z "$tt" ] && ok "a new mint stamps no template — there is none (#288)" \
+               || no "a new mint stamped user.box.template='$tt'"
   rc="$(incus config get tpl limits.cpu 2>/dev/null)/$(incus config get tpl limits.memory 2>/dev/null)"
   [ "$rc" = "1/1GiB" ] && ok "inline --cpu/--memory landed (limits = $rc, beating BOX_* env)" \
                        || no "inline resource flags did not land — limits are $rc, expected 1/1GiB"

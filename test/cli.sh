@@ -71,15 +71,21 @@ check "unknown flag on list exits 2"           2 "unknown option"   "$BOX" list 
 check "--name with no value exits 2"           2 "--name needs a value" "$BOX" new --name
 # #159's hard cut is resolved before the Incus preflight, so every retired
 # spelling teaches its replacement even on a machine with no daemon.
-check "new: --template blank hard-cuts to the argumentless blank mint (#159)" 2 \
-  "omit --template" "$BOX" new --name work --template blank
-check "new: --template tenant hard-cuts the internal seed (#159)" 2 \
-  "omit --template, that IS the default mint" \
-  "$BOX" new --name work --template tenant
-for retired in claude-box codex-box grok-box kimi-box; do
-  check "new: --template $retired hard-cuts to a blank mint (#159, #214)" 2 \
-    "every box is blank now" "$BOX" new --name work --template "$retired"
+# The template axis is gone (#288): EVERY --template spelling refuses with
+# the replacement, never "no such template".
+for retired in blank tenant claude-box codex-box grok-box kimi-box anything; do
+  check "new: --template $retired is refused — box has no templates (#288)" 2 \
+    "box has no templates since 0.11.0" "$BOX" new --name work --template "$retired"
 done
+check "new: ...and the refusal says to omit it and converge a role" 2 \
+  "omit --template" "$BOX" new --name work --template claude-box
+check "new: --template staging-box teaches the flags that replace it (#288)" 2 \
+  "box new --name staging-box --size medium --autostart --require-vm" \
+  "$BOX" new --name work --template staging-box
+check "box templates is refused, naming where roles live (#288)" 2 \
+  "box has no templates since 0.11.0" "$BOX" templates
+check "new: --from refuses --autostart (the source's boot demands ride along)" 2 \
+  "drop --autostart/--require-vm" "$BOX" new --name copy --from work --autostart
 # --role is a HARD CUT and refuses LOUDLY (#214): unrecognized would be an
 # "unknown option", which teaches nothing to the operator who typed the flag
 # this release removed. Every arm of the message is asserted, because the
@@ -97,8 +103,6 @@ check "new: --role refuses with no value too (#214)" 2 \
   "--role is gone" "$BOX" new --name work --role
 check "new: --user is a plain Linux user name (#159)" 2 \
   "--user must be a plain Linux user name" "$BOX" new --name work --user 'bad user'
-check "new: --user rides the default mint, not a dedicated template (#214)" 2 \
-  "declares its own user" "$BOX" new --name work --template staging-box --user dev
 check "new: --from keeps named sizes on the fresh-mint side (#159)" 2 \
   "explicit --cpu/--memory/--disk overrides, not --size" \
   "$BOX" new --name copy --from work --size medium
@@ -548,58 +552,52 @@ rm -rf "$ARTWORK"
 # not KEY="value" fails HERE, not at mint time on a host.
 # ---------------------------------------------------------------------------
 TPLFN="$(mktemp)"
-awk '/^load_template\(\) \{/,/^\}/' "$ROOT/bin/box" > "$TPLFN"
-check "load_template: extracted from bin/box (guards the awk)" 0 "unknown key" cat "$TPLFN"
-check "load_template: the extracted function is valid bash"    0 "" bash -n "$TPLFN"
+awk '/^load_seed\(\) \{/,/^\}/' "$ROOT/bin/box" > "$TPLFN"
+check "load_seed: extracted from bin/box (guards the awk)" 0 "unknown key" cat "$TPLFN"
+check "load_seed: the extracted function is valid bash"    0 "" bash -n "$TPLFN"
 
-# tpl <root> <template> — run the real parser against <root>/templates/, print
-# what it resolved. $0 carries the extracted-function file into the subshell.
+# tpl <root> [autostart require_vm] — run the real parser against
+# <root>/seed/box.env (#288: box has one seed), print what it resolved. $0
+# carries the extracted-function file into the subshell.
 tpl() {
-  root="$1" bash -c '
+  root="$1" autostart="${2:-0}" require_vm="${3:-0}" bash -c '
     die() { echo "box: $*" >&2; exit 1; }
-    . "$0"; load_template "$1"
+    . "$0"; load_seed
     printf "IMAGE=%s USER=%s REQUIRE_VM=%s NO_FALLBACK=%s AUTOSTART=%s\n" \
       "$T_IMAGE" "$T_USER" "$T_REQUIRE_VM" "$T_NO_CONTAINER_FALLBACK" \
       "$T_AUTOSTART"
-  ' "$TPLFN" "$2"
+  ' "$TPLFN"
 }
 
-# The allowlist itself is load-bearing: a template must not be able to grow a
+# The allowlist itself is load-bearing: the seed must not be able to grow a
 # network key, and the required keys must still be required. Fixture-driven,
 # against a throwaway root — exactly the dies a green parse cannot prove.
-EVILROOT="$(mktemp -d)"; mkdir -p "$EVILROOT/templates/evil"
+EVILROOT="$(mktemp -d)"; mkdir -p "$EVILROOT/seed"
 printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_USER="dev"\nBOX_NETWORK="lan"\n' \
-  > "$EVILROOT/templates/evil/box.env"
-check "load_template: an unknown key dies (no template grows a network)" 1 "unknown key" \
-  tpl "$EVILROOT" evil
-printf 'BOX_USER="dev"\n' > "$EVILROOT/templates/evil/box.env"
-check "load_template: a missing BOX_IMAGE dies" 1 "required" tpl "$EVILROOT" evil
-# The boot demands' green path, kept as a fixture even now that staging sets
-# them in-tree: fixtures survive a template rename, and a deleted case arm
-# must fail HERE, through the real parser, not at first use on a host.
-mkdir -p "$EVILROOT/templates/server"
-printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_USER="ops"\nBOX_REQUIRE_VM="1"\nBOX_AUTOSTART="1"\n' \
-  > "$EVILROOT/templates/server/box.env"
-check "load_template: REQUIRE_VM and AUTOSTART round-trip (accepted + surfaced)" \
-  0 "REQUIRE_VM=1 NO_FALLBACK= AUTOSTART=1" tpl "$EVILROOT" server
-# The softer demand is independently parsed. Keeping it a second boolean key
-# means a typo cannot quietly degrade into an unpinned template (#175).
-mkdir -p "$EVILROOT/templates/tenant-vm-default"
+  > "$EVILROOT/seed/box.env"
+check "load_seed: an unknown key dies (the seed never grows a network)" 1 "unknown key" \
+  tpl "$EVILROOT"
+printf 'BOX_USER="dev"\n' > "$EVILROOT/seed/box.env"
+check "load_seed: a missing BOX_IMAGE dies" 1 "required" tpl "$EVILROOT"
+rm -rf "$EVILROOT/seed"; check "load_seed: a missing seed says to re-run install.sh" 1 "re-run install.sh" tpl "$EVILROOT"
+mkdir -p "$EVILROOT/seed"
+# The boot demands as FLAGS (#288): --autostart and --require-vm set what the
+# staging template's keys used to, through the same T_* the mint reads.
 printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_USER="dev"\nBOX_NO_CONTAINER_FALLBACK="1"\n' \
-  > "$EVILROOT/templates/tenant-vm-default/box.env"
-check "load_template: NO_CONTAINER_FALLBACK round-trips (accepted + surfaced)" \
-  0 "REQUIRE_VM= NO_FALLBACK=1" tpl "$EVILROOT" tenant-vm-default
+  > "$EVILROOT/seed/box.env"
+check "load_seed: --autostart and --require-vm surface as the boot demands (#288)" \
+  0 "REQUIRE_VM=1 NO_FALLBACK=1 AUTOSTART=1" tpl "$EVILROOT" 1 1
+check "load_seed: without the flags the seed's own soft demand stands" \
+  0 "REQUIRE_VM= NO_FALLBACK=1 AUTOSTART=" tpl "$EVILROOT"
 # BOX_BOOTSTRAP_ROLE (#81) named the role box auto-ran after mint. #214 cut the
 # hook it fed, so the key is no longer in the allowlist and a box.env carrying
-# it now dies BY NAME at parse time — the loud shape, not a silently ignored
-# key that would leave an operator believing their template still converges.
-mkdir -p "$EVILROOT/templates/tenant"
+# it now dies BY NAME at parse time.
 printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_USER="claude"\nBOX_BOOTSTRAP_ROLE="claude"\n' \
-  > "$EVILROOT/templates/tenant/box.env"
-check "load_template: BOX_BOOTSTRAP_ROLE is refused by name (#214)" \
-  1 "unknown key 'BOX_BOOTSTRAP_ROLE'" tpl "$EVILROOT" tenant
-check "load_template: ...and the refusal says a template does not converge (#214)" \
-  1 "none for convergence" tpl "$EVILROOT" tenant
+  > "$EVILROOT/seed/box.env"
+check "load_seed: BOX_BOOTSTRAP_ROLE is refused by name (#214)" \
+  1 "unknown key 'BOX_BOOTSTRAP_ROLE'" tpl "$EVILROOT"
+check "load_seed: ...and the refusal says the seed does not converge (#214)" \
+  1 "none for convergence" tpl "$EVILROOT"
 rm -rf "$EVILROOT"
 
 # ---------------------------------------------------------------------------
@@ -643,8 +641,8 @@ check "strong form: no acting line in bin/box names the converger (#214)" 1 "" \
   sf_names_converger "$ROOT/bin/box"
 check "strong form: bin/box names no pin variable where it acts (#214)" 1 "" \
   sf_names_pin "$ROOT/bin/box"
-for f in "$ROOT"/templates/*/box.env "$ROOT"/templates/*/user-data.yaml; do
-  rel="templates/$(basename "$(dirname "$f")")/$(basename "$f")"
+for f in "$ROOT"/seed/box.env "$ROOT"/seed/user-data.yaml; do
+  rel="seed/$(basename "$f")"
   check "strong form: $rel names the converger nowhere at all (#214)" 1 "" \
     grep -qwE 'rig|RIG_REPO|RIG_REF' "$f"
   check "strong form: $rel has no prose exception of its own (#214)" 1 "" \
@@ -721,10 +719,12 @@ rm -f "$SFPRE"
 # ACTS, so everything inside the region is a comment, the refusal function's
 # own frame, or a line that only prints or exits. A line count would red on a
 # reformat and pass on a curl; this reds on the curl.
+# Widened once, visibly (#288): the template axis's refusals name the same
+# registry, so their echo-only frames (refuse_template_*) sit in the region too.
 sf_region_only_prints() {
   local stray
   stray="$(awk '/^# box-strong-form-prose-begin$/,/^# box-strong-form-prose-end$/' "$1" \
-    | grep -vE '^#|^[[:space:]]*$|^refuse_role\(\)[[:space:]]*\{$|^\}$|^[[:space:]]+echo([[:space:]]|$)|^[[:space:]]+exit[[:space:]]+[0-9]+$')"
+    | grep -vE '^#|^[[:space:]]*$|^refuse_(role|template_[a-z]+)\(\)[[:space:]]*\{$|^\}$|^[[:space:]]+echo([[:space:]]|$)|^[[:space:]]+exit[[:space:]]+[0-9]+$')"
   [ -z "$stray" ] || { printf 'acting line inside the prose region:\n%s\n' "$stray"; return 1; }
 }
 check "strong form: the prose region only prints and exits (#214)" 0 "" \
@@ -1524,7 +1524,7 @@ check "render_userdata: the render makes NO network call (#214)" 1 "" \
 # unconditionally. Drive it through the real renderer, then make every
 # assertion against what cloud-init receives rather than against source.
 SEEDLOG="$(mktemp)"
-SEEDFILE="$ROOT/templates/tenant/user-data.yaml"
+SEEDFILE="$ROOT/seed/user-data.yaml"
 rud T_USER=dev > "$SEEDLOG"
 check "render_userdata: the tenant render makes no network call either (#214)" 1 "" \
   grep -q . "$NETLOG"
@@ -1566,7 +1566,7 @@ check "tenant seed: package_update is on — the seed installs packages (#214)" 
 # shellcheck disable=SC2016  # $1/$2 expand in the child shell, by design
 check "tenant seed: BOX_USER and bin/box's default are the same 'dev' (#214)" 0 "" \
   bash -c 'grep -qx '"'"'BOX_USER="dev"'"'"' "$1" && grep -qF '"'"'user="${user:-dev}"'"'"' "$2"' \
-  _ "$ROOT/templates/tenant/box.env" "$ROOT/bin/box"
+  _ "$ROOT/seed/box.env" "$ROOT/bin/box"
 rm -f "$RUFN" "$SEED"
 
 # YAML well-formedness needs python3 + pyyaml; the CI runner has both. Skip
@@ -1580,12 +1580,14 @@ else
   echo "skip: rendered payload YAML well-formedness (no python3+pyyaml here; CI has both)"
 fi
 
-for d in "$ROOT"/templates/*/; do
-  t="$(basename "$d")"
+# One seed since #288; the loop shape is kept so a second seed directory, if
+# one ever came back, would have to pass the same checks.
+for d in "$ROOT"/seed/; do
+  t=seed
   # The parse itself asserts the allowlist AND the required keys (the driven
   # function dies without BOX_IMAGE/BOX_USER); the greps pin both keys to the
   # FILE, so neither can quietly become an inherited default.
-  check "template '$t': box.env parses against the real allowlist" 0 "USER=" tpl "$ROOT" "$t"
+  check "template '$t': box.env parses against the real allowlist" 0 "USER=" tpl "$ROOT"
   check "template '$t': box.env sets BOX_IMAGE" 0 "" grep -q '^BOX_IMAGE=' "$d/box.env"
   check "template '$t': box.env sets BOX_USER"  0 "" grep -q '^BOX_USER='  "$d/box.env"
   # #175: every shipped seed defaults to the VM trust boundary. Discovery is
@@ -1770,7 +1772,7 @@ for d in "$ROOT"/templates/*/; do
   esac
   # A dedicated seed duplicates BOX_USER into cloud-init. box's own tenant seed
   # instead carries exactly the token render_userdata replaces at mint.
-  if [ "$t" = tenant ]; then
+  if [ "$t" = seed ]; then
     check "template 'tenant': cloud-init carries the tenant user token (#159)" 0 "" \
       grep -qE '^[[:space:]]*-[[:space:]]+name:[[:space:]]+"@BOX_USER@"$' "$d/user-data.yaml"
   else
@@ -1829,25 +1831,19 @@ done
 # is its trust boundary (its guest runs docker, once converged) and a server
 # returns from a host reboot without an operator. Pinned to the FILE so neither
 # can quietly vanish in a rewrite.
-check "staging-box: demands VM mode (BOX_REQUIRE_VM=1)" 0 "" \
-  grep -qx 'BOX_REQUIRE_VM="1"' "$ROOT/templates/staging-box/box.env"
-check "staging-box: demands autostart (BOX_AUTOSTART=1)" 0 "" \
-  grep -qx 'BOX_AUTOSTART="1"' "$ROOT/templates/staging-box/box.env"
-check "staging-box: keeps its 'ops' user (#214 kept the whole server shape)" 0 "USER=ops" tpl "$ROOT" staging-box
-check "staging-box: its ops user still creates itself in cloud-init" 0 "" \
-  grep -qE '^[[:space:]]*-[[:space:]]+name:[[:space:]]+ops$' "$ROOT/templates/staging-box/user-data.yaml"
-check "staging-box: BOX_BOOTSTRAP_ROLE is gone from the file (#214)" 1 "" \
-  grep -q 'BOX_BOOTSTRAP_ROLE' "$ROOT/templates/staging-box/box.env"
+check "staging-box: the template directory is gone (#288)" 1 "" \
+  test -e "$ROOT/templates/staging-box"
+check "templates/: nothing remains under it (#288)" 1 "" test -e "$ROOT/templates"
 # #175's five softer declarations are pinned separately from the discovery
 # guard above: the loop catches a future unpinned seed, while this catches one
 # of today's seeds accidentally inheriting staging-box's stronger policy.
 check "tenant: permits only an explicit container override (BOX_NO_CONTAINER_FALLBACK=1)" \
-  0 "" grep -qx 'BOX_NO_CONTAINER_FALLBACK="1"' "$ROOT/templates/tenant/box.env"
+  0 "" grep -qx 'BOX_NO_CONTAINER_FALLBACK="1"' "$ROOT/seed/box.env"
 # box's one tenant seed carries the unprivileged tool floor unconditionally
 # (#214): there is no second shape and no role that could select one.
 for p in python3-venv shellcheck; do
   check "tenant: ships '$p' — an unprivileged tenant cannot apt-install it (#177)" 0 "" \
-    grep -qE "^[[:space:]]*-[[:space:]]+$p\$" "$ROOT/templates/tenant/user-data.yaml"
+    grep -qE "^[[:space:]]*-[[:space:]]+$p\$" "$ROOT/seed/user-data.yaml"
 done
 for retired in claude-box codex-box grok-box kimi-box; do
   check "templates: retired '$retired' seed is deleted (#159)" 1 "" \
@@ -1883,10 +1879,10 @@ check "new: the soft KVM-less refusal names KVM and the explicit weaker override
     printf "%s\n" "$line" | grep -q "weaker isolation"'
 # #68 is byte-for-byte behavior, not merely an equivalent refusal. Pin both
 # messages so #175 cannot advertise an override staging-box does not permit.
-check "new: REQUIRE_VM keeps the explicit-container refusal wording (#68)" 0 "" \
-  grep -Fq "usage_error \"template '\$t' requires VM mode — it will not mint as a container (drop --container)\"" "$ROOT/bin/box"
-check "new: REQUIRE_VM keeps the KVM-less refusal wording (#68)" 0 "" \
-  grep -Fq "die \"template '\$t' requires VM mode and this host has no /dev/kvm — mint it on a KVM-capable host (or via --remote)\"" "$ROOT/bin/box"
+check "new: --require-vm refuses --container, saying so (#68, #288)" 0 "" \
+  grep -Fq 'usage_error "--require-vm refuses container mode (drop --container)"' "$ROOT/bin/box"
+check "new: --require-vm keeps a KVM-less refusal (#68, #288)" 0 "" \
+  grep -Fq 'die "--require-vm needs VM mode and this host has no /dev/kvm' "$ROOT/bin/box"
 check "new: boot.autostart is stamped under the T_AUTOSTART guard" 0 "" bash -c '
   awk "/^cmd_new\(\) \{/,/^\}/" "'"$ROOT"'/bin/box" \
     | grep -F "boot.autostart=true" | grep -q "T_AUTOSTART"'
@@ -2054,8 +2050,8 @@ check "new: BOX_LAUNCH_TIMEOUT is documented in box help new" 0 "" bash -c '
 # convergence command now, so the assertion is the strongest form of the one
 # that was here: no template names a convergence role at all.
 # shellcheck disable=SC2016  # the path expands in the child shell, by design
-check "templates: no template names a convergence role at all (#214)" 1 "" bash -c '
-  grep -h "^BOX_BOOTSTRAP_ROLE=" "'"$ROOT"'"/templates/*/box.env | grep -q .'
+check "seed: names no convergence role at all (#214)" 1 "" bash -c '
+  grep -h "^BOX_BOOTSTRAP_ROLE=" "'"$ROOT"'"/seed/box.env | grep -q .'
 # shellcheck disable=SC2016  # the $-string is a literal in the target file
 check "new: the ready hint offers 'box root' for a server-class box (#176, #214)" 0 "" bash -c '
   awk "/^cmd_new\(\) \{/,/^\}/" "'"$ROOT"'/bin/box" \
@@ -3454,19 +3450,16 @@ for k in schema version image mode created origin; do
     launch_has "$MLOG" "user\.box\.$k="
 done
 
-# The one surviving dedicated template must keep the values load_template
-# read from its seed. Runtime role/user variables are empty on this path, so
-# this drive catches any later assignment that erases staging's identity and
-# silently skips convergence (#159 review round 1).
+# The staging box WITHOUT its template (#288): the flags reproduce what
+# staging-box's box.env carried — VM only, autostart, medium — through the
+# same mint path every box takes.
 STAGINGLOG="$MWORK/staging-template.log"
-mintbox "$STAGINGLOG" new --name staging --template staging-box --vm >/dev/null 2>&1
-check "mint staging: keeps the seed user stamp (#159)" 0 "" \
-  launch_has "$STAGINGLOG" 'user\.box\.user=ops'
-check "mint staging: keeps the server autostart demand (#68, #159)" 0 "" \
+mintbox "$STAGINGLOG" new --name staging --size medium --autostart --require-vm >/dev/null 2>&1
+check "mint staging: --autostart stamps the server autostart demand (#68, #288)" 0 "" \
   launch_has "$STAGINGLOG" 'boot\.autostart=true'
-check "mint staging: launches as a VM (#68, #159)" 0 "" \
+check "mint staging: --require-vm launches as a VM (#68, #288)" 0 "" \
   launch_has "$STAGINGLOG" ' --vm '
-check "mint staging: keeps its 60GiB VM root device (#68, #159)" 0 "" \
+check "mint staging: --size medium keeps its 60GiB VM root device (#68, #288)" 0 "" \
   launch_has "$STAGINGLOG" 'root,size=60GiB'
 check "mint staging: disables VM secure boot (#159)" 0 "" \
   launch_has "$STAGINGLOG" 'security\.secureboot=false'
@@ -3476,8 +3469,6 @@ check "mint staging: execs no converger of its own (#214)" 1 "" \
   grep -qE '^incus exec staging .* bootstrap' "$STAGINGLOG"
 check "mint staging: renders no installer line into its seed (#214)" 1 "" \
   launch_has "$STAGINGLOG" 'install\.sh'
-check "mint staging: keeps the ops sudo line in the rendered seed (#214)" 0 "" \
-  launch_has "$STAGINGLOG" 'NOPASSWD:ALL'
 # The retired keys are absent HERE too: staging-box was the one seed that
 # actually declared BOX_BOOTSTRAP_ROLE, so it is the one whose stamp would
 # still carry a role if the cut had been made only on the tenant path.
@@ -3593,8 +3584,10 @@ check "mint: stamps the mint time as UTC ISO 8601 (#103)" 0 "" \
 # does not rewrite it, and box_user()/the login hint read two of them.
 check "mint: the pre-existing boundary tag still rides the same line" \
   0 "user.box=1" launchline "$MLOG"
-check "mint: stamps the internal tenant seed every mint renders (#159, #214)" \
-  0 "user.box.template=tenant" launchline "$MLOG"
+check "mint: no longer stamps a template — there is none (#288)" \
+  1 "" launch_has "$MLOG" 'user\.box\.template='
+check "mint: ...while the launch line itself was read (the absence is real)" \
+  0 "user.box=1" launchline "$MLOG"
 check "mint: the pre-existing user stamp is untouched" \
   0 "user.box.user=claude" launchline "$MLOG"
 # Deliberately NOT stamped. limits.* already hold cpu/memory and a duplicate
@@ -11251,8 +11244,8 @@ check "scope: bin/box still lands scope:cli" 0 "" \
   scope_of_is "$LABELER" bin/box scope:cli
 check "scope: drill/ — the rehearsal machinery — still lands scope:drill" 0 "" \
   scope_of_is "$LABELER" drill/doctor.sh scope:drill
-check "scope: templates/ still lands scope:templates" 0 "" \
-  scope_of_is "$LABELER" templates/box-init.sh scope:templates
+check "scope: seed/ lands scope:templates (#288)" 0 "" \
+  scope_of_is "$LABELER" seed/user-data.yaml scope:templates
 check "scope: install.sh still lands scope:installer" 0 "" \
   scope_of_is "$LABELER" install.sh scope:installer
 check "scope: host/ still lands scope:host" 0 "" \
