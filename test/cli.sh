@@ -2663,6 +2663,7 @@ check "revoke: refuses a service whose unit still runs, naming it" 1 "garm.servi
 check "revoke: the refusal says to stop it first" 1 "stop them first, so it drains" rs_revoke svc
 # shellcheck disable=SC2016  # the $-strings expand in the child shell, by design
 check "revoke: the user's own systemd manager is not the service" 1 "" bash -c 'env PATH="'"$RS"'/bin:$PATH" RS="'"$RS"'" bash "'"$ROOT"'/host/revoke-user.sh" svc 2>&1 | grep -q "  user@"'
+check "revoke: the running-unit refusal comes first, even with --purge --purge-pool" 1 "garm.service" rs_revoke svc --purge --purge-pool
 check "revoke: --force revokes anyway, loudly" 0 "WARNING: --force" rs_revoke svc --force
 rs_reset
 check "revoke --purge on a service: every tool profile and custom volume goes, then the project" 0 "kept: grant pool gig" rs_revoke svc --purge
@@ -2673,6 +2674,10 @@ check "revoke --purge: 'default' is never deleted" 1 "" grep -q "profile delete 
 check "revoke --purge: the pool survives a plain purge" 1 "" grep -q "storage delete gig" "$RS/log"
 rs_reset
 check "revoke --purge --purge-pool deletes the grant pool" 0 "purge: grant pool gig removed" rs_revoke svc --purge --purge-pool
+rs_reset; printf -- '- /1.0/images/abc123\n- /1.0/images/abc123?project=user-1002\n' >"$RS/state/foreign"
+check "revoke --purge-pool: image caches on the pool are not 'foreign' (rehearsal finding)" 0 "purge: grant pool gig removed" \
+  rs_revoke svc --purge --purge-pool
+check "revoke --purge-pool: ...the image cache volume is dropped before the pool" 0 "storage volume delete gig image/abc123" rs_log
 rs_reset; echo "- /1.0/instances/other?project=user-1600" >"$RS/state/foreign"
 check "revoke --purge-pool: refused while the pool is shared, before anything is purged" 1 "used outside user-1500" rs_revoke svc --purge --purge-pool
 check "revoke --purge-pool: the refusal deleted nothing" 1 "" grep -q "delete" "$RS/log"

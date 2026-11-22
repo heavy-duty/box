@@ -895,9 +895,11 @@ as_svc incus --project "$ps_" profile create drill-tool >/dev/null 2>&1
 # A unit running AS the service: revoke must refuse and name it.
 systemd-run --quiet --uid="$US" --unit=boxdrill-svc sleep 600 >/dev/null 2>&1
 out="$(BOX_YES=1 box revoke "$US" --purge --purge-pool 2>&1)"; rc=$?
-[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "boxdrill-svc.service" \
-  && ok "(r) revoke refuses while boxdrill-svc.service runs as the service, by name" \
-  || no "(r) revoke did not refuse under a running unit (rc=$rc)"
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "boxdrill-svc.service"; then
+  ok "(r) revoke refuses while boxdrill-svc.service runs as the service, by name"
+else
+  no "(r) revoke did not refuse under a running unit (rc=$rc):"; printf '%s\n' "$out" | tail -4 | sed 's/^/        /'
+fi
 systemctl stop boxdrill-svc >/dev/null 2>&1
 out="$(BOX_YES=1 box revoke "$US" --purge --purge-pool 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ]; then
@@ -952,13 +954,13 @@ else
   else
     no "(t) a group member could not 'box --as $US list':"; printf '%s\n' "$out" | tail -5 | sed 's/^/        /'
   fi
-  if runuser -u boxdrillm -- box --as "$US" new --name drill-shared "${MODE[@]}" >/dev/null 2>&1; then
+  if out="$(runuser -u boxdrillm -- box --as "$US" new --name drill-shared "${MODE[@]}" --cpu 1 --memory 1GiB --disk 2GiB 2>&1)"; then
     incus --project "$ps_" list --format csv -c n 2>/dev/null | grep -qx drill-shared \
       && ok "(t) a member's box lands in the tenant's project $ps_" \
       || no "(t) the member's box is not in $ps_"
     runuser -u boxdrillm -- box --as "$US" rm drill-shared --force >/dev/null 2>&1
   else
-    no "(t) a group member could not mint as the tenant"
+    no "(t) a group member could not mint as the tenant:"; printf '%s\n' "$out" | tail -5 | sed 's/^/        /'
   fi
   out="$(runuser -u boxdrillo -- box --as "$US" list 2>&1)"; rc=$?
   [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "boxdrillgrp" \

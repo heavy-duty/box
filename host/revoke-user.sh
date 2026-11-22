@@ -61,20 +61,6 @@ fi
 if [ "$service" -eq 0 ] && { [ "$force" -eq 1 ] || [ "$purge_pool" -eq 1 ]; }; then
   echo "box revoke: --force and --purge-pool are for service grants; $project is not one" >&2; exit 2
 fi
-if [ "$purge_pool" -eq 1 ]; then
-  [ -n "$grant_pool" ] || { echo "box revoke: $project has no grant pool to purge" >&2; exit 2; }
-  owner="$(incus storage get "$grant_pool" user.box.grant </dev/null 2>/dev/null || true)"
-  [ "$owner" = "$user" ] || { echo "box revoke: pool $grant_pool is not $user's grant pool (user.box.grant=${owner:-unset}) — not deleting it" >&2; exit 1; }
-  # Refused BEFORE anything is purged: a pool something else uses would leave
-  # the purge half-done at the last step.
-  foreign="$(incus storage show "$grant_pool" </dev/null 2>/dev/null \
-    | awk '/^used_by:/{u=1;next} u&&/^- /{print $2;next} u&&!/^- /{u=0}' \
-    | grep -v "project=$project\(&\|\$\)" || true)"
-  if [ -n "$foreign" ]; then
-    echo "box revoke: pool $grant_pool is used outside $project — refusing --purge-pool:" >&2
-    printf '  %s\n' "${foreign//$'\n'/$'\n'  }" >&2; exit 1
-  fi
-fi
 if [ "$service" -eq 1 ]; then
   # The units running AS the service, by systemd's own attribution (ps' unit
   # column), not by name: a service whose unit is named for its engine
@@ -94,6 +80,23 @@ if [ "$service" -eq 1 ]; then
   fi
 fi
 
+if [ "$purge_pool" -eq 1 ]; then
+  [ -n "$grant_pool" ] || { echo "box revoke: $project has no grant pool to purge" >&2; exit 2; }
+  owner="$(incus storage get "$grant_pool" user.box.grant </dev/null 2>/dev/null || true)"
+  [ "$owner" = "$user" ] || { echo "box revoke: pool $grant_pool is not $user's grant pool (user.box.grant=${owner:-unset}) — not deleting it" >&2; exit 1; }
+  # Refused BEFORE anything is purged: a pool something else uses would leave
+  # the purge half-done at the last step.
+  # Image entries are CACHES, not users: minting on a pool leaves the image's
+  # volume there, and every project holding that image fingerprint lists it
+  # (measured in the rehearsal). They are dropped before the pool goes.
+  pool_used="$(incus storage show "$grant_pool" </dev/null 2>/dev/null \
+    | awk '/^used_by:/{u=1;next} u&&/^- /{print $2;next} u&&!/^- /{u=0}' || true)"
+  foreign="$(grep -v "project=$project\(&\|\$\)" <<<"$pool_used" | grep -v '^/1\.0/images/' || true)"
+  if [ -n "$foreign" ]; then
+    echo "box revoke: pool $grant_pool is used outside $project — refusing --purge-pool:" >&2
+    printf '  %s\n' "${foreign//$'\n'/$'\n'  }" >&2; exit 1
+  fi
+fi
 if [ "$purge" -eq 1 ]; then
   # Destructive and irreversible: a TTY to ask on, or BOX_YES=1, or refuse —
   # the same non-interactive contract as install.sh.
@@ -272,6 +275,14 @@ fi
 # operator wants back; checked unshared before anything was deleted, above.
 if [ -n "$grant_pool" ]; then
   if [ "$purge_pool" -eq 1 ]; then
+    # The image caches on the pool, by fingerprint — Incus recreates one on
+    # demand wherever that image is next used, so dropping it loses nothing.
+    while IFS= read -r ref; do
+      case "$ref" in /1.0/images/*) ;; *) continue ;; esac
+      fp="${ref#/1.0/images/}"; fp="${fp%%\?*}"
+      incus storage volume delete "$grant_pool" "image/$fp" </dev/null >/dev/null 2>&1 || true
+    done < <(incus storage show "$grant_pool" </dev/null 2>/dev/null \
+      | awk '/^used_by:/{u=1;next} u&&/^- /{print $2;next} u&&!/^- /{u=0}' | sort -u)
     incus storage delete "$grant_pool" </dev/null \
       || { echo "box revoke: could not delete pool $grant_pool (incus storage show $grant_pool)" >&2; exit 1; }
     echo "purge: grant pool $grant_pool removed"
