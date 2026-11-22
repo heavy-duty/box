@@ -584,7 +584,9 @@ if [ "$rawrc" -ne 0 ]; then
 else
   ok "(m) raw attach to boxnet launches (expected: the network must be usable for the profile to work)"
   ip_raw=""
-  for _ in $(seq 1 45); do
+  # 180s, not 90: a raw instance runs cloud-init with no seed of box's, and on
+  # the CI runner it was still 'running' at 90s with no lease yet.
+  for _ in $(seq 1 90); do
     ip_raw="$(incus --project "$p1" list esc2 --format csv --columns 4 2>/dev/null | tr -d '"' | sed 's/ (.*//' | grep . | head -n1)"
     [ -n "$ip_raw" ] && as_u "$U1" timeout -k 5 15 incus exec esc2 -- true >/dev/null 2>&1 && break
     sleep 2
@@ -597,7 +599,7 @@ else
     # Hand over the evidence instead of making the next reader re-derive it:
     # what the guest sees, what cloud-init did, and the NIC Incus gave it.
     inf "evidence (esc2):"
-    { incus --project "$p1" exec esc2 -- sh -c 'ip -o addr 2>&1; echo ---; cloud-init status --long 2>&1 | head -8; echo ---; ls /etc/systemd/network /etc/netplan 2>&1; echo ---; journalctl -b --no-pager 2>/dev/null | grep -iE "dhcp|networkd|eth0|lease" | tail -8' 2>&1
+    { incus --project "$p1" exec esc2 -- sh -c 'ip -o addr 2>&1; echo ---; cloud-init status --long 2>&1 | head -8; echo ---; ls /etc/systemd/network /etc/netplan 2>&1; echo ---; networkctl status eth0 --no-pager 2>&1 | head -12; echo ---; systemctl is-active systemd-networkd 2>&1; echo ---; journalctl -b --no-pager 2>/dev/null | grep -iE "dhcp|networkd|eth0|lease" | tail -8' 2>&1
       echo ---; incus --project "$p1" config show esc2 --expanded 2>&1 | sed -n '/^devices:/,/^[a-z]/p'
       echo ---; incus network list-leases boxnet 2>&1 | tail -6; } </dev/null | head -60 | sed 's/^/          /'
 
