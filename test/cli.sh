@@ -2848,6 +2848,7 @@ check "setup-host: installs dnsmasq-base when it is missing" 0 "" \
   grep -qF 'apt_get install -y dnsmasq-base' "$ROOT/host/setup-host.sh"
 check "setup-host: ...only when /usr/sbin/dnsmasq is absent and apt exists" 0 "" \
   grep -qF 'if [ ! -x /usr/sbin/dnsmasq ] && command -v apt-get >/dev/null 2>&1; then' "$ROOT/host/setup-host.sh"
+# shellcheck disable=SC2016  # the $-strings expand in the child shell, by design
 check "setup-host: ...before boxnet is created" 0 "" bash -c '
   f="'"$ROOT"'/host/setup-host.sh"
   [ "$(grep -n "install -y dnsmasq-base" "$f" | cut -d: -f1)" -lt "$(grep -n "incus network create boxnet" "$f" | head -1 | cut -d: -f1)" ]'
