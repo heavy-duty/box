@@ -66,7 +66,7 @@ artifact embeds that same tree for transfer to a server. `VERSION`,
 
 ### What a box drill proves
 
-The box drill is the 71-probe VM isolation contract: it exercises the trust
+The box drill is the 90-probe VM isolation contract: it exercises the trust
 boundary on real hardware. The lighter Incus container rehearsal in CI proves
 the tier mechanics but cannot substitute for that boundary measurement. The
 record format and operating procedure live in [drills/README.md](drills/README.md),

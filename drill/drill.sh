@@ -54,7 +54,9 @@
 #      anything else here touches it (#64).                                 [1]
 #   A. Incus semantics — the assumptions box is built on, probed directly.
 #      These were only ever verified against a stub.                        [8]
-#   B. The box surface — the whole CLI, end to end, including the boundary. [45]
+#   B. The box surface — the whole CLI, end to end, including the boundary. [47]
+#   G. Guest interiors — what a fresh box holds, measured from inside (#292).
+#      chrony, skew, no tenant, root entry, /tmp, no swap, drop-ins.        [17]
 #   C. Isolation baseline — does the trust boundary actually hold?
 #      (#15 section A)                                                      [9]
 #   E. box expose — a deliberate loopback door, opened and shut (#55).      [7]
@@ -275,15 +277,19 @@ aud()  { audit+=("$*"); }                       # a measurement, for the record
 # emits no verdicts at all (install, host setup, the summary itself). A verdict
 # emitted under '-' lands in the '?' bucket and is reported, because an
 # unattributed probe means this table has drifted from the script.
-PHASE_ORDER=(I A B C E D T)
+PHASE_ORDER=(I A B G C E D T)
 declare -A PHASE_EXPECT=(
   [I]=1     # install.sh left a complete host stack (#64)
   [A]=8     # A1–A6, A8, A9 — Incus semantics (A7 prints, it does not judge)
-  [B]=45    # the box surface: dedicated seed/version 5 + blank 10 + #171 clone 3
+  [B]=47    # the box surface: seed/version 5 + blank 12 + #171 clone 3
             # + the drill box, its clone and the CLI contract 27. It was 51 until
             # #214 took the role axis out: the two per-role mints proved a payload
             # box no longer installs (6 probes), and the drill box's own two agent
             # probes became two seed-payload probes, which is a swap and not a cut.
+            # 0.11.0 (#291) added two to the blank mint: no tenant, and --user refusing.
+  [G]=17    # guest interiors (#292): chrony 1 + skew 2 + no tenant + box root
+            # + checkup seed + /tmp cap + ENOSPC + no swap + no converger + no
+            # stamp + --role refused + --autostart + restart + drop-in 2
   [C]=9     # C1–C7, plus archive-is-up and the peer clone
   [E]=7     # box expose: add, list, info, the door, per-port, remove, shut
   [D]=0     # D states the settled contract; it judges only a failed baseline
@@ -1823,8 +1829,8 @@ fi
 
 printf '\n  minting the drill box (cold)…\n'
 t0=$SECONDS
-if mint_box /tmp/mint-drill.log --name drill --size medium; then
-  ok "box new --name drill --size medium  ($((SECONDS - t0))s)"
+if mint_box /tmp/mint-drill.log --name drill --size medium --autostart; then
+  ok "box new --name drill --size medium --autostart  ($((SECONDS - t0))s)"
 else
   no "box new FAILED — tail: $(tail -3 /tmp/mint-drill.log | tr '\n' ' ')"
   timeout -k 5 60 incus delete -f drill >/dev/null 2>&1
@@ -1901,6 +1907,90 @@ box rm clone --force 2>&1 | grep -q 'removed' && ok "rm --force removes the clon
 box lst 2>&1 | grep -q "did you mean 'list'" && ok "typo → did-you-mean, exit 2" || no "unknown command not suggested"
 box list archive 2>&1 | grep -q 'box info archive' && ok "'list <box>' points at info" || no "'list <box>' does not point at info"
 box snapshot archive --labl x 2>&1 | grep -q 'unknown option' && ok "typo'd flag rejected (not swallowed as a label)" || no "unknown flag was swallowed"
+
+# ===========================================================================
+phase G "G. Guest interiors — what a fresh box holds, measured from inside (#292)"
+# ===========================================================================
+# 0.10.0 shipped chrony, the /tmp cap and the rig-free box, and no probe here
+# witnessed any of them (#253 C1); 0.11.0 adds the no-tenant box, root entry,
+# the absent swapfile and the firewall drop-ins. Written against the seed as it
+# stands after #288–#291, on the drill box (renamed 'archive' by now).
+box start archive >/dev/null 2>&1; wait_box archive >/dev/null 2>&1
+gtyp="$(box list | awk '$1 == "archive" { print $3 }')"
+in_box archive chronyc tracking 2>/dev/null | grep -qE '^Reference ID +: [0-9A-F]{8} \(' \
+  && ok "chronyc tracking answers with a reference source (#174)" \
+  || no "chronyc tracking named no reference source — the clock posture did not land"
+if [ "$gtyp" = VM ]; then
+  for skew in +3 -3; do
+    in_box archive date -s "$skew hours" >/dev/null 2>&1
+    conv=""; for _i in $(seq 1 60); do
+      off="$(in_box archive chronyc tracking 2>/dev/null | awk -F': ' '/^System time/{print $2}' | awk '{print $1}')"
+      [ -n "$off" ] && awk -v o="$off" 'BEGIN{exit !(o < 1.0)}' && { conv="$((_i * 2))s"; break; }
+      sleep 2
+    done
+    [ -n "$conv" ] && ok "a ${skew}h skew converged unattended (within $conv, makestep -1)" \
+                   || no "a ${skew}h skew did NOT converge within 120s — chrony's makestep posture is missing"
+  done
+else
+  skipped G 2 "the box is a container: it shares the host clock, so a guest skew has nothing to converge"
+fi
+people="$(in_box archive getent passwd | awk -F: '$3>=1000 && $3<60000' | wc -l)"
+[ "$people" = 0 ] && ok "a fresh mint holds no tenant — root alone (#291)" \
+                  || no "a fresh mint holds $people regular user(s) — box should create none"
+# shellcheck disable=SC2016  # $(id -u) and $HOME expand inside the box, by design
+rh="$(printf 'echo "$(id -u):$HOME"\nexit\n' | box root archive 2>/dev/null | tr -d '\r' | grep -E '^[0-9]+:' | tail -1)"
+[ "$rh" = "0:/root" ] && ok "box root reaches uid 0 with HOME=/root (#176)" \
+                      || no "box root landed as '${rh:-<nothing>}', expected 0:/root"
+ck="$(box checkup archive 2>&1)"
+printf '%s\n' "$ck" | grep -qE '^SEED +seed/3$' && ok "box checkup runs and reports the seed/3 generation (#258, #290)" \
+                                            || no "box checkup did not report seed/3: $(printf '%s' "$ck" | head -2 | tr '\n' ' ')"
+printf '%s\n' "$ck" | grep -qE '^TMP +tmpfs at 1\.0 GiB' && ok "/tmp is the fixed 1.0 GiB tmpfs, read through box checkup (#178)" \
+                                                     || no "/tmp is not the 1.0 GiB cap: $(printf '%s' "$ck" | grep '^TMP')"
+in_box archive sh -c 'dd if=/dev/zero of=/tmp/fill bs=1M count=1100 2>&1; rm -f /tmp/fill' | grep -q 'No space left on device' \
+  && ok "a write past the /tmp cap gives ENOSPC (#178)" || no "a 1.1 GiB write into /tmp did not hit the cap"
+if [ "$gtyp" = VM ]; then
+  [ -z "$(in_box archive swapon --show 2>/dev/null)" ] && ok "an unconverged VM has NO swap — box lays none since 0.11.0 (#290, D9's cost)" \
+                                                       || no "an unconverged VM has swap — the seed still lays a swapfile"
+else
+  skipped G 1 "the box is a container: swap is the host's, so 'no swapfile' has no guest verdict"
+fi
+in_box archive sh -c 'command -v rig' >/dev/null 2>&1 \
+  && no "a fresh mint has a converger on PATH — box installs none (#214)" \
+  || ok "a fresh mint has no converger on PATH (#214)"
+# The two probes below NAME what #214 retired in order to prove it ABSENT; the
+# strong-form guard in test/cli.sh skips lines marked "absence probe (#292)".
+if incus config show archive 2>/dev/null | grep -qE '^ *user\.box\.(role|rig\.)'; then  # absence probe (#292)
+  no "the instance carries a role or converger stamp (#214)"
+else
+  ok "no retired role or converger stamp on the instance (#214)"
+fi
+rout="$(box new --name cbrole --role claude-box </dev/null 2>&1)"; rrc=$?; rgone="$(printf '%s' "$rout" | grep -c -- '--role is gone')"  # absence probe (#292)
+if [ "$rrc" = 2 ] && [ "$rgone" -ge 1 ] && ! incus info cbrole >/dev/null 2>&1; then
+  ok "the retired role flag is refused on a real daemon, creating nothing (#214)"
+else
+  no "the retired role flag was not refused cleanly (rc=$rrc)"
+fi
+[ "$(incus config get archive boot.autostart 2>/dev/null)" = true ] \
+  && ok "--autostart stamped boot.autostart on a real mint (#288)" || no "the drill box minted with --autostart carries no boot.autostart"
+box restart archive >/dev/null 2>&1 && wait_box archive \
+  && ok "box restart brings the box back (#179)" || no "box restart did not bring the box back"
+# Firewall drop-ins (#279): a port listed in /etc/box/firewall.d is reachable
+# from boxnet on the GATEWAY only, every other gateway port stays dropped.
+GWD="$(boxnet_gw)"; DP=9917
+printf 'tcp %s\n' "$DP" | sudo tee /etc/box/firewall.d/cbdrill.conf >/dev/null
+sudo systemctl restart box-firewall.service >/dev/null 2>&1 || sudo /usr/local/sbin/box-firewall >/dev/null 2>&1
+dsrv="$(mktemp -d)"; echo drill-dropin >"$dsrv/index.html"
+( cd "$dsrv" && setsid python3 -m http.server "$DP" --bind "$GWD" >/dev/null 2>&1 & echo $! >"$dsrv/pid" )
+sleep 1
+[ "$(box_probe archive "http://$GWD:$DP")" = reachable ] \
+  && ok "a drop-in port is reachable from a box on the gateway (#279)" \
+  || no "the drop-in port $DP on $GWD was not reachable from the box"
+[ "$(box_probe archive "http://$GWD:$((DP + 1))")" = dropped ] \
+  && ok "every other gateway port stays DROPPED beside a drop-in (#279)" \
+  || no "gateway port $((DP + 1)) answered — the drop-in widened more than its port"
+kill "$(cat "$dsrv/pid")" 2>/dev/null; rm -rf "$dsrv"
+sudo rm -f /etc/box/firewall.d/cbdrill.conf
+sudo systemctl restart box-firewall.service >/dev/null 2>&1 || sudo /usr/local/sbin/box-firewall >/dev/null 2>&1
 
 # ===========================================================================
 phase C "C. Isolation baseline — does the boundary actually hold? (#15 section A)"
