@@ -36,7 +36,7 @@ here="$(dirname "$(dirname "$self")")"
 usage() { echo "usage: box grant [--service] <user>" >&2; exit 2; }
 
 # --service (#281): the user is a SERVICE, not a person — a no-login system
-# account a daemon runs as (gig's garm, heavy-duty/handbook proposal 0011).
+# account a daemon runs as (gig or crew, heavy-duty/handbook proposal 0011).
 # Three things differ, each bought by how a person's grant would break it:
 #   · no usable home: the user-side incus calls get a throwaway HOME and
 #     INCUS_CONF, because the CLI wants ~/.config/incus before it connects and

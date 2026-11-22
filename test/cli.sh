@@ -2346,7 +2346,7 @@ check "grant: no argument is a usage error"      2 "usage: box grant"  bash "$RO
 check "grant: a flag is not a user"              2 "usage: box grant"  bash "$ROOT/host/grant-user.sh" --frob
 check "grant: --service alone is a usage error"  2 "usage: box grant [--service] <user>"  bash "$ROOT/host/grant-user.sh" --service
 check "grant: two users is a usage error"        2 "usage: box grant"  bash "$ROOT/host/grant-user.sh" a b
-check "help grant documents --service (#281)"    0 "box grant --service garm" "$BOX" help grant
+check "help grant documents --service (#281)"    0 "box grant --service gig" "$BOX" help grant
 check "help grant: a service gets managed disks only" 0 "restricted.devices.disk=managed" "$BOX" help grant
 check "help grant: grant first, then start the service" 0 "Grant FIRST, then start the service" "$BOX" help grant
 check "revoke: no argument is a usage error"     2 "usage: box revoke" bash "$ROOT/host/revoke-user.sh"

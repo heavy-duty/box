@@ -953,7 +953,7 @@ its groups once, at start, and one that touches incus-user before the grant
 creates an unhardened project.
 
   box grant dev1
-  box grant --service garm
+  box grant --service gig
 EOF
 ;;
     revoke) cat <<'EOF'

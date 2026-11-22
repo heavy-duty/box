@@ -333,7 +333,7 @@ shipped profile is installed into their project. Re-run
 `box grant <user>` after upgrading box to refresh the profile, like
 `setup-host` for the stack.
 
-**Services get the same tier** (#281). `box grant --service garm` grants a
+**Services get the same tier** (#281). `box grant --service gig` grants a
 no-login system account a daemon runs as: its project is fenced exactly like a
 person's, plus managed disks only (`restricted.devices.disk=managed`, so a
 service never mounts host paths into an instance) and the
