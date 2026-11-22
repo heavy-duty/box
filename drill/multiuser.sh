@@ -594,6 +594,13 @@ else
     # Without an address the negative probes below would all pass vacuously
     # — a dead NIC drops everything, including the truth.
     no "(m) the raw instance never got a boxnet lease — the scoped guarantee went UNMEASURED"
+    # Hand over the evidence instead of making the next reader re-derive it:
+    # what the guest sees, what cloud-init did, and the NIC Incus gave it.
+    inf "evidence (esc2):"
+    { incus --project "$p1" exec esc2 -- sh -c 'ip -o addr 2>&1; echo ---; cloud-init status --long 2>&1 | head -8; echo ---; ls /etc/systemd/network /etc/netplan 2>&1; echo ---; journalctl -b --no-pager 2>/dev/null | grep -iE "dhcp|networkd|eth0|lease" | tail -8' 2>&1
+      echo ---; incus --project "$p1" config show esc2 --expanded 2>&1 | sed -n '/^devices:/,/^[a-z]/p'
+      echo ---; incus network list-leases boxnet 2>&1 | tail -6; } </dev/null | head -60 | sed 's/^/          /'
+
   else
     r="$(probe_up "$U1" esc2 https://1.1.1.1)"
     [ "$r" = reachable ] && ok "(m) raw NIC: public egress works ($r)" || no "(m) raw NIC: egress broken: $r"
