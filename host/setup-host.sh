@@ -804,6 +804,9 @@ if ! command -v ufw >/dev/null 2>&1 && ! command -v nft >/dev/null 2>&1; then
   apt_get install -y nftables
 fi
 $SUDO install -m 755 "$here/host/box-firewall.sh" /usr/local/sbin/box-firewall
+# The drop-in directory tools write their ports into (#279). Made here so it
+# is discoverable; never removed by teardown — the files are the tools'.
+$SUDO install -d -m 0755 /etc/box/firewall.d
 $SUDO install -m 644 "$here/host/box-firewall.service" /etc/systemd/system/
 $SUDO systemctl daemon-reload
 $SUDO systemctl enable box-firewall.service

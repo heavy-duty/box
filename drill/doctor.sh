@@ -503,6 +503,29 @@ if command -v ufw >/dev/null 2>&1; then
   fi
 fi
 
+# Drop-ins (#279): what other tools opened on the gateway, read through the
+# installed firewall's own parser so the doctor and the firewall can never
+# disagree about what a file means. Informational: a tool's port is that
+# tool's business; a malformed file is reported (it fails closed).
+FW_BIN=/usr/local/sbin/box-firewall
+[ -x "$FW_BIN" ] || FW_BIN="$(dirname "$0")/../host/box-firewall.sh"
+if [ -d "${BOX_FIREWALL_D:-/etc/box/firewall.d}" ]; then
+  head_ "Firewall — drop-in ports (${BOX_FIREWALL_D:-/etc/box/firewall.d})"
+  if ! bash "$FW_BIN" --supports dropins >/dev/null 2>&1; then
+    no "the installed box-firewall does not read drop-ins — re-run setup-host to install this release's"
+  else
+    dropin_err="$(mktemp)"
+    dropin_list="$(bash "$FW_BIN" --list-dropins 2>"$dropin_err" || true)"
+    if [ -n "$dropin_list" ]; then
+      ok "accepted from boxnet to the gateway only: $(tr '\n' ',' <<<"$dropin_list" | sed 's/,$//; s/,/, /g')"
+    else
+      inf "no drop-in ports"
+    fi
+    while IFS= read -r line; do [ -z "$line" ] || no "${line#box-firewall: }"; done <"$dropin_err"
+    rm -f "$dropin_err"
+  fi
+fi
+
 # box-profile is the placement contract. The pre-rename ancestor profile used to be
 # reported beside it, because the migration tool could still re-home the boxes
 # that referenced it; with that tool retired (#226), naming it here would tell

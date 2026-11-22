@@ -874,6 +874,29 @@ The VM is the trust boundary: whatever runs inside — the coding agent, or
 anything a template ships — can run arbitrary code and touch nothing you care
 about.
 
+### Opening a port to the gateway: `/etc/box/firewall.d` (#279)
+
+Boxes reach nothing on the host but DNS and DHCP. A tool that runs a service
+boxes must call at bootstrap (a CI manager's callback, a pull-through mirror)
+opens it with a drop-in, one file per tool:
+
+```
+# /etc/box/firewall.d/gig.conf
+tcp 9997
+```
+
+Each non-comment line is `tcp PORT` or `udp PORT` (1–65535). Each port is
+accepted **from boxnet to the gateway address only**, before the final drop,
+so the host's other addresses on that port stay closed, and so does every
+other gateway port. On a UFW host the same rules are UFW allows tagged
+`box-firewall.d`, converged on every run. A malformed line is reported as
+`file:line` and **its whole file is skipped** (fail closed). The other files
+still apply. To apply an edit: `sudo systemctl restart box-firewall`. The
+files are re-read at every boot and every `setup-host` too. `box doctor` lists
+the active ports, and `teardown-host` leaves the directory alone, because the
+files belong to the tools that wrote them. To check that the installed
+firewall reads drop-ins: `box-firewall --supports dropins` (exit 0).
+
 ### Measured, not claimed
 
 Every clause above is probed live by an end-to-end drill, because the one time

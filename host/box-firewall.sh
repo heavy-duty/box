@@ -6,6 +6,59 @@
 set -euo pipefail
 
 NET=boxnet
+
+# --- Drop-ins: /etc/box/firewall.d/*.conf (#279) ------------------------------
+# The one extension point a tool has into this firewall: a file per tool, each
+# non-comment line `tcp PORT` or `udp PORT`, and every listed port is accepted
+# from boxnet to the GATEWAY address only, before the final drop. Re-read on
+# every run (boot, setup-host, `systemctl restart box-firewall`), so editing a
+# file and restarting the service is the whole procedure. A malformed line
+# fails its FILE closed — that file contributes nothing, the others still
+# apply — and is reported as file:line. Never fails open. BOX_FIREWALL_D moves
+# the directory for tests only.
+DROPIN_DIR="${BOX_FIREWALL_D:-/etc/box/firewall.d}"
+DROPINS=()   # "proto port", de-duplicated, in file order
+read_dropins() {
+  local f n line bad entries e
+  DROPINS=()
+  [ -d "$DROPIN_DIR" ] || return 0
+  for f in "$DROPIN_DIR"/*.conf; do
+    [ -f "$f" ] || continue
+    n=0; bad=0; entries=()
+    while IFS= read -r line || [ -n "$line" ]; do
+      n=$((n + 1))
+      line="${line%%#*}"
+      line="$(printf '%s' "$line" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')"
+      [ -n "$line" ] || continue
+      if [[ "$line" =~ ^(tcp|udp)\ ([1-9][0-9]{0,4})$ ]] && [ "${BASH_REMATCH[2]}" -le 65535 ]; then
+        entries+=("${BASH_REMATCH[1]} ${BASH_REMATCH[2]}")
+      else
+        echo "box-firewall: $f:$n: not 'tcp PORT' or 'udp PORT' (1-65535): '$line' — this file's rules are skipped" >&2
+        bad=1
+      fi
+    done <"$f"
+    [ "$bad" -eq 0 ] || continue
+    for e in "${entries[@]+"${entries[@]}"}"; do
+      case " ${DROPINS[*]+"${DROPINS[*]/ /:}"} " in *" ${e/ /:} "*) continue ;; esac
+      DROPINS+=("$e")
+    done
+  done
+}
+
+# The stable detection signal tools key on (heavy-duty/gig asked for one on
+# #279), and a read-only listing for 'box doctor'. Neither touches a rule.
+case "${1:-}" in
+  --supports)
+    [ "${2:-}" = dropins ] && { echo dropins; exit 0; }
+    exit 1 ;;
+  --list-dropins)
+    read_dropins
+    for e in "${DROPINS[@]+"${DROPINS[@]}"}"; do echo "$e"; done
+    exit 0 ;;
+  "") ;;
+  *) echo "usage: box-firewall [--supports dropins | --list-dropins]" >&2; exit 2 ;;
+esac
+read_dropins
 # The gateway is read off the live bridge, not hardcoded: the subnet is an
 # input now (BOX_SUBNET, setup-host.sh — #80), and a bridge moved off a
 # colliding subnet must keep its firewall. setup-host runs us after the
@@ -68,6 +121,25 @@ if [[ "$UFW_STATUS" == *"Status: active"* ]]; then
       ufw delete allow in on "$NET" to "$stale" port 53 proto udp || true
     done
     ufw insert 1 deny in on "$NET"
+    # Drop-in ports (#279), tagged with a comment so a later run can tell its
+    # own rules from an operator's: any tagged rule no longer listed — or aimed
+    # at an old gateway — is deleted, highest number first so the numbering
+    # holds, and the live set is inserted above the deny.
+    # Captured first, never piped: the same SIGPIPE race the status read above
+    # documents (#102) applies to any multi-line writer feeding a reader.
+    ufw_numbered="$(ufw status numbered 2>/dev/null || true)"
+    stale_nums="$(printf '%s\n' "$ufw_numbered" | awk -v net="$NET" -v gw="$GW" -v want=" ${DROPINS[*]+"${DROPINS[*]/ /:}"} " '
+        /# box-firewall\.d/ {
+          n = $0; sub(/^\[ */, "", n); sub(/\].*/, "", n)
+          split($0, f, /\] */); split(f[2], w, /[ \t]+/)
+          to = w[1]; split(w[2], pp, "/")
+          key = pp[2] ":" pp[1]
+          if (to != gw || index(want, " " key " ") == 0) print n
+        }' | sort -rn)"
+    for num in $stale_nums; do ufw --force delete "$num" || true; done
+    for e in "${DROPINS[@]+"${DROPINS[@]}"}"; do
+      ufw insert 1 allow in on "$NET" to "$GW" port "${e#* }" proto "${e% *}" comment 'box-firewall.d'
+    done
     ufw insert 1 allow in on "$NET" to "$GW" port 53 proto tcp
     ufw insert 1 allow in on "$NET" to "$GW" port 53 proto udp
     ufw insert 1 allow in on "$NET" to any port 67 proto udp
@@ -93,6 +165,19 @@ else
   nft add rule inet box input iifname "$NET" ct state established,related accept
   nft add rule inet box input iifname "$NET" udp dport '{ 53, 67 }' accept
   nft add rule inet box input iifname "$NET" tcp dport 53 accept
+  # Drop-in ports (#279): to the gateway address only, so the host's other
+  # addresses on the same port stay dropped. With no gateway yet (the boot
+  # window above) they are left out — closed, not guessed — and the next run
+  # once the bridge is addressed adds them.
+  if [ "${#DROPINS[@]}" -gt 0 ]; then
+    if [ -n "$GW" ]; then
+      for e in "${DROPINS[@]}"; do
+        nft add rule inet box input iifname "$NET" ip daddr "$GW" "${e% *}" dport "${e#* }" accept
+      done
+    else
+      echo "box-firewall: $NET has no address yet — drop-in ports left closed until the next run" >&2
+    fi
+  fi
   nft add rule inet box input iifname "$NET" drop
 fi
 

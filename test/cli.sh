@@ -2572,6 +2572,7 @@ rs_log() { cat "$RS/log"; }
 rs_reset; printf 'garm.service\nuser@1500.service\n' >"$RS/state/units"
 check "revoke: refuses a service whose unit still runs, naming it" 1 "garm.service" rs_revoke svc
 check "revoke: the refusal says to stop it first" 1 "stop them first, so it drains" rs_revoke svc
+# shellcheck disable=SC2016  # the $-strings expand in the child shell, by design
 check "revoke: the user's own systemd manager is not the service" 1 "" bash -c 'env PATH="'"$RS"'/bin:$PATH" RS="'"$RS"'" bash "'"$ROOT"'/host/revoke-user.sh" svc 2>&1 | grep -q "  user@"'
 check "revoke: --force revokes anyway, loudly" 0 "WARNING: --force" rs_revoke svc --force
 rs_reset
@@ -4400,11 +4401,13 @@ infobox() {  # infobox <cfg-file> — 'box info work' against a canned config
 # resolves as a box, and info says where it came from instead of calling it old.
 PROFILE_ONLY="$(mktemp)"; : >"$PROFILE_ONLY"
 PROFILE_TAG="$(mktemp)"; echo "user.box 1" >"$PROFILE_TAG"
+# shellcheck disable=SC2016  # the $-strings expand in the child shell, by design
 check "info: an instance tagged only by profile resolves as a box (#284)" \
   0 "minted outside box new" env FAKE_CFG_EXPANDED="$PROFILE_TAG" bash -c 'infobox_x() { env FAKE_INCUS_LOG=/dev/null FAKE_CFG="$1" FAKE_ROW="work,RUNNING,VIRTUAL-MACHINE,0" PATH="'"$MSHIM"':$PATH" "'"$BOX"'" info work </dev/null 2>&1; }; infobox_x "'"$PROFILE_ONLY"'"'
 check "info: an instance with no user.box on either level is not a box (#284)" \
   1 "no such box: work" infobox "$PROFILE_ONLY"
 rm -f "$PROFILE_ONLY" "$PROFILE_TAG"
+# shellcheck disable=SC2016  # the $-strings expand in the child shell, by design
 check "resolve_box: reads user.box from the expanded config (#284)" 0 "" bash -c '
   awk "/^resolve_box\(\) \{/,/^\}/" "'"$ROOT"'/bin/box" | grep -q "incus config get --expanded \"\$i\" user.box "'
 check "info: surfaces the mint time and the box that minted it (#103)" \
@@ -7267,7 +7270,7 @@ runfw() { # runfw <ufw|noufw> [VAR=val ...] — the real box-firewall, under shi
   # fwlog_ready below show what the run actually said. Overwritten per call by
   # design: every fwlog_ready sits immediately after its own runfw, so "the
   # last run" is always the run being diagnosed.
-  env PATH="$p" "$@" bash "$ROOT/host/box-firewall.sh" 2>"$WFW/last-run.err" || rc=$?
+  env PATH="$p" BOX_FIREWALL_D="${FW_DROPINS:-$WFW/no-dropins}" "$@" bash "$ROOT/host/box-firewall.sh" 2>"$WFW/last-run.err" || rc=$?
   cat "$WFW/last-run.err" >&2
   return "$rc"
 }
@@ -7401,6 +7404,88 @@ check "box-firewall: the nft path survives the boot window too" 0 "" \
 check "box-firewall: ...with the same interface-scoped carve-out" 0 "" \
   grep -qF 'add rule inet box input iifname boxnet udp dport { 53, 67 } accept' "$WFW/nftboot.log"
 
+
+# --- Drop-ins in /etc/box/firewall.d (#279) ----------------------------------
+FWD="$WFW/dropins"; mkdir -p "$FWD"
+runfw_d() { FW_DROPINS="$FWD" runfw "$@"; }
+printf 'tcp 9997\n# a comment\n\n  udp   5353   # trailing comment\ntcp 9997\n' >"$FWD/a-gig.conf"
+printf 'tcp 8080\n' >"$FWD/b-mirror.conf"
+check "box-firewall: drop-ins apply on a no-UFW host" 0 "" \
+  runfw_d noufw FAKE_IP4_BOXNET="$BX89" FAKE_NFT_LOG="$WFW/drop.log"
+check "box-firewall: ...a drop-in port is accepted to the GATEWAY only" 0 "" \
+  grep -qF 'add rule inet box input iifname boxnet ip daddr 10.89.0.1 tcp dport 9997 accept' "$WFW/drop.log"
+check "box-firewall: ...udp, with whitespace and a trailing comment" 0 "" \
+  grep -qF 'ip daddr 10.89.0.1 udp dport 5353 accept' "$WFW/drop.log"
+# shellcheck disable=SC2016  # $1 expands in the child shell, by design
+check "box-firewall: ...a port listed twice is one rule" 0 "" \
+  bash -c '[ "$(grep -c "tcp dport 9997 accept" "$1")" -eq 1 ]' _ "$WFW/drop.log"
+# shellcheck disable=SC2016  # $1 expands in the child shell, by design
+check "box-firewall: ...every drop-in lands BEFORE the final drop, in file order" 0 "" bash -c '
+  a="$(grep -n "dport 9997 accept" "$1" | cut -d: -f1)"; b="$(grep -n "dport 8080 accept" "$1" | cut -d: -f1)"
+  d="$(grep -n "iifname boxnet drop" "$1" | cut -d: -f1)"
+  [ -n "$a" ] && [ -n "$b" ] && [ -n "$d" ] && [ "$a" -lt "$b" ] && [ "$b" -lt "$d" ]' _ "$WFW/drop.log"
+printf 'tcp 7000\ntcp 99999\n' >"$FWD/c-bad.conf"
+check "box-firewall: a malformed line is reported as file:line" 0 "c-bad.conf:2: not 'tcp PORT' or 'udp PORT'" \
+  runfw_d noufw FAKE_IP4_BOXNET="$BX89" FAKE_NFT_LOG="$WFW/bad.log"
+check "box-firewall: ...its file contributes NOTHING (fails closed)" 1 "" grep -qF 'dport 7000' "$WFW/bad.log"
+check "box-firewall: ...the other files still apply" 0 "" grep -qF 'tcp dport 8080 accept' "$WFW/bad.log"
+rm -f "$FWD/c-bad.conf"
+for badline in 'tcp 0' 'tcp 08080' 'sctp 80' 'tcp 80 81' 'tcp' 'tcp -1' 'tcp 65536'; do
+  printf '%s\n' "$badline" >"$FWD/z.conf"
+  check "box-firewall --list-dropins: '$badline' is refused" 0 "z.conf:1:" \
+    env BOX_FIREWALL_D="$FWD" bash "$ROOT/host/box-firewall.sh" --list-dropins
+done
+rm -f "$FWD/z.conf"
+check "box-firewall: drop-ins are left CLOSED in the boot window (no gateway)" 0 "drop-in ports left closed" \
+  runfw_d noufw FAKE_IP4_BOXNET= FAKE_NFT_LOG="$WFW/dropboot.log"
+check "box-firewall: ...no drop-in rule in that window" 1 "" grep -qF 'dport 9997' "$WFW/dropboot.log"
+# No directory: the generated rules are byte-identical to the script before
+# drop-ins existed. The baseline is today's nft sequence as the pre-#279 script
+# (839888e) emitted it under these same shims, recorded here rather than read
+# from git, so a shallow checkout cannot skip the comparison.
+cat >"$WFW/before.log" <<'NFT'
+nft add table inet box
+nft add chain inet box input { type filter hook input priority -5 ; }
+nft flush chain inet box input
+nft add rule inet box input iifname boxnet ct state established,related accept
+nft add rule inet box input iifname boxnet udp dport { 53, 67 } accept
+nft add rule inet box input iifname boxnet tcp dport 53 accept
+nft add rule inet box input iifname boxnet drop
+nft list table bridge box
+nft add table bridge box
+nft add chain bridge box forward { type filter hook forward priority -200 ; policy accept ; }
+nft add rule bridge box forward meta ibrname boxnet meta obrname boxnet drop
+nft add table inet box
+nft add chain inet box expose-snat { type nat hook postrouting priority 110 ; }
+nft flush chain inet box expose-snat
+nft add rule inet box expose-snat oifname boxnet ip saddr 127.0.0.0/8 masquerade
+NFT
+check "box-firewall: with no firewall.d the run is clean" 0 "" \
+  runfw noufw FAKE_IP4_BOXNET="$BX89" FAKE_NFT_LOG="$WFW/after.log"
+check "box-firewall: ...and its nft rules are byte-identical to before #279" 0 "" \
+  diff "$WFW/before.log" "$WFW/after.log"
+# UFW: the same ports, tagged, above the deny; tagged rules no longer listed go.
+check "box-firewall: drop-ins on a UFW host" 0 "" \
+  runfw_d ufw FAKE_IP4_BOXNET="$BX88" FAKE_UFW_STATUS="$U_FRESH" FAKE_UFW_LOG="$WFW/ufwdrop.log"
+check "box-firewall: ...each port is a tagged gateway-only allow" 0 "" \
+  grep -qF "ufw insert 1 allow in on boxnet to 10.88.0.1 port 9997 proto tcp comment box-firewall.d" "$WFW/ufwdrop.log"
+# shellcheck disable=SC2016  # $1 expands in the child shell, by design
+check "box-firewall: ...inserted after the deny, so they sit above it" 0 "" bash -c '
+  d="$(grep -n "insert 1 deny in on boxnet" "$1" | cut -d: -f1)"; a="$(grep -n "port 9997 proto tcp comment" "$1" | cut -d: -f1)"
+  [ -n "$d" ] && [ -n "$a" ] && [ "$d" -lt "$a" ]' _ "$WFW/ufwdrop.log"
+U_STALE="$(printf 'Status: active\n\n[ 1] 10.88.0.1 53/tcp on boxnet ALLOW IN Anywhere\n[ 2] 10.88.0.1 4444/tcp on boxnet ALLOW IN Anywhere # box-firewall.d\n[ 3] 10.88.0.1 9997/tcp on boxnet ALLOW IN Anywhere # box-firewall.d\n[ 4] 10.77.0.1 8080/tcp on boxnet ALLOW IN Anywhere # box-firewall.d\n[ 5] 10.88.0.1 3000/tcp on boxnet ALLOW IN Anywhere\n')"
+check "box-firewall: stale tagged drop-in rules converge away" 0 "" \
+  runfw_d ufw FAKE_IP4_BOXNET="$BX88" FAKE_UFW_STATUS="$U_STALE" FAKE_UFW_LOG="$WFW/ufwstale.log"
+# shellcheck disable=SC2016  # the $-strings expand in the child shell, by design
+check "box-firewall: ...a port no longer listed is deleted, highest number first" 0 "" bash -c '
+  grep -q "ufw --force delete 4" "$1" && grep -q "ufw --force delete 2" "$1" &&
+  [ "$(grep -n "delete 4" "$1" | cut -d: -f1)" -lt "$(grep -n "delete 2" "$1" | cut -d: -f1)" ]' _ "$WFW/ufwstale.log"
+check "box-firewall: ...a listed port at the live gateway is kept" 1 "" grep -q "ufw --force delete 3" "$WFW/ufwstale.log"
+check "box-firewall: ...an operator's untagged rule is never touched" 1 "" grep -q "ufw --force delete 5" "$WFW/ufwstale.log"
+check "box-firewall --supports dropins answers yes" 0 "dropins" bash "$ROOT/host/box-firewall.sh" --supports dropins
+check "box-firewall --supports something-else answers no" 1 "" bash "$ROOT/host/box-firewall.sh" --supports frob
+check "box-firewall --list-dropins prints the effective ports" 0 "tcp 8080" env BOX_FIREWALL_D="$FWD" bash "$ROOT/host/box-firewall.sh" --list-dropins
+check "box-firewall: an unknown flag is a usage error" 2 "usage: box-firewall" bash "$ROOT/host/box-firewall.sh" --frob
 # ---------------------------------------------------------------------------
 # The doctor's UFW blind spot (#86 review item 1, second half): the ACL
 # check alone gave a remapped UFW host a clean bill while the stale UFW
