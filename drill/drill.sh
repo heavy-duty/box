@@ -1663,11 +1663,11 @@ fi
 
 # A9 — 'incus copy' preserves user.* keys (#15 B2). #17's whole metadata design:
 # a clone must still know what it is without consulting the template.
-incus config set cbprobe user.box.user claude 2>/dev/null
+incus config set cbprobe user.box.origin mint 2>/dev/null
 incus stop -f cbprobe >/dev/null 2>&1
 incus copy cbprobe cbcopy >/dev/null 2>&1
-c="$(incus config get cbcopy user.box.user 2>/dev/null)"
-if [ "$c" = claude ]; then
+c="$(incus config get cbcopy user.box.origin 2>/dev/null)"
+if [ "$c" = mint ]; then
   ok "incus copy preserves user.* keys (a clone knows what it is)"
   aud "B2 copy preserves user.*: YES — #17's metadata-stamp design holds"
 else
@@ -1740,14 +1740,20 @@ if mint_box /tmp/mint-tpl.log --name tpl --cpu 1 --memory 1GiB; then
   rc="$(incus config get tpl limits.cpu 2>/dev/null)/$(incus config get tpl limits.memory 2>/dev/null)"
   [ "$rc" = "1/1GiB" ] && ok "inline --cpu/--memory landed (limits = $rc, beating BOX_* env)" \
                        || no "inline resource flags did not land — limits are $rc, expected 1/1GiB"
-  [ "$(incus config get tpl user.box.user 2>/dev/null)" = dev ] \
-    && ok "template user stamped on the instance (user.box.user=dev)" || no "user.box.user not stamped"
+  [ -z "$(incus config get tpl user.box.user 2>/dev/null)" ] \
+    && ok "no user stamped — box creates none since 0.11.0 (#291)" || no "a 0.11.0 mint stamped user.box.user"
   incus config show tpl 2>/dev/null | grep -q '^- box-profile' \
     && ok "blank box launched with the box-profile profile — same placement contract" \
     || no "blank box is NOT on box-profile — a template picked its own placement?!"
-  u="$(timeout -k 5 30 box exec tpl -- whoami </dev/null 2>/dev/null | tr -d '[:space:]')"
-  [ "$u" = dev ] && ok "exec lands in the template's user ($u) — nothing hardcodes claude" \
-                 || no "exec landed in '${u:-<nothing>}', expected dev"
+  u="$(timeout -k 5 30 box exec tpl -- id -u </dev/null 2>/dev/null | tr -d '[:space:]')"
+  [ "$u" = 0 ] && ok "exec enters as root by default (uid $u) — the entry model of #291" \
+               || no "exec landed as uid '${u:-<nothing>}', expected root (0)"
+  people="$(timeout -k 5 30 box exec tpl -- getent passwd </dev/null 2>/dev/null | awk -F: '$3>=1000 && $3<60000' | wc -l)"
+  [ "$people" = 0 ] && ok "a fresh mint carries no tenant — box creates no users (#291)" \
+                    || no "a fresh mint has $people regular user(s) — box should create none"
+  timeout -k 5 30 box exec --user nobody-here tpl -- true </dev/null >/dev/null 2>&1; urc=$?
+  [ "$urc" = 2 ] && ok "exec --user with a missing user refuses (exit 2), never running as root" \
+                 || no "exec --user nobody-here exited $urc — expected a refusal (2)"
   timeout -k 5 30 box exec tpl -- sh -lc 'command -v claude' </dev/null >/dev/null 2>&1 \
     && no "the blank box has claude installed — 'blank' is not blank" \
     || ok "blank box has no claude — nobody home, as designed"

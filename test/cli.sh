@@ -85,6 +85,7 @@ check "new: --template staging-box teaches the flags that replace it (#288)" 2 \
 check "box tmux is refused, carrying the replacement (#289)" 2 \
   "box exec --user <user> <box> -- tmux new-session -A -s main" "$BOX" tmux work
 check "box tmux: ...and the reason the verb existed (SIGHUP)" 2 "SIGHUP" "$BOX" tmux work
+# shellcheck disable=SC2016  # $1 expands in the child shell, by design
 check "help: no tmux verb in the listing's live commands (#289)" 1 "" bash -c '"$1" help | grep -E "^  tmux " | grep -qv "Removed"' _ "$BOX"
 check "box templates is refused, naming where roles live (#288)" 2 \
   "box has no templates since 0.11.0" "$BOX" templates
@@ -105,8 +106,10 @@ check "new: --role's refusal keeps --size in the taught line (#214)" 2 \
   "box new --name work --size medium" "$BOX" new --name work --role claude-box
 check "new: --role refuses with no value too (#214)" 2 \
   "--role is gone" "$BOX" new --name work --role
-check "new: --user is a plain Linux user name (#159)" 2 \
-  "--user must be a plain Linux user name" "$BOX" new --name work --user 'bad user'
+check "new: --user is refused — box creates no users (#291)" 2 \
+  "box new creates no users since 0.11.0" "$BOX" new --name work --user claude
+check "new: ...and the refusal says how to enter as one later" 2 \
+  "box shell --user claude <box>" "$BOX" new --name work --user claude
 check "new: --from keeps named sizes on the fresh-mint side (#159)" 2 \
   "explicit --cpu/--memory/--disk overrides, not --size" \
   "$BOX" new --name copy --from work --size medium
@@ -343,7 +346,7 @@ rm -rf "$CKWORK"
 # marker files.
 # ---------------------------------------------------------------------------
 EXECFN="$(mktemp)"
-grep '^cmd_exec()' "$BOX" > "$EXECFN"
+awk '/^cmd_exec\(\) \{/,/^\}/' "$BOX" > "$EXECFN"
 check "box exec: cmd_exec extracted (guards the grep)" 0 "exec \"\$@\"" cat "$EXECFN"
 check "box exec: extracted function is valid bash" 0 "" bash -n "$EXECFN"
 check "box exec: command argv never rides sudo -i" 1 "" grep -q -- ' -i ' "$EXECFN"
@@ -352,7 +355,7 @@ exec_fixture() { # exec_fixture <command> [arg...]
   bash -c '
     set -e
     . "$0"
-    box_user() { printf "%s\n" fixture-user; }
+    require_guest_user() { :; }
     incus() {
       [ "$1" = exec ] && [ "$2" = fixture ] && [ "$3" = -- ]
       shift 3
@@ -361,7 +364,23 @@ exec_fixture() { # exec_fixture <command> [arg...]
       shift 4
       "$@"
     }
-    inst=fixture
+    inst=fixture; user=fixture-user
+    args=(fixture "$@")
+    cmd_exec
+  ' "$EXECFN" "$@"
+}
+# The ROOT path (#291's default): no sudo at all, the same argv-preserving
+# bash -lc wrapper, straight through incus exec.
+exec_root_fixture() {
+  bash -c '
+    set -e
+    . "$0"
+    incus() {
+      [ "$1" = exec ] && [ "$2" = fixture ] && [ "$3" = -- ] && [ "$4" = bash ] && [ "$5" = -lc ]
+      shift 3
+      "$@"
+    }
+    inst=fixture; user=""
     args=(fixture "$@")
     cmd_exec
   ' "$EXECFN" "$@"
@@ -379,6 +398,13 @@ check "box exec: multiline step two was not fused into set argv" 0 "" \
   test -f "$EXEC_STATE/step-two"
 check "box exec: plain argv remains separate" 0 "one argument" \
   exec_fixture printf '%s\n' "one argument"
+rm -f "$EXEC_STATE"/step-*
+check "box exec (root default, #291): a multiline body executes each statement" 0 "" \
+  exec_root_fixture bash -lc "$exec_body"
+check "box exec (root default): step one ran" 0 "" test -f "$EXEC_STATE/step-one"
+check "box exec (root default): step two ran" 0 "" test -f "$EXEC_STATE/step-two"
+check "box exec (root default): plain argv remains separate" 0 "one argument" \
+  exec_root_fixture printf '%s\n' "one argument"
 rm -rf "$EXEC_STATE"
 rm -f "$EXECFN"
 
@@ -576,8 +602,8 @@ tpl() {
   root="$1" autostart="${2:-0}" require_vm="${3:-0}" bash -c '
     die() { echo "box: $*" >&2; exit 1; }
     . "$0"; load_seed
-    printf "IMAGE=%s USER=%s REQUIRE_VM=%s NO_FALLBACK=%s AUTOSTART=%s\n" \
-      "$T_IMAGE" "$T_USER" "$T_REQUIRE_VM" "$T_NO_CONTAINER_FALLBACK" \
+    printf "IMAGE=%s REQUIRE_VM=%s NO_FALLBACK=%s AUTOSTART=%s\n" \
+      "$T_IMAGE" "$T_REQUIRE_VM" "$T_NO_CONTAINER_FALLBACK" \
       "$T_AUTOSTART"
   ' "$TPLFN"
 }
@@ -586,17 +612,19 @@ tpl() {
 # network key, and the required keys must still be required. Fixture-driven,
 # against a throwaway root — exactly the dies a green parse cannot prove.
 EVILROOT="$(mktemp -d)"; mkdir -p "$EVILROOT/seed"
-printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_USER="dev"\nBOX_NETWORK="lan"\n' \
+printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_NETWORK="lan"\n' \
   > "$EVILROOT/seed/box.env"
 check "load_seed: an unknown key dies (the seed never grows a network)" 1 "unknown key" \
   tpl "$EVILROOT"
-printf 'BOX_USER="dev"\n' > "$EVILROOT/seed/box.env"
+printf 'BOX_DESCRIPTION="x"\n' > "$EVILROOT/seed/box.env"
 check "load_seed: a missing BOX_IMAGE dies" 1 "required" tpl "$EVILROOT"
+printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_USER="dev"\n' > "$EVILROOT/seed/box.env"
+check "load_seed: BOX_USER is refused by name — box creates no users (#291)" 1 "unknown key 'BOX_USER'" tpl "$EVILROOT"
 rm -rf "$EVILROOT/seed"; check "load_seed: a missing seed says to re-run install.sh" 1 "re-run install.sh" tpl "$EVILROOT"
 mkdir -p "$EVILROOT/seed"
 # The boot demands as FLAGS (#288): --autostart and --require-vm set what the
 # staging template's keys used to, through the same T_* the mint reads.
-printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_USER="dev"\nBOX_NO_CONTAINER_FALLBACK="1"\n' \
+printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_NO_CONTAINER_FALLBACK="1"\n' \
   > "$EVILROOT/seed/box.env"
 check "load_seed: --autostart and --require-vm surface as the boot demands (#288)" \
   0 "REQUIRE_VM=1 NO_FALLBACK=1 AUTOSTART=1" tpl "$EVILROOT" 1 1
@@ -605,7 +633,7 @@ check "load_seed: without the flags the seed's own soft demand stands" \
 # BOX_BOOTSTRAP_ROLE (#81) named the role box auto-ran after mint. #214 cut the
 # hook it fed, so the key is no longer in the allowlist and a box.env carrying
 # it now dies BY NAME at parse time.
-printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_USER="claude"\nBOX_BOOTSTRAP_ROLE="claude"\n' \
+printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_BOOTSTRAP_ROLE="claude"\n' \
   > "$EVILROOT/seed/box.env"
 check "load_seed: BOX_BOOTSTRAP_ROLE is refused by name (#214)" \
   1 "unknown key 'BOX_BOOTSTRAP_ROLE'" tpl "$EVILROOT"
@@ -1491,7 +1519,8 @@ chmod +x "$NETSHIM/curl"
 
 RUFN="$(mktemp)"
 awk '/^render_userdata\(\) \{/,/^\}/' "$ROOT/bin/box" > "$RUFN"
-check "render_userdata: extracted from bin/box (guards the awk)" 0 "@BOX_USER@" cat "$RUFN"
+check "render_userdata: extracted from bin/box (guards the awk)" 0 "awk" cat "$RUFN"
+check "render_userdata: substitutes nothing since #291 (no @BOX_USER@ arm)" 1 "" grep -q '@BOX_USER@' "$RUFN"
 check "render_userdata: the extracted function is valid bash" 0 "" bash -n "$RUFN"
 
 SEED="$(mktemp)"
@@ -1503,8 +1532,8 @@ rud() { # rud [VAR=val ...] — render the fixture seed through the real functio
   env T_USER=fixture FAKE_CURL_LOG="$NETLOG" PATH="$NETSHIM:$PATH" "$@" \
       bash -c 'die() { echo "box: $*" >&2; exit 1; }; . "$0"; render_userdata "$1"' "$RUFN" "$SEEDFILE"
 }
-check "render_userdata: the tenant user reaches cloud-init (#159)" 0 \
-  'name: "custom"' rud T_USER=custom
+check "render_userdata: a @BOX_USER@ token is inert text now (#291)" 0 \
+  'name: "@BOX_USER@"' rud T_USER=custom
 # The token is INERT TEXT (#214). A test that still expected resolution here
 # would be asserting the thing this release removed, so what is asserted is
 # that the seed comes out carrying its own bytes.
@@ -1580,9 +1609,10 @@ check "tenant seed: package_update is on — the seed installs packages (#214)" 
 # load_template has read one, so BOX_USER cannot be the single source — which
 # makes 'they agree' something to assert rather than to hope.
 # shellcheck disable=SC2016  # $1/$2 expand in the child shell, by design
-check "tenant seed: BOX_USER and bin/box's default are the same 'dev' (#214)" 0 "" \
-  bash -c 'grep -qx '"'"'BOX_USER="dev"'"'"' "$1" && grep -qF '"'"'user="${user:-dev}"'"'"' "$2"' \
-  _ "$ROOT/seed/box.env" "$ROOT/bin/box"
+check "seed: names no BOX_USER (#291)" 1 "" grep -q '^BOX_USER=' "$ROOT/seed/box.env"
+# shellcheck disable=SC2016  # a literal in the target file
+check "bin/box: has no default tenant user any more (#291)" 1 "" grep -qF 'user="${user:-dev}"' "$ROOT/bin/box"
+check "tenant seed: the rendered payload creates no user (#291)" 1 "" grep -qE '^users:' "$SEEDLOG"
 rm -f "$RUFN" "$SEED"
 
 # YAML well-formedness needs python3 + pyyaml; the CI runner has both. Skip
@@ -1598,14 +1628,15 @@ fi
 
 # One seed since #288; the loop shape is kept so a second seed directory, if
 # one ever came back, would have to pass the same checks.
+# shellcheck disable=SC2043  # one seed today; the loop keeps a second one honest
 for d in "$ROOT"/seed/; do
   t=seed
   # The parse itself asserts the allowlist AND the required keys (the driven
   # function dies without BOX_IMAGE/BOX_USER); the greps pin both keys to the
   # FILE, so neither can quietly become an inherited default.
-  check "template '$t': box.env parses against the real allowlist" 0 "USER=" tpl "$ROOT"
+  check "template '$t': box.env parses against the real allowlist" 0 "IMAGE=images:" tpl "$ROOT"
   check "template '$t': box.env sets BOX_IMAGE" 0 "" grep -q '^BOX_IMAGE=' "$d/box.env"
-  check "template '$t': box.env sets BOX_USER"  0 "" grep -q '^BOX_USER='  "$d/box.env"
+  check "template '$t': box.env sets no BOX_USER (#291)"  1 "" grep -q '^BOX_USER='  "$d/box.env"
   # #175: every shipped seed defaults to the VM trust boundary. Discovery is
   # deliberate: a new template that forgets the pin must fail this same loop.
   check "template '$t': declares one of the two no-fallback demands (#175)" \
@@ -1662,8 +1693,8 @@ for d in "$ROOT"/seed/; do
   # The half of the seed's user block that #177 did NOT change: no password
   # login, in every template. Dropping sudo while leaving the account
   # unlocked would trade one door for another.
-  check "template '$t': the tenant password stays locked (#177)" 0 "" \
-    grep -qE '^[[:space:]]*lock_passwd: true$' "$d/user-data.yaml"
+  check "template '$t': creates no users at all — a role does (#291)" 1 "" \
+    grep -qE '^users:' "$d/user-data.yaml"
   # #289: 'box tmux' went with the package (#253 D7(a)); the seed carries none.
   check "template '$t': installs no tmux (#289)" 1 "" \
     grep -qE '^[[:space:]]*-[[:space:]]+tmux$' "$d/user-data.yaml"
@@ -1767,8 +1798,8 @@ for d in "$ROOT"/seed/; do
   # A dedicated seed duplicates BOX_USER into cloud-init. box's own tenant seed
   # instead carries exactly the token render_userdata replaces at mint.
   if [ "$t" = seed ]; then
-    check "template 'tenant': cloud-init carries the tenant user token (#159)" 0 "" \
-      grep -qE '^[[:space:]]*-[[:space:]]+name:[[:space:]]+"@BOX_USER@"$' "$d/user-data.yaml"
+    check "seed: cloud-init carries no tenant user token (#291)" 1 "" \
+      grep -q '@BOX_USER@' "$d/user-data.yaml"
   else
     tuser="$(tpl "$ROOT" "$t" | sed -n 's/.*USER=\([^ ]*\).*/\1/p')"
     check "template '$t': user-data.yaml creates BOX_USER ('$tuser')" 0 "" \
@@ -2953,6 +2984,13 @@ case "$*" in
       echo "Error: Instance is not running" >&2
       exit 1
     fi ;;
+  # The guest's passwd for the entry model (#291): FAKE_GUEST_USERS is a
+  # space-separated list of regular users the box "has".
+  "exec work -- getent passwd")
+    uid=1000; for u in ${FAKE_GUEST_USERS:-}; do echo "$u:x:$uid:$uid::/home/$u:/bin/bash"; uid=$((uid+1)); done
+    echo "root:x:0:0:root:/root:/bin/bash" ;;
+  "exec work -- getent passwd "*)
+    want="${*: -1}"; for u in ${FAKE_GUEST_USERS:-}; do [ "$u" = "$want" ] && { echo "$u:x:1000:1000::/home/$u:/bin/bash"; exit 0; }; done; exit 2 ;;
   "config get "*)             exit 1 ;;
 esac
 exit 0
@@ -2986,13 +3024,38 @@ check "root: a nonexistent box fails through the shared box guard" 1 "no such bo
 root_stopped() { FAKE_ROOT_STOPPED=1 runbox "$CWORK/root-stopped.log" root work; }
 check "root: a stopped box preserves Incus's failure" 1 "Instance is not running" \
   root_stopped
-# shellcheck disable=SC2016  # $inst and the command substitution are literal bin/box source.
-check "root: shell implementation remains the tenant-user contract" 0 "" \
-  grep -qFx 'cmd_shell() { incus exec "$inst" -- sudo -u "$(box_user "$inst")" -i; }' "$BOX"
-check "root: live rehearsal removes the tenant sudoers entry" 0 "" \
+# The entry model (#291, amended 2026-11-22): root by default, --user opt-in
+# and refusing, never a fallback; a hint when exactly one regular user exists.
+SHLOG="$CWORK/shell.log"
+check "shell: enters as root by default (#291)" 0 "" runbox "$SHLOG" shell work
+check "shell: ...as a root login shell, no sudo" 0 "" grep -qFx 'incus exec work -- bash -l' "$SHLOG"
+check "shell: ...and no guest sudo at all" 1 "" grep -q 'sudo' "$SHLOG"
+shell_one_user() { FAKE_GUEST_USERS=claude runbox "$SHLOG" shell work; }
+check "shell: with exactly one regular user, a hint names it — never a switch" 0 \
+  "entering as root; this box has user claude (--user claude)" shell_one_user
+check "shell: ...and it still entered as root" 0 "" grep -qFx 'incus exec work -- bash -l' "$SHLOG"
+shell_two_users_no_hint() { ! FAKE_GUEST_USERS="claude ops" runbox "$SHLOG" shell work | grep -q "entering as root"; }
+check "shell: two regular users, no hint" 0 "" shell_two_users_no_hint
+shell_as_claude() { FAKE_GUEST_USERS=claude runbox "$SHLOG" shell --user claude work; }
+check "shell --user claude enters as claude" 0 "" shell_as_claude
+check "shell --user: ...through a login shell as that user" 0 "" grep -qFx 'incus exec work -- sudo -u claude -i' "$SHLOG"
+shell_as_ghost() { FAKE_GUEST_USERS="claude ops" runbox "$SHLOG" shell --user ghost work; }
+check "shell --user ghost refuses (exit 2), naming who exists" 2 "no user 'ghost' in work — it has: claude ops" shell_as_ghost
+check "shell --user ghost: ...and never fell back to root" 1 "" grep -q 'bash -l' "$SHLOG"
+shell_as_ghost_empty() { runbox "$SHLOG" shell --user ghost work; }
+check "shell --user on a root-only box says box creates no users" 2 "it has no users but root" shell_as_ghost_empty
+exec_as_ghost() { runbox "$SHLOG" exec --user ghost work -- id -u; }
+check "exec --user ghost refuses too, never running as root" 2 "no user 'ghost' in work" exec_as_ghost
+check "exec --user ghost: ...nothing ran" 1 "" grep -q 'bash -lc' "$SHLOG"
+exec_root() { runbox "$SHLOG" exec work -- id -u; }
+check "exec runs as root by default (#291)" 0 "" exec_root
+check "exec: ...with no sudo in the way" 0 "" grep -qF 'incus exec work -- bash -lc cd ~ && exec "$@" _ id -u' "$SHLOG"
+check "box_user() is gone — nothing reads user.box.user to pick an entry (#291)" 1 "" \
+  grep -qE '^box_user\(\)' "$BOX"
+check "root: live rehearsal proves the tenant holds no sudoers entry" 0 "" \
   grep -qF 'box root precondition:' "$ROOT/drill/multiuser.sh"
-check "root: live rehearsal measures tenant and root entry identities" 0 "" \
-  grep -qF 'entry identities after removing' "$ROOT/drill/multiuser.sh"
+check "root: live rehearsal measures the root default, --user and root entries (#291)" 0 "" \
+  grep -qF 'entry identities (#291)' "$ROOT/drill/multiuser.sh"
 check "root: live rehearsal refuses a foreign root shell" 0 "" \
   grep -qF 'cannot box root' "$ROOT/drill/multiuser.sh"
 
@@ -3356,7 +3419,7 @@ restamp_has() { grep -F 'config set' "$1" | grep -qE "$2"; }
 # --- the write half: a fresh mint ------------------------------------------
 MLOG="$MWORK/mint.log"
 check "mint: a shimmed 'box new' runs to completion" 0 "ready" \
-  mintbox "$MLOG" new --name w1 --user claude --container
+  mintbox "$MLOG" new --name w1 --container
 # shellcheck disable=SC2016  # $1 expands in the child shell, by design.
 check "mint: a fresh mint creates exactly one snapshot (#213)" 0 "1" \
   bash -c 'grep -c "^incus snapshot create " "$1"' _ "$MLOG"
@@ -3431,10 +3494,10 @@ check "mint: the default path takes the small cpu row (#159)" 0 "" \
   launch_has "$MLOG" 'limits\.cpu=2'
 check "mint: the default path takes the small memory row (#159)" 0 "" \
   launch_has "$MLOG" 'limits\.memory=2GiB'
-check "mint: --user reaches cloud-init (#159, #214)" 0 "" \
-  launch_has "$MLOG" 'name: "claude"'
-check "mint: --user reaches the stamp (#159, #214)" 0 "" \
-  launch_has "$MLOG" 'user\.box\.user=claude'
+check "mint: cloud-init creates no user (#291)" 1 "" \
+  launch_has "$MLOG" '^users:|name: "'
+check "mint: no user is stamped (#291)" 1 "" \
+  launch_has "$MLOG" 'user\.box\.user='
 # THE OFFLINE PROOF, at the mint rather than at the renderer (#214). A mint of
 # a pin-bearing seed used to make a HEAD request and DIE if it failed; the shim
 # curl fails every call, so a surviving probe would both log a line and take
@@ -3519,16 +3582,11 @@ BOX_CPU=1 mintbox "$ENVBEATS" new --name envbeats \
 check "mint size: BOX_CPU beats --size medium (#159)" 0 "" \
   launch_has "$ENVBEATS" 'limits\.cpu=1'
 
-# --user rides the ordinary mint on its own (#214 D2): the tenant user was
-# never the role's to derive, so removing the role removes nothing from it.
+# box creates no users since 0.11.0 (#291): --user on new refuses before any
+# daemon call, so nothing is launched.
 USERLOG="$MWORK/user-override.log"
 mintbox "$USERLOG" new --name ada --user ada --container >/dev/null 2>&1
-check "mint: --user reaches the instance stamp with no role at all (#214)" 0 "" \
-  launch_has "$USERLOG" 'user\.box\.user=ada'
-check "mint: --user reaches cloud-init with no role at all (#214)" 0 "" \
-  launch_has "$USERLOG" 'name: "ada"'
-check "mint: an unnamed user still defaults to dev (#214)" 0 "" \
-  launch_has "$MEDIUMLOG" 'user\.box\.user=dev'
+check "mint: --user launches nothing — it is refused (#291)" 1 "" grep -q 'incus launch' "$USERLOG"
 # The pin environment is INERT at the mint, not merely at the renderer: box
 # reads neither variable, so neither reaches the seed, the stamp or the network.
 PINENVLOG="$MWORK/pin-env.log"
@@ -3567,7 +3625,7 @@ check "mint: ...and box_id() never asks the box for it (#181)" 0 "" \
 # An id every box shares is not an identity. Two mints, two ids.
 MLOG2="$MWORK/mint2.log"
 check "mint: a second mint runs to completion" 0 "ready" \
-  mintbox "$MLOG2" new --name w1b --user claude --container
+  mintbox "$MLOG2" new --name w1b --container
 stamped_id() { launchline "$1" | grep -oE 'user\.box\.id=[0-9a-f-]+' | head -1 | cut -d= -f2; }
 mint_ids_differ() {
   local a b; a="$(stamped_id "$1")"; b="$(stamped_id "$2")"
@@ -3600,8 +3658,8 @@ check "mint: no longer stamps a template — there is none (#288)" \
   1 "" launch_has "$MLOG" 'user\.box\.template='
 check "mint: ...while the launch line itself was read (the absence is real)" \
   0 "user.box=1" launchline "$MLOG"
-check "mint: the pre-existing user stamp is untouched" \
-  0 "user.box.user=claude" launchline "$MLOG"
+check "mint: the user stamp is gone (#291)" \
+  1 "" launch_has "$MLOG" 'user\.box\.user='
 # Deliberately NOT stamped. limits.* already hold cpu/memory and a duplicate
 # drifts the first time someone edits a limit by hand; a container's disk does
 # not exist (its root rides the pool); and the tier is a fact about whoever is

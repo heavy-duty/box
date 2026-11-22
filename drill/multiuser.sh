@@ -105,9 +105,9 @@ as_u() { local u="$1"; shift; runuser -u "$u" -- "$@" </dev/null; }
 # Feed one command to an interactive box entry path without granting it a
 # terminal. Both `sudo -i` (box shell) and `bash -l` (box root) read the pipe;
 # pinning `exit` keeps a changed shell startup from waiting on runner stdin.
-entry_uid_as_u() { # entry_uid_as_u <user> <shell|root> <box>
-  local u="$1" verb="$2" b="$3"
-  printf 'id -u\nexit\n' | runuser -u "$u" -- box "$verb" "$b" 2>/dev/null \
+entry_uid_as_u() { # entry_uid_as_u <user> <shell|root> <box> [box flags…]
+  local u="$1" verb="$2" b="$3"; shift 3
+  printf 'id -u\nexit\n' | runuser -u "$u" -- box "$verb" "$@" "$b" 2>/dev/null \
     | tr -d '\r' | grep -E '^[0-9]+$' | tail -1
 }
 
@@ -272,18 +272,25 @@ rm -f "$mintlog"
 as_u "$U1" box list 2>/dev/null | grep -q '^mine ' && ok "(b) box list shows mine" || no "(b) box list does not show mine"
 as_u "$U1" box exec mine -- true >/dev/null 2>&1 && ok "(b) box exec mine -- true" || no "(b) box exec failed"
 
-# #169: compare the new explicit login-user boundary with sudo -i while the
-# latter is still safe (one fixed `env` argv), then exercise the exact
-# silent-success multiline shape that sudo -i used to corrupt.
-target_user="$(as_u "$U1" incus config get mine user.box.user)"
+# box creates no users since 0.11.0 (#291): a fresh box holds root alone, so
+# the default entry is root. Make a tenant the way convergence would — as root,
+# inside the box, with no sudo — then measure both entry contracts through the
+# restricted user's CLI and certificate.
+target_user=tenant
+as_u "$U1" box exec mine -- useradd -m -s /bin/bash "$target_user" >/dev/null 2>&1 \
+  && ok "(b) a tenant is created inside the box as root (the converger's job since #291)" \
+  || no "(b) could not create a tenant inside the box as root"
+# #169: compare the explicit login-user boundary with sudo -i while the latter
+# is still safe (one fixed `env` argv), then exercise the exact silent-success
+# multiline shape that sudo -i used to corrupt.
 legacy_env="$(as_u "$U1" incus exec mine -- sudo -u "$target_user" -i env \
   | grep -E '^(USER|LOGNAME|SHELL|HOME|PWD|PATH)=' | sort)"
-exec_env="$(as_u "$U1" box exec mine -- env \
+exec_env="$(as_u "$U1" box exec --user "$target_user" mine -- env \
   | grep -E '^(USER|LOGNAME|SHELL|HOME|PWD|PATH)=' | sort)"
-[ "$exec_env" = "$legacy_env" ] \
-  && ok "(b) box exec preserves cross-user login environment (USER/LOGNAME/SHELL/HOME/PWD/PATH)" \
+[ -n "$exec_env" ] && [ "$exec_env" = "$legacy_env" ] \
+  && ok "(b) box exec --user preserves the cross-user login environment (USER/LOGNAME/SHELL/HOME/PWD/PATH)" \
   || {
-    no "(b) box exec changed the cross-user login environment (#169)"
+    no "(b) box exec --user changed the cross-user login environment (#169)"
     diff -u <(printf '%s\n' "$legacy_env") <(printf '%s\n' "$exec_env") | sed 's/^/        /' || true
   }
 as_u "$U1" box exec mine -- bash -lc '
@@ -296,18 +303,8 @@ as_u "$U1" box exec mine -- bash -lc '
   && ok "(b) box exec preserves multiline commands, including the silent-success set shape" \
   || no "(b) box exec corrupted a multiline command (#169)"
 
-# #176: the named root path exists specifically so operator access never
-# depends on a privilege the tenant holds inside the guest. Remove that
-# privilege for real, then measure both entry contracts through the restricted
-# user's CLI and certificate: shell remains the tenant; root remains UID 0.
-# shellcheck disable=SC2016 # $1/$u expand in the guest sh, not this rehearsal.
-as_u "$U1" incus exec mine -- sh -c '
-  u="$1"
-  for f in /etc/sudoers /etc/sudoers.d/*; do
-    [ -f "$f" ] || continue
-    sed -i "/^${u}[[:space:]]/d" "$f"
-  done
-' sh "$target_user" >/dev/null 2>&1
+# #176: operator access never depends on a privilege the tenant holds inside
+# the guest. The tenant was made without sudo; prove it holds none.
 # shellcheck disable=SC2016 # $1/$u expand in the guest sh, not this rehearsal.
 if as_u "$U1" incus exec mine -- sh -c '
   u="$1"
@@ -315,18 +312,30 @@ if as_u "$U1" incus exec mine -- sh -c '
 ' sh "$target_user"; then
   ok "(b) box root precondition: $target_user has no sudoers entry"
 else
-  no "(b) box root precondition FAILED: $target_user still has a sudoers entry"
+  no "(b) box root precondition FAILED: $target_user has a sudoers entry"
 fi
 tenant_uid="$(as_u "$U1" incus exec mine -- id -u "$target_user" 2>/dev/null)"
 shell_uid="$(entry_uid_as_u "$U1" shell mine)"
-[ -n "$tenant_uid" ] && [ "$shell_uid" = "$tenant_uid" ] && [ "$shell_uid" -ne 0 ] \
-  && ok "(b) box shell still enters as $target_user (uid $shell_uid) without tenant sudo" \
-  || no "(b) box shell identity changed without tenant sudo (want uid ${tenant_uid:-?}, got ${shell_uid:-?})"
+[ "$shell_uid" = 0 ] \
+  && ok "(b) box shell enters as root by default (uid 0) — #291's entry model" \
+  || no "(b) box shell did not enter as root by default (got ${shell_uid:-?})"
+user_uid="$(entry_uid_as_u "$U1" shell mine --user "$target_user")"
+[ -n "$tenant_uid" ] && [ "$user_uid" = "$tenant_uid" ] && [ "$user_uid" -ne 0 ] \
+  && ok "(b) box shell --user $target_user enters as $target_user (uid $user_uid) without tenant sudo" \
+  || no "(b) box shell --user $target_user identity wrong (want uid ${tenant_uid:-?}, got ${user_uid:-?})"
+hint="$(printf 'exit\n' | runuser -u "$U1" -- box shell mine 2>&1 >/dev/null)"
+printf '%s' "$hint" | grep -q "this box has user $target_user (--user $target_user)" \
+  && ok "(b) with one regular user, box shell's root entry names it in a hint" \
+  || no "(b) box shell gave no one-user hint (stderr: '${hint:-<empty>}')"
+as_u "$U1" box shell --user ghost mine >/dev/null 2>&1; grc=$?
+[ "$grc" = 2 ] \
+  && ok "(b) box shell --user ghost refuses (exit 2), never a root fallback" \
+  || no "(b) box shell --user ghost exited $grc — expected a refusal (2)"
 root_uid="$(entry_uid_as_u "$U1" root mine)"
 [ "$root_uid" = 0 ] \
   && ok "(b) box root enters as uid 0 without tenant sudo" \
   || no "(b) box root did not enter as uid 0 without tenant sudo (got ${root_uid:-?})"
-aud "b. entry identities after removing $target_user sudoers: shell=${shell_uid:-?}, root=${root_uid:-?}"
+aud "b. entry identities (#291): shell=${shell_uid:-?} (root default), shell --user $target_user=${user_uid:-?}, root=${root_uid:-?}"
 
 as_u "$U1" box info mine 2>/dev/null | grep -qF "$(boxnet_pfx)" \
   && ok "(g) box info shows a boxnet ($(boxnet_pfx)x) address — placed on the hardened network" \

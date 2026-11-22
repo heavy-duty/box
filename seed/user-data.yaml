@@ -3,26 +3,12 @@
 # split: every ordinary mint renders this file, and it carries ONE hygiene —
 # the agent-class one, because that is the shape the fleet measured. What the
 # box BECOMES is installed inside it afterwards, by its operator.
-# The tenant is UNPRIVILEGED, and the ABSENCE of a 'sudo:' line here is the
-# whole of it (#177, ruled by danmt on #176). Root was never a confidentiality
-# boundary — an agent already runs AS this user, so its credentials, the repo
-# and the egress are reachable without it, and the VM contains the rest. What
-# root cost is in-guest mitigation: an egress allowlist enforced in the guest,
-# a read-only mount, auditd, a required proxy are each one 'sudo' away from
-# being switched off, and a box whose tenant is root cannot produce
-# trustworthy evidence about its own contents, because root rewrites the logs
-# that would say otherwise. The operator's path is 'box root <box>', which
-# authorizes through the host's Incus socket and needs no sudoers entry in the
-# guest (#176). 'staging-box' keeps its sudo on purpose: a self-converging
-# fleet guest is the other trait, and it gets the other answer.
-# NOT a partial allowlist ('NOPASSWD: /usr/bin/apt-get' and friends, #177
-# decision 6): apt alone installs a package that owns the box, so it keeps
-# most of the risk while feeling safer. Either the tenant is unprivileged or
-# it is not.
-users:
-  - name: "@BOX_USER@"
-    shell: /bin/bash
-    lock_passwd: true
+# NO USERS (#291, #253 D8(ii), danmt: "box shouldn't know anything about users
+# directly, its up to the convergence step"). A fresh box holds root alone;
+# 'box shell' and 'box exec' enter as root by default, and a tenant arrives
+# with convergence (a role's USER=, created by the converger). The
+# unprivileged-tenant posture of #177 is the role's to keep now: a role that
+# wants a sudo-less agent creates it without sudo.
 package_update: true
 # curl + ca-certificates: they no longer carry box's installer — they carry
 # the OPERATOR's (#214). The first line of the by-hand converge is a

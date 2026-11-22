@@ -413,15 +413,15 @@ VM boundary itself is proven on real hardware, like the rest of the drill).
 
 ```sh
 box new --name work --size medium   # a blank box, nothing converged
-box shell work                      # enter as the tenant user (default: dev)
+box shell work                      # a root shell: box creates no users (#291)
 ```
 
-**That box is blank, and blank is literal.** The seed carries a tenant user, a
-fixed 1GiB `/tmp`, chrony, `curl` and `ca-certificates` — that list is the
-whole of it. No swap, no `python3-venv`, no `shellcheck`: since 0.11.0 those
-come from convergence (#290). There is no
-coding agent on it, and **no `gh`**; the tenant has no sudo, so it cannot
-`apt install` one either. Authenticating is therefore not the first thing you
+**That box is blank, and blank is literal.** The seed carries a fixed 1GiB
+`/tmp`, chrony, `curl` and `ca-certificates` — that list is the whole of it.
+**No users** (#291): a fresh box holds root alone, so `box shell` and
+`box exec` enter as root by default, and a tenant arrives with convergence.
+No swap, no `python3-venv`, no `shellcheck`: those come from convergence too
+(#290). There is no coding agent on it, and **no `gh`**. Authenticating is therefore not the first thing you
 do on a fresh box. Converging is.
 
 **Box mints; you converge.** Turning a box into a coding-agent box, a server,
@@ -434,13 +434,15 @@ box root work                            # root inside it, authorized by the hos
 # then, inside the box, as root:
 curl -fsSL https://raw.githubusercontent.com/heavy-duty/rig/<ref>/install.sh \
   | RIG_REPO=heavy-duty/rig RIG_REF=<ref> bash
-rig bootstrap claude-box --user dev
+rig bootstrap claude-box               # creates the role's tenant (claude) and converges
 ```
 
-Once your converger has put a toolchain on the box, authenticate inside it —
-box never handles the credential, before or after:
+Once your converger has put a toolchain and a tenant on the box, enter as that
+tenant and authenticate inside it — box never handles the credential, before or
+after:
 
 ```sh
+box shell --user claude work     # --user names who to enter as; it must exist
 gh auth login                    # or drop a PAT in — your git credentials, your call
 git clone https://github.com/you/project && cd project
 ```
@@ -456,10 +458,13 @@ Three details in that block are load-bearing:
 
 - **`--size medium` is not decoration.** A role never implied a size, and
   omitting it gives you 2/2/20 where an agent box used to get 4/8/60.
-- **`box root`, not `box shell` + `sudo`.** The tenant an ordinary mint
-  creates is unprivileged and has no sudoers entry (see below), and `box root`
-  authorizes through the host's Incus socket rather than through anything in
-  the guest ([#176](https://github.com/heavy-duty/box/issues/176)).
+- **Root by default, `--user` by choice** (#291). `box shell`/`box exec`
+  enter as root unless `--user NAME` names someone who exists in the box; a
+  missing NAME is refused, listing who does exist, and never falls back to
+  root. With exactly one regular user present, the root entry prints a hint
+  naming them. `box root` is the explicit spelling of the default, authorized
+  through the host's Incus socket rather than anything in the guest
+  ([#176](https://github.com/heavy-duty/box/issues/176)).
 - **`box root` is a login shell**, so `$HOME` is set and a converger that
   reads it needs no workaround.
 
@@ -469,13 +474,11 @@ There is no role axis and no `--role` flag. The public mint shapes are:
 
 | Mint shape | Meaning |
 |---|---|
-| `box new --name <box>` | The tenant seed: an unprivileged user, a thin toolchain, nobody home |
-| `box new --user <name>` | The same seed with a tenant user other than `dev` |
+| `box new --name <box>` | The seed: root only, a fixed `/tmp`, chrony, curl — nobody home |
 | `--size medium --autostart --require-vm` | The old `staging-box` template as flags (#288): VM-only, back after a host reboot |
 
-**The seed is thin and it is the whole of what box installs.** It carries the
-tenant user, `curl`, `ca-certificates` and `chrony`, and caps `/tmp` at a
-fixed 1GiB — and nothing that joins a tailnet or admits a credential. **An
+**The seed is thin and it is the whole of what box installs.** It carries
+`curl`, `ca-certificates` and `chrony`, and caps `/tmp` at a fixed 1GiB — and nothing that joins a tailnet or admits a credential. **An
 unconverged box has no swap and no Python venv or shellcheck** (#290, #253
 D6/D9): the rig-templates agent roles install `python3-venv` and `shellcheck`
 (`APT_EXTRAS`) and lay swap (`SWAP_SIZE`), so a box you never converge
@@ -485,17 +488,19 @@ of box not converging, not an oversight. `curl` and
 of the converge above is a `curl … | bash` inside the box, and a bare cloud
 image is not guaranteed to ship either.
 
-**The tenant is unprivileged inside its own box; the operator enters as root
-from the host** ([#177](https://github.com/heavy-duty/box/issues/177)). The
-seed creates the tenant user with no sudoers entry, so `sudo` inside a box
-fails — and `box root <box>` still lands as root, authorized by
-the host's Incus socket rather than by anything in the guest
+**A tenant is the converger's, and so is whether it holds sudo; the operator
+enters as root from the host** ([#177](https://github.com/heavy-duty/box/issues/177),
+[#291](https://github.com/heavy-duty/box/issues/291)). box creates no users,
+so the role that creates the tenant decides its privilege — rig-templates'
+agent roles create theirs with no sudoers entry, so `sudo` inside an agent box
+fails — and `box root <box>` still lands as root, authorized by the host's
+Incus socket rather than by anything in the guest
 ([#176](https://github.com/heavy-duty/box/issues/176)). Root was never what
 contained a coding agent; the VM is. What it cost was the ability to add any
 control *inside* a box later — an egress allowlist, a read-only mount, an
 audit trail — each of which is one `sudo` away from being switched off while
-the tenant holds it. The seed ships the toolchain instead, user-local installs
-still work unprivileged — `python3 -m venv`, `cargo`, `uv`, and
+the tenant holds it. The role ships the toolchain instead, and user-local
+installs still work unprivileged — `python3 -m venv`, `cargo`, `uv`, and
 `npm install --prefix <dir>` (a *global* `npm -g` writes to `/usr`, so point
 it somewhere the tenant owns once: `npm config set prefix ~/.local`) — and
 anything genuinely needing `apt` is one `box root` away. A staging box's
@@ -549,9 +554,10 @@ form). Resolution is `--cpu/--memory/--disk` > `BOX_*` environment >
 
 The default mint path defaults to `small`. Named sizes apply to fresh mints; `--from` clones keep the explicit
 `--cpu`/`--memory`/`--disk` override surface.
-The selected seed, its generation and the resolved user are stamped onto the
-instance, so `shell` and `exec` land in the right user — and a clone
-still knows, because `incus copy` carries the metadata. `box checkup <box>`
+The seed's generation (`seed/3` since 0.11.0) is stamped onto the instance,
+and a clone still knows it, because `incus copy` carries the metadata. No user
+is stamped any more (#291): `shell` and `exec` enter as root unless `--user`
+says otherwise, and an older box's `user.box.user` stamp is no longer read. `box checkup <box>`
 reports that generation; an older box with no marker says it is unknown rather
 than guessing from the guest's current contents.
 
@@ -580,8 +586,8 @@ snapshot labels and the `--from` line to clone one.
 Every fresh mint marks a snapshot called `pristine`
 ([#104](https://github.com/heavy-duty/box/issues/104)) at the one moment it
 is true: **after cloud-init, before anything converges the box.** At that
-instant the guest is pristine Debian plus box's thin seed — the tenant user,
-the toolchain — and nothing else. It exists for a few seconds on every
+instant the guest is pristine Debian plus box's thin seed — root, chrony, the
+`/tmp` cap — and nothing else. It exists for a few seconds on every
 mint, so box captures it rather than asking you to be quick.
 
 ```sh
@@ -671,12 +677,12 @@ the door is per-port, punched and removable at runtime.
 ## Commands
 
 ```
-box new --name <box> [--size small|medium|large] [--autostart] [--require-vm] [--user <user>] [--from <src>[/<snap>]] [--cpu <n>] [--memory <size>] [--disk <size>] [--vm|--container]
+box new --name <box> [--size small|medium|large] [--autostart] [--require-vm] [--from <src>[/<snap>]] [--cpu <n>] [--memory <size>] [--disk <size>] [--vm|--container]
 box list                     # list your boxes
 box info <box>               # one box: state, IP, exposures, provenance, snapshots
-box shell <box>              # enter as the stamped tenant user
+box shell [--user <u>] <box> # root by default; --user enters as one who exists
 box root <box>               # enter as root through the host's Incus authorization
-box exec <box> -- <cmd...>   # run a command in the box
+box exec [--user <u>] <box> -- <cmd...>   # run a command in the box (root by default)
 box snapshot <box> [label]   # checkpoint (label defaults to manual-<epoch>)
 box restore <box> <snap> [--force]
                              # roll back to a snapshot — destructive, asks first

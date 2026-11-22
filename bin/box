@@ -189,14 +189,14 @@ box_tier() {
 # doesn't enforce a box invariant, it is incus's job, not ours — that is
 # what `box incus` is for.
 CMDS=(
-  "new^--name <box> [--size small|medium|large] [--autostart] [--require-vm] [--user <user>] [--from <src>[/<snap>]] [--cpu <n>] [--memory <size>] [--disk <size>] [--vm|--container]^^Mint a blank box, or --from an existing box/snapshot^fn:cmd_new^"
+  "new^--name <box> [--size small|medium|large] [--autostart] [--require-vm] [--from <src>[/<snap>]] [--cpu <n>] [--memory <size>] [--disk <size>] [--vm|--container]^^Mint a blank box, or --from an existing box/snapshot^fn:cmd_new^"
   "templates^^^Removed in 0.11.0 — box mints one seed; see 'box help templates'^fn:cmd_templates^"
   "list^[--json]^^List your boxes^fn:cmd_list^"
   "info^<box> [--json]^box^One box: state, type, IP, what minted it, snapshot labels^fn:cmd_info^"
   "checkup^<box>^box^Is this guest fit for work? Report seed, storage, memory, swap, and OOM history^fn:cmd_checkup^"
-  "shell^<box>^box^Open a shell in a box, as its template's user^fn:cmd_shell^"
-  "root^<box>^box^Open a root shell in a box — authorized by the host's Incus socket^fn:cmd_root^"
-  "exec^<box> -- <cmd...>^box^Run a command inside a box^fn:cmd_exec^"
+  "shell^[--user <user>] <box>^box^Open a shell in a box — root unless --user names one that exists^fn:cmd_shell^"
+  "root^<box>^box^Open a root shell in a box (the same as 'box shell') — authorized by the host's Incus socket^fn:cmd_root^"
+  "exec^[--user <user>] <box> -- <cmd...>^box^Run a command inside a box — as root unless --user names one^fn:cmd_exec^"
   "tmux^^^Removed in 0.11.0 — see 'box help tmux' for the replacement^fn:cmd_tmux^"
   "snapshot^<box> [<label>]^box^Checkpoint a box (label defaults to manual-<epoch>)^fn:cmd_snapshot^"
   "restore^<box> <snapshot> [--force]^box,arg2,confirm^Roll a box back to one of its snapshots — irreversible, and it asks first^incus:snapshot restore^restored {} to {1}^roll {} back to snapshot '{1}' and discard everything in the box since it was taken"
@@ -291,7 +291,7 @@ EOF
 OPTIONS
   --name <box>          Name for the new box                  (new, import)
   --size <size>         Named resource bundle: small, medium, large   (new)
-  --user <user>         Tenant user override (default: dev)           (new)
+  --user <user>         Enter as this user, which must exist  (shell, exec)
   --autostart           Start with the host after a reboot            (new)
   --require-vm          VM mode only: refuse --container and fallback (new)
   --from <src>[/<snap>] Clone from box <src>, or from its snapshot    (new)
@@ -388,8 +388,8 @@ entry in the guest and no analogue of a HOME workaround. The README carries
 the four-step path verbatim.
 
   --name <box>           Required. The box's name.
-  --user <user>          The tenant user cloud-init creates, and the one
-                         'box shell' lands in. Default: dev.
+  (--user is gone from 'new' since 0.11.0, #291: box creates no users. A role
+   creates them when you converge; enter as one with 'box shell --user'.)
   --size <size>          small, medium, or large. Default: small.
   --autostart            Stamp boot.autostart: the box comes back after a
                          host reboot with no operator (#288).
@@ -591,29 +591,38 @@ when every check is clean and 1 when it reports a finding or an unknown check.
 EOF
 ;;
     shell) cat <<'EOF'
-Open an interactive shell in a running box as its template's user. This is the
-tenant entry path; 'box root' is the operator path. Neither uses SSH, and there
-is no inbound route to a box.
+Open an interactive shell in a running box — as ROOT by default (#291). Since
+0.11.0 box creates no users, so a fresh box holds root alone and root is the
+documented default, never a fallback. --user NAME enters as NAME instead (a
+login shell); a NAME the box does not have is refused, listing who it does
+have, and never drops to root. With exactly one regular user present (a
+converged box, typically) the root entry prints a one-line hint naming it.
+'box root' is the same root entry. Neither uses SSH, and there is no inbound
+route to a box.
 
-  box shell work
+  box shell work                 # root
+  box shell --user ops work      # the tenant a role created
 EOF
 ;;
     root) cat <<'EOF'
-Open a root login shell in a running box. Authorization comes from the host's
-Incus socket: this grants nothing beyond the access already implied by
-'box shell' and the 'box incus' escape hatch. It does not use or require sudo
-inside the guest, so it also works when the tenant has no sudoers entry.
+Open a root login shell in a running box — the same entry 'box shell' makes
+by default since 0.11.0, kept as the explicit name for it.
+Authorization comes from the host's Incus socket: this grants nothing beyond
+the access already implied by 'box shell' and the 'box incus' escape hatch.
+It does not use or require sudo inside the guest, so it also works when the
+tenant has no sudoers entry.
 
   box root work
 EOF
 ;;
     exec) cat <<'EOF'
-Run a command inside a box as its tenant user (default: 'dev', or whatever
---user set at mint). Everything after -- is passed through untouched; the --
-is required, or box will read your command's flags as its own.
+Run a command inside a box — as root by default (#291), or as --user NAME,
+which must exist in the box (refused otherwise, never a root fallback).
+Everything after -- is passed through untouched; the -- is required, or box
+will read your command's flags as its own.
 
   box exec work -- uname -a
-  box exec work -- cat /etc/os-release
+  box exec --user ops work -- id
 
 A blank box carries the seed and nothing else, so anything else — git, gh, an
 agent CLI — runs here only once you have converged it onto the box.
@@ -1762,7 +1771,7 @@ load_seed() {
   local t=seed dir line key val size_cpu="" size_memory="" size_disk=""
   dir="$root/seed"
   [ -f "$dir/box.env" ] || die "box's seed is missing ($dir/box.env) — re-run install.sh"
-  T_DESC=""; T_IMAGE=""; T_USER=""; T_CPU=""; T_MEMORY=""; T_DISK=""
+  T_DESC=""; T_IMAGE=""; T_CPU=""; T_MEMORY=""; T_DISK=""
   T_REQUIRE_VM=""; T_NO_CONTAINER_FALLBACK=""; T_AUTOSTART=""
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|\#*) continue ;; esac
@@ -1781,7 +1790,6 @@ load_seed() {
     case "$key" in
       BOX_DESCRIPTION) T_DESC="$val" ;;
       BOX_IMAGE)       T_IMAGE="$val" ;;
-      BOX_USER)        T_USER="$val" ;;
       BOX_CPU)         T_CPU="$val" ;;
       BOX_MEMORY)      T_MEMORY="$val" ;;
       BOX_DISK)        T_DISK="$val" ;;
@@ -1791,11 +1799,10 @@ load_seed() {
       *) die "the seed: unknown key '$key' — it sets image, user, resources and boot demands, nothing else (there is no key for a network, and none for convergence, on purpose)" ;;
     esac
   done <"$dir/box.env"
-  # Not 'A && B || die': if T_IMAGE is set but T_USER is not, that idiom still
-  # dies (which is what we want) — but it reads as an if-then-else it is not, so
-  # spell the guard out (SC2015).
-  if [ -z "$T_IMAGE" ] || [ -z "$T_USER" ]; then
-    die "the seed: BOX_IMAGE and BOX_USER are required"
+  # BOX_USER left the allowlist with #291: box creates no users, so a seed
+  # naming one now dies as an unknown key — loudly, which is the point.
+  if [ -z "$T_IMAGE" ]; then
+    die "the seed: BOX_IMAGE is required"
   fi
   # One public size table (#159). --size takes the old template-resource rung:
   # explicit resource flag > BOX_* environment > named size > template value
@@ -1847,7 +1854,6 @@ render_userdata() {
   data="$(awk '
     NR == 1 || $0 !~ /^[[:space:]]*#/ { print }
   ' "$f")"
-  data="${data//@BOX_USER@/${T_USER:-}}"
   printf '%s\n' "$data"
 }
 
@@ -2209,11 +2215,11 @@ resolve_fresh_intent() {
   # with what to do instead — never "no such template", which would read as a
   # typo rather than a removal.
   [ -z "$template" ] || refuse_template "$template"
-  # --user survives the role cut (#214 D2): the tenant user was never the
-  # role's to derive, and 'dev' is the seed's default with or without one.
-  user="${user:-dev}"
-  [[ "$user" =~ ^[a-z_][a-z0-9_-]*$ ]] \
-    || usage_error "--user must be a plain Linux user name (lowercase letters, digits, _ and -): $user"
+  # box creates no users since 0.11.0 (#291, #253 D8(ii)): a fresh box holds
+  # only root, and users arrive with convergence. --user on 'new' therefore
+  # refuses, naming where a user comes from now; on shell/exec it chooses whom
+  # to enter as.
+  [ -z "$user" ] || usage_error "box new creates no users since 0.11.0 (#253) — a role creates them when you converge (its USER=); enter as one afterwards with 'box shell --user $user <box>'"
 }
 
 cmd_new() {
@@ -2223,7 +2229,7 @@ cmd_new() {
     [ -z "$template" ] || usage_error "box has no templates since 0.11.0 (#253) — and --from clones an existing box anyway (drop --template)"
     [ "$autostart$require_vm" = 00 ] || usage_error "--from clones an existing box; its boot demands ride along (drop --autostart/--require-vm)"
     [ -z "$size" ] || usage_error "--from takes explicit --cpu/--memory/--disk overrides, not --size"
-    [ -z "$user" ] || usage_error "--from clones an existing box; its user rides along (drop --user)"
+    [ -z "$user" ] || usage_error "box new creates no users since 0.11.0 (#253) — and --from clones a box with whatever users it has (drop --user)"
   else
     resolve_fresh_intent
   fi
@@ -2383,7 +2389,6 @@ cmd_new() {
   else
     local m extra=()
     load_seed
-    T_USER="$user"
     m="$(pick_mode)"
     # A server-class template (BOX_REQUIRE_VM, #68) has no weaker mode: the VM
     # is its trust boundary, and its guest runs docker. BOX_NO_CONTAINER_FALLBACK
@@ -2493,7 +2498,6 @@ cmd_new() {
     echo "box: launching instance $instance (incus launch, $m mode)..."
     timeout -k 5 "$budget" incus launch "$T_IMAGE" "$instance" --profile box-profile \
       --config user.box=1 \
-      --config user.box.user="$T_USER" \
       "${stamp[@]}" \
       --config limits.cpu="$T_CPU" \
       --config limits.memory="$T_MEMORY" \
@@ -2882,30 +2886,55 @@ cmd_checkup() {
     "$type" "${seed:-unknown}" "${swap_policy:-default}" < "$script"
 }
 
-# Which user does a shell land in? The template stamped it on the instance at
-# mint time (user.box.user), and 'incus copy' carries user.* keys — so a clone
-# knows without consulting the template. Two subtleties, both from the audit:
-# 'incus config get' prints EMPTY + exit 0 for an unset key (B4), hence ${u:-},
-# never '||'; and a pre-rename box has no metadata but is always a Claude box,
-# so the legacy tag maps to 'claude'. The root fallback is effectively
-# unreachable (every template sets a user) — anything that truly needs root
-# goes through the 'box incus' escape hatch.
-box_user() {
-  local u
-  u="$(incus config get "$1" user.box.user 2>/dev/null || true)"
-  if [ -z "$u" ] && [ "$(incus config get "$1" user.claudebox 2>/dev/null || true)" = 1 ]; then
-    u=claude
-  fi
-  echo "${u:-root}"
+# The entry model (#291, amended by danmt 2026-11-22): root is the DEFAULT,
+# always — a fresh box holds no one else (box creates no users since 0.11.0),
+# so root is never a fallback and never a guess. --user NAME is opt-in, and a
+# NAME the guest does not have refuses, listing who it does have; it never
+# drops to root. The user.box.user stamp of older boxes is no longer read.
+#
+# box_regular_users <inst> — the guest's own people: uid 1000..59999, read from
+# its passwd database (the same range Debian's adduser hands out).
+box_regular_users() {
+  # Captured, never piped: the passwd table is a multi-line writer, and the
+  # suite's #102 race guard (rightly) refuses one feeding a reader.
+  local pw; pw="$(incus exec "$1" -- getent passwd </dev/null 2>/dev/null || true)"
+  awk -F: '$3 >= 1000 && $3 < 60000 { print $1 }' <<<"$pw"
 }
-
-cmd_shell() { incus exec "$inst" -- sudo -u "$(box_user "$inst")" -i; }
+# require_guest_user <inst> <box> <user> — refuse (exit 2) unless it exists.
+require_guest_user() {
+  [[ "$3" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || usage_error "--user must be a plain Linux user name, got '$3'"
+  incus exec "$1" -- getent passwd "$3" >/dev/null 2>&1 </dev/null && return 0
+  local have; have="$(box_regular_users "$1" | tr '\n' ' ')"
+  usage_error "no user '$3' in $2 — ${have:+it has: ${have% }}${have:-it has no users but root (box creates none; a role does when you converge)}"
+}
+cmd_shell() {
+  if [ -n "$user" ]; then
+    require_guest_user "$inst" "${args[0]}" "$user"
+    incus exec "$inst" -- sudo -u "$user" -i
+    return
+  fi
+  # A hint, never a switch: when exactly one regular user exists (a converged
+  # box, typically), say so — entering as root by accident is the one mistake
+  # worth a line.
+  local people; people="$(box_regular_users "$inst")"
+  if [ -n "$people" ] && [ "$(printf '%s\n' "$people" | wc -l)" -eq 1 ]; then
+    echo "box: entering as root; this box has user $people (--user $people)" >&2
+  fi
+  incus exec "$inst" -- bash -l
+}
 cmd_root()  { incus exec "$inst" -- bash -l; }
 # sudo -i joins its command argv into one shell string. In that join, a
 # backslash-newline becomes a shell continuation and silently deletes the
 # newline from a multi-line `box exec` payload (#169). Keep the login
 # environment explicitly, but let the inner shell exec the original argv.
-cmd_exec()  { incus exec "$inst" -- sudo -u "$(box_user "$inst")" -H bash -lc 'cd ~ && exec "$@"' _ "${args[@]:1}"; }
+cmd_exec() {
+  if [ -n "$user" ]; then
+    require_guest_user "$inst" "${args[0]}" "$user"
+    incus exec "$inst" -- sudo -u "$user" -H bash -lc 'cd ~ && exec "$@"' _ "${args[@]:1}"
+  else
+    incus exec "$inst" -- bash -lc 'cd ~ && exec "$@"' _ "${args[@]:1}"
+  fi
+}
 
 # Removed with the tmux package (#289, #253 D7(a)): the verb goes with it, and
 # stays one release as a refusal carrying the replacement and the reason.
