@@ -2766,6 +2766,9 @@ check "revoke: group removal is the lockout" 0 "" \
 # Group membership is read at login: purge must terminate live sessions (a
 # stale-group process could recreate the project unhardened AFTER the purge),
 # and a bare revoke must say the socket survives in held sessions.
+check "revoke --purge: restarts incus-user after removing a uid's state (it caches it; rehearsal finding)" 0 "" \
+  grep -qF 'systemctl stop incus-user.service' "$ROOT/host/revoke-user.sh"
+check "revoke --purge: ...the service, never the socket" 1 "" grep -qF 'stop incus-user.socket' "$ROOT/host/revoke-user.sh"
 check "revoke: purge terminates live sessions first" 0 "" \
   grep -qF 'loginctl terminate-user' "$ROOT/host/revoke-user.sh"
 check "revoke: purge refuses under unkillable sessions" 0 "" \

@@ -373,6 +373,9 @@ if ! incus project show "$project" >/dev/null 2>&1 </dev/null; then
       echo "  the touch as $user timed out after 60s" >&2
     elif [ -n "$touch_err" ]; then
       echo "  the touch as $user said: $touch_err" >&2
+      case "$touch_err" in *"connection reset by peer"*)
+        echo "  incus-user may still cache this uid's purged state — restart it, then re-run:  systemctl stop incus-user.service" >&2 ;;
+      esac
     fi
     exit 1
   fi

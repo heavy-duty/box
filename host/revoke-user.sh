@@ -320,6 +320,15 @@ done < <(incus config trust list --format csv --columns nf 2>/dev/null)
 if $SUDO test -d "/var/lib/incus/users/$uid" 2>/dev/null; then
   $SUDO rm -rf "/var/lib/incus/users/$uid"
   echo "purge: incus-user state for uid $uid removed"
+  # The running incus-user still holds that uid's state in memory, and resets
+  # every connection from it until it restarts — measured in the rehearsal: a
+  # re-grant right after a purge failed three times with "connection reset by
+  # peer". Stopping the service (never the socket) lets socket activation
+  # start a fresh one on the next connection; other users reconnect the same.
+  if $SUDO systemctl is-active --quiet incus-user.service 2>/dev/null; then
+    $SUDO systemctl stop incus-user.service 2>/dev/null \
+      && echo "purge: incus-user restarted on demand (it cached uid $uid's state)" || true
+  fi
 fi
 
 # Assert absence rather than trusting exit codes — the wipe.sh discipline.
