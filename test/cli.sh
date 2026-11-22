@@ -2344,7 +2344,7 @@ rm -f "$BINFN" "$HOSTFN"
 # The tier scripts parse and refuse bad usage without a daemon — drive them.
 check "grant: no argument is a usage error"      2 "usage: box grant"  bash "$ROOT/host/grant-user.sh"
 check "grant: a flag is not a user"              2 "usage: box grant"  bash "$ROOT/host/grant-user.sh" --frob
-check "grant: --service alone is a usage error"  2 "usage: box grant [--service] <user>"  bash "$ROOT/host/grant-user.sh" --service
+check "grant: --service alone is a usage error"  2 "usage: box grant [--service]"  bash "$ROOT/host/grant-user.sh" --service
 check "grant: two users is a usage error"        2 "usage: box grant"  bash "$ROOT/host/grant-user.sh" a b
 check "help grant documents --service (#281)"    0 "box grant --service gig" "$BOX" help grant
 check "help grant: a service gets managed disks only" 0 "restricted.devices.disk=managed" "$BOX" help grant
@@ -2430,6 +2430,108 @@ check "grant --service: the throwaway home lives under /tmp, never root's TMPDIR
 # shellcheck disable=SC2016  # the $-strings are literals in the target file
 check "grant --service: the home is made and handed over through \$SUDO" 0 "" \
   grep -qF '$SUDO chown "$user" "$svc_home"' "$ROOT/host/grant-user.sh"
+
+# --- grant, driven (#282, #283): a stubbed host --------------------------------
+# A fake root host: id/getent/usermod/runuser/systemctl/pgrep/chown/timeout and
+# an incus whose storage and project config live in files under $GS/state. Every
+# mutating call lands in $GS/log, so the pool and caps logic is asserted on what
+# it DID, not on what the file says.
+GS="$(mktemp -d)"; mkdir -p "$GS/bin" "$GS/state"
+gs_stub() { printf '#!/usr/bin/env bash\n%s\n' "$2" >"$GS/bin/$1"; chmod +x "$GS/bin/$1"; }
+# The stubs are single-quoted scripts: their $-expressions expand when they RUN.
+# shellcheck disable=SC2016
+{
+gs_stub id 'case "$*" in
+  "-u") echo 0 ;; "-u svc") echo 1500 ;; "-nG svc") cat "$GS/state/groups" 2>/dev/null || echo svc ;;
+  *) echo "fake id: $*" >&2; exit 2 ;; esac'
+gs_stub getent '[ "$2" = svc ]'
+gs_stub usermod 'echo "usermod $*" >>"$GS/log"; echo "svc incus" >"$GS/state/groups"'
+gs_stub gpasswd 'echo "gpasswd $*" >>"$GS/log"; echo svc >"$GS/state/groups"'
+gs_stub systemctl 'exit 0'
+gs_stub pgrep 'exit 1'
+gs_stub chown 'exit 0'
+gs_stub timeout 'shift; exec "$@"'
+gs_stub runuser 'while [ "$1" != -- ]; do shift; done; shift; exec "$@"'
+gs_stub incus 'st="$GS/state"; log() { echo "incus $*" >>"$GS/log"; }
+p=""; if [ "$1" = --project ]; then p="$2"; shift 2; fi
+case "$*" in
+  "network show boxnet") exit 0 ;;
+  "project show user-1500"|"project list") exit 0 ;;
+  "info") echo "api_extensions:"; [ -n "${GS_NO_EXT:-}" ] || echo "- projects_limits_disk_pool"; echo "- other" ;;
+  "profile device get default eth0 type") exit 1 ;;
+  "profile show box-profile") exit 0 ;;
+  "profile edit box-profile") cat >/dev/null; log "--project $p $*" ;;
+  "profile device set box-profile root pool "*) log "--project $p $*" ;;
+  "storage list --format csv -c n") echo default; for f in "$st"/pool-*; do [ -e "$f" ] && basename "$f" | sed s/^pool-//; done ;;
+  "storage show "*) [ -e "$st/pool-$3" ] || exit 1; echo "driver: $(cat "$st/pool-$3")" ;;
+  "storage get "*) cat "$st/pool-$3.$4" 2>/dev/null; exit 0 ;;
+  "storage create "*) [ -z "${GS_CREATE_FAIL:-}" ] || { echo "Error: no space"; exit 1; }
+    echo btrfs >"$st/pool-$3"; echo "${5#size=}" >"$st/pool-$3.size"; log "$*" ;;
+  "storage set "*) echo "$5" >"$st/pool-$3.$4"; log "$*" ;;
+  "project get user-1500 "*) cat "$st/proj.$4" 2>/dev/null; exit 0 ;;
+  "project set user-1500 limits.memory 1GiB") echo "Error: uses more than that" >&2; exit 1 ;;
+  "project set "*) echo "$5" >"$st/proj.$4"; log "$*" ;;
+  "project unset "*) rm -f "$st/proj.$4"; log "$*" ;;
+  *) echo "STUB: unexpected incus ${p:+--project $p }$*" >&2; exit 3 ;;
+esac'
+}
+gs_reset() { rm -rf "$GS/state" "$GS/log"; mkdir -p "$GS/state"; : >"$GS/log"; }
+gs_grant() { env PATH="$GS/bin:$PATH" GS="$GS" bash "$ROOT/host/grant-user.sh" "$@"; }
+gs_log() { cat "$GS/log"; }
+
+gs_reset
+check "grant --pool: creates the btrfs pool, marks it, confines and roots the project" 0 "pool: created gig (200GiB btrfs loop file) for svc" \
+  gs_grant --service --pool gig --pool-size 200GiB svc
+check "grant --pool: the pool is created at the asked size" 0 "storage create gig btrfs size=200GiB" gs_log
+check "grant --pool: the pool is marked as this user's" 0 "storage set gig user.box.grant svc" gs_log
+check "grant --pool: every other pool is limited to 0" 0 "project set user-1500 limits.disk.pool.default 0" gs_log
+check "grant --pool: its own pool is never limited" 1 "" grep -q "limits.disk.pool.gig 0" "$GS/log"
+check "grant --pool: the project carries the pool marker" 0 "project set user-1500 user.box.pool gig" gs_log
+check "grant --pool: box-profile roots on the grant pool" 0 "--project user-1500 profile device set box-profile root pool gig" gs_log
+: >"$GS/log"
+check "grant: a re-run without --pool keeps the profile's root on the grant pool" 0 "rooted on gig" gs_grant --service svc
+check "grant: the re-run re-points the refreshed profile" 0 "profile device set box-profile root pool gig" gs_log
+check "grant: the re-run creates no pool" 1 "" grep -q "storage create" "$GS/log"
+: >"$GS/log"
+check "grant --pool: re-run adopts the user's own pool" 0 "pool: gig already exists (200GiB, btrfs, svc's)" \
+  gs_grant --service --pool gig --pool-size 100GiB svc
+check "grant --pool: an undersized pool is refused" 1 "smaller than 300GiB" gs_grant --service --pool gig --pool-size 300GiB svc
+echo zfs >"$GS/state/pool-gig"
+check "grant --pool: a non-btrfs pool is refused" 1 "is zfs, not btrfs" gs_grant --service --pool gig --pool-size 100GiB svc
+echo btrfs >"$GS/state/pool-gig"; echo other >"$GS/state/pool-gig.user.box.grant"
+check "grant --pool: someone else's pool is refused" 1 "is not svc's grant pool (user.box.grant=other)" gs_grant --service --pool gig --pool-size 100GiB svc
+gs_reset; echo btrfs >"$GS/state/pool-shared"; echo 1TiB >"$GS/state/pool-shared.size"
+check "grant --pool: a pool box did not make is refused" 1 "user.box.grant=unset" gs_grant --service --pool shared --pool-size 100GiB svc
+gs_reset
+check "grant --pool: refused without the disk-pool limits extension" 1 "projects_limits_disk_pool" \
+  env GS_NO_EXT=1 PATH="$GS/bin:$PATH" GS="$GS" bash "$ROOT/host/grant-user.sh" --service --pool gig --pool-size 1GiB svc
+check "grant --pool: no pool is made without the extension" 1 "" grep -q "storage create" "$GS/log"
+gs_reset
+check "grant --pool: a failed create says why" 1 "could not create pool 'gig': Error: no space" \
+  env GS_CREATE_FAIL=1 PATH="$GS/bin:$PATH" GS="$GS" bash "$ROOT/host/grant-user.sh" --service --pool gig --pool-size 1GiB svc
+check "grant --pool without --pool-size is a usage error" 2 "--pool and --pool-size go together" gs_grant --pool gig svc
+check "grant --pool default is refused" 2 "the host's shared pool" gs_grant --pool default --pool-size 1GiB svc
+check "grant --pool with a bad name is refused" 2 "lower-case name" gs_grant --pool 'Gig;x' --pool-size 1GiB svc
+check "grant --pool-size must be a size" 2 "a size like 200GiB" gs_grant --pool gig --pool-size lots svc
+check "grant --pool needs a value" 2 "--pool needs a value" gs_grant --pool --pool-size 1GiB svc
+gs_reset
+check "grant caps: sets limits.memory, limits.cpu, limits.instances" 0 "caps: limits.instances=6" \
+  gs_grant --service --memory 16GiB --cpu 6 --instances 6 svc
+check "grant caps: memory" 0 "project set user-1500 limits.memory 16GiB" gs_log
+check "grant caps: cpu" 0 "project set user-1500 limits.cpu 6" gs_log
+: >"$GS/log"
+check "grant caps: none unsets" 0 "caps: limits.cpu unset" gs_grant --service --cpu none svc
+check "grant caps: none is an unset, not a set" 0 "project unset user-1500 limits.cpu" gs_log
+check "grant caps: a cap below use is refused with the reason" 1 "Incus refuses a cap below what the project already uses" \
+  gs_grant --service --memory 1GiB svc
+check "grant caps: --cpu must be a whole number" 2 "--cpu must be a whole number" gs_grant --cpu 2.5 svc
+check "grant caps: --instances must be a whole number" 2 "--instances must be a whole number" gs_grant --instances 0 svc
+check "grant caps: --memory must be a size" 2 "--memory must be a size" gs_grant --memory 16G svc
+check "help grant documents --pool and the caps" 0 "--pool NAME --pool-size SIZE gives the grant a storage pool" "$BOX" help grant
+# shellcheck disable=SC2016  # the $-strings are literals in the target file
+check "new: a pooled grant sizes a container's root too (#282)" 0 "" bash -c '
+  awk "/^cmd_new\(\) \{/,/^\}/" "'"$ROOT"'/bin/box" | grep -q "box_grant_pool)\" \]; then extra+=(--device \"root,size=\$T_DISK\")"'
+rm -rf "$GS"
 check "revoke: group removal is the lockout" 0 "" \
   grep -qF 'gpasswd -d' "$ROOT/host/revoke-user.sh"
 # Group membership is read at login: purge must terminate live sessions (a

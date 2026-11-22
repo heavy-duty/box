@@ -82,6 +82,14 @@ BOX_STAMP_SCHEMA=1
 #   neither              -> none        (no socket at all)
 # host/setup-host.sh carries a byte-identical copy (it runs before any install
 # tree exists); test/cli.sh diffs the two so they cannot drift.
+# The pool a restricted caller's grant confines them to (#282): the
+# user.box.pool marker box grant --pool stamps on user-<uid>. Empty for an
+# admin, an unpooled grant, or a project the caller cannot read.
+box_grant_pool() {
+  [ "$(box_tier)" = restricted ] || return 0
+  incus project get "user-$(id -u)" user.box.pool </dev/null 2>/dev/null || true
+}
+
 box_tier() {
   [ "$(id -u)" -eq 0 ] && { printf 'admin\n'; return; }
   local groups; groups="$(id -nG 2>/dev/null | tr ' ' '\n')"
@@ -175,7 +183,7 @@ CMDS=(
   "incus^<box> -- <args...>^box^Escape hatch: run any incus command against a box^fn:cmd_incus^"
   "doctor^[--fix | --pin-dns]^^Is this host fit to mint boxes? Diagnose the daemon, network, DNS, isolation^fn:cmd_doctor^"
   "setup-host^^^One-time host setup: Incus, the boxnet stack, the profile, the firewall^fn:cmd_setup_host^"
-  "grant^[--service] <user>^^Admin: give a host user (or a service, --service) the restricted tier — their own boxes, on the hardened boxnet^fn:cmd_grant^"
+  "grant^[--service] [--pool NAME --pool-size SIZE] [--memory SIZE] [--cpu N] [--instances N] <user>^^Admin: give a host user (or a service, --service) the restricted tier — their own boxes, on the hardened boxnet^fn:cmd_grant^"
   "revoke^<user> [--purge]^^Admin: take the restricted tier back (--purge also deletes their boxes)^fn:cmd_revoke^"
   "teardown-host^[--purge-incus]^^Remove the box host stack (both name generations)^fn:cmd_teardown_host^"
   "versions^^^List the installed box versions — the current default and the running one^fn:cmd_versions^"
@@ -952,8 +960,26 @@ with project=user-<uid>. Grant FIRST, then start the service: a service reads
 its groups once, at start, and one that touches incus-user before the grant
 creates an unhardened project.
 
+--pool NAME --pool-size SIZE gives the grant a storage pool of its own
+(#282): a btrfs loop file of SIZE, created once and marked as this user's
+(user.box.grant). The project is CONFINED to it — every other pool's
+limits.disk.pool.<name> is 0 — so a full tenant pool fails that tenant and
+never 'default'. Their box-profile roots on it, and 'box new' sizes every
+root disk (containers too), as Incus requires under disk limits. A pool box
+did not make, a non-btrfs pool or one smaller than SIZE is refused; box never
+resizes or deletes a pool here. Re-run the grant after adding a host pool, so
+the new pool is confined too.
+
+--memory SIZE, --cpu N and --instances N cap the project (#283) with its own
+limits.memory / limits.cpu / limits.instances, so a tenant can never starve
+the host's other guests; 'none' unsets one. Under a cap Incus refuses any
+instance that does not set limits.cpu and limits.memory itself or by
+profile: 'box new' always stamps both, and a tool minting through the API
+must too. A re-run without a flag leaves that setting as it is.
+
   box grant dev1
   box grant --service gig
+  box grant --service gig --pool gig --pool-size 200GiB --memory 16GiB --cpu 6 --instances 6
 EOF
 ;;
     revoke) cat <<'EOF'
@@ -2319,6 +2345,10 @@ cmd_new() {
     # turning it off boots reliably across image rebuilds. Container mode has
     # no firmware, so it does not apply there.
     if [ "$m" = vm ]; then extra+=(--vm --device "root,size=$T_DISK" --config security.secureboot=false); else extra+=(--config security.nesting=true); fi
+    # A grant confined to its own pool (#282) carries per-pool disk limits, and
+    # Incus then wants every root disk sized — a container's too. Read from the
+    # caller's own project marker; an admin or an unpooled grant is unchanged.
+    if [ "$m" != vm ] && [ -n "$(box_grant_pool)" ]; then extra+=(--device "root,size=$T_DISK"); fi
     # BOX_AUTOSTART (#68): a server-class box must come back after a host
     # reboot without an operator. Stamped per-instance like limits.*; a --from clone
     # needs no code — 'incus copy' keeps every non-volatile config key, the
@@ -2326,7 +2356,7 @@ cmd_new() {
     [ "$T_AUTOSTART" != 1 ] || extra+=(--config boot.autostart=true)
     # Root size is a VM launch concern; a container's root rides the pool. Say
     # so instead of silently dropping an explicit --disk.
-    [ "$m" = vm ] || [ -z "$disk" ] || disk_is_vm_only_note
+    [ "$m" = vm ] || [ -z "$disk" ] || [ -n "$(box_grant_pool)" ] || disk_is_vm_only_note
     # The template's identity is stamped ONTO the instance: which template,
     # which user. 'incus copy' preserves user.* keys (audit B2), so a clone
     # knows what it is without ever consulting the template again.

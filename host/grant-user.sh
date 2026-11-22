@@ -33,7 +33,10 @@ set -euo pipefail
 self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 here="$(dirname "$(dirname "$self")")"
 
-usage() { echo "usage: box grant [--service] <user>" >&2; exit 2; }
+usage() {
+  echo "usage: box grant [--service] [--pool NAME --pool-size SIZE] [--memory SIZE|none] [--cpu N|none] [--instances N|none] <user>" >&2
+  exit 2
+}
 
 # --service (#281): the user is a SERVICE, not a person — a no-login system
 # account a daemon runs as (gig or crew, heavy-duty/handbook proposal 0011).
@@ -49,14 +52,57 @@ usage() { echo "usage: box grant [--service] <user>" >&2; exit 2; }
 #     project — the grant says so, and warns if the user already runs.
 service=0
 user=""
-for a in "$@"; do
-  case "$a" in
+# --pool/--pool-size (#282) and the caps (#283) converge only when given: a
+# re-run without them leaves what an earlier grant set (the pool is read back
+# from the project's user.box.pool marker for the profile's root, below).
+pool=""; pool_size=""; cap_memory=""; cap_cpu=""; cap_instances=""
+need_val() {
+  if [ "$#" -lt 2 ] || [ -z "$2" ] || [ "${2#-}" != "$2" ]; then echo "box grant: $1 needs a value" >&2; usage; fi
+}
+while [ "$#" -gt 0 ]; do
+  case "$1" in
     --service) service=1 ;;
+    --pool)        need_val "$@"; pool="$2"; shift ;;
+    --pool-size)   need_val "$@"; pool_size="$2"; shift ;;
+    --memory)      need_val "$@"; cap_memory="$2"; shift ;;
+    --cpu)         need_val "$@"; cap_cpu="$2"; shift ;;
+    --instances)   need_val "$@"; cap_instances="$2"; shift ;;
     -*) usage ;;
-    *) [ -z "$user" ] || usage; user="$a" ;;
+    *) [ -z "$user" ] || usage; user="$1" ;;
   esac
+  shift
 done
 [ -n "$user" ] || usage
+
+# Sizes are Incus's own spelling (bytes, or N with kB/MB/GB/TB or KiB/MiB/GiB/
+# TiB); to_bytes is the one reader, so a check and a comparison never disagree.
+size_re='^[0-9]+(B|kB|KB|MB|GB|TB|KiB|MiB|GiB|TiB)?$'
+to_bytes() {
+  local v="$1" n u
+  n="${v%%[!0-9]*}"; u="${v#"$n"}"
+  case "$u" in
+    ""|B) echo "$n" ;;
+    kB|KB) echo $((n*1000)) ;;      MB) echo $((n*1000**2)) ;;
+    GB) echo $((n*1000**3)) ;;      TB) echo $((n*1000**4)) ;;
+    KiB) echo $((n*1024)) ;;        MiB) echo $((n*1024**2)) ;;
+    GiB) echo $((n*1024**3)) ;;     TiB) echo $((n*1024**4)) ;;
+    *) return 1 ;;
+  esac
+}
+if [ -n "$pool" ] || [ -n "$pool_size" ]; then
+  if [ -z "$pool" ] || [ -z "$pool_size" ]; then echo "box grant: --pool and --pool-size go together" >&2; exit 2; fi
+  [[ "$pool" =~ ^[a-z][a-z0-9-]{0,62}$ ]] || { echo "box grant: --pool must be a lower-case name (letters, digits, '-'), got '$pool'" >&2; exit 2; }
+  [ "$pool" != default ] || { echo "box grant: --pool default is the host's shared pool — a grant pool is its own" >&2; exit 2; }
+  if ! [[ "$pool_size" =~ $size_re ]] || [ "${#pool_size}" -gt 12 ]; then
+    echo "box grant: --pool-size must be a size like 200GiB, got '$pool_size'" >&2; exit 2
+  fi
+fi
+[ -z "$cap_memory" ] || [ "$cap_memory" = none ] || { [[ "$cap_memory" =~ $size_re ]] && [ "${#cap_memory}" -le 12 ]; } \
+  || { echo "box grant: --memory must be a size like 16GiB, or none — got '$cap_memory'" >&2; exit 2; }
+for c in "cpu:$cap_cpu" "instances:$cap_instances"; do
+  v="${c#*:}"; [ -z "$v" ] || [ "$v" = none ] || [[ "$v" =~ ^[1-9][0-9]{0,4}$ ]] \
+    || { echo "box grant: --${c%%:*} must be a whole number, or none — got '$v'" >&2; exit 2; }
+done
 
 # Root, or sudo — same decision, same reasons as setup-host.sh: granting
 # needs usermod and a run-as-the-user touch, both root's to give.
@@ -345,6 +391,62 @@ echo "snapshots: allowed"
 incus project set "$project" restricted.backups allow </dev/null
 echo "backups: allowed ('box export' rides them, #70)"
 
+# 6b. A pool of the grant's own (#282). A full tenant pool then fails that
+# tenant and never 'default', which carries every other guest. Created as a
+# btrfs loop file of the given size, or adopted when an earlier grant of THIS
+# user made it (the user.box.grant marker); anything else is refused and never
+# resized or deleted here. Confinement is limits.disk.pool.<other>=0 for every
+# other pool, which needs the projects_limits_disk_pool API extension.
+if [ -n "$pool" ]; then
+  # Captured, never piped into grep -q: under pipefail an early-exiting grep
+  # SIGPIPEs the much longer 'incus info' and the check reads as a refusal.
+  server_info="$(incus info </dev/null 2>/dev/null || true)"
+  grep -Eq '^[[:space:]]*-[[:space:]]+projects_limits_disk_pool[[:space:]]*$' <<<"$server_info" \
+    || { echo "box grant --pool: this Incus lacks the projects_limits_disk_pool extension (Incus 6.0 LTS has it) — cannot confine $project to one pool" >&2; exit 1; }
+  if incus storage show "$pool" >/dev/null 2>&1 </dev/null; then
+    driver="$(incus storage show "$pool" </dev/null | awk '/^driver:/{print $2}')"
+    owner="$(incus storage get "$pool" user.box.grant </dev/null 2>/dev/null || true)"
+    have="$(incus storage get "$pool" size </dev/null 2>/dev/null || true)"
+    [ "$owner" = "$user" ] || { echo "box grant --pool: pool '$pool' exists and is not $user's grant pool (user.box.grant=${owner:-unset}) — choose another name" >&2; exit 1; }
+    [ "$driver" = btrfs ] || { echo "box grant --pool: pool '$pool' is $driver, not btrfs" >&2; exit 1; }
+    if [ -z "$have" ] || [ "$(to_bytes "$have" 2>/dev/null || echo 0)" -lt "$(to_bytes "$pool_size")" ]; then
+      echo "box grant --pool: pool '$pool' is ${have:-of unknown size}, smaller than $pool_size — box never resizes a pool; grow it by hand or pick a smaller --pool-size" >&2; exit 1
+    fi
+    echo "pool: $pool already exists ($have, btrfs, $user's)"
+  else
+    if ! err="$(incus storage create "$pool" btrfs size="$pool_size" </dev/null 2>&1)"; then
+      echo "box grant --pool: could not create pool '$pool': $err" >&2; exit 1
+    fi
+    incus storage set "$pool" user.box.grant "$user" </dev/null
+    echo "pool: created $pool ($pool_size btrfs loop file) for $user"
+  fi
+  incus project unset "$project" "limits.disk.pool.$pool" </dev/null 2>/dev/null || true
+  while read -r other; do
+    if [ -z "$other" ] || [ "$other" = "$pool" ]; then continue; fi
+    incus project set "$project" "limits.disk.pool.$other" 0 </dev/null
+  done < <(incus storage list --format csv -c n </dev/null)
+  incus project set "$project" user.box.pool "$pool" </dev/null
+  echo "pool: $project confined to $pool (every other pool's limit is 0; re-run the grant after adding a pool)"
+fi
+
+# 6c. Caps (#283): the project's own limits.* — 'none' unsets. Incus then
+# refuses any instance that does not set limits.cpu/limits.memory itself or
+# by profile; 'box new' always stamps both, and so must a tool's profiles.
+for c in "memory:$cap_memory" "cpu:$cap_cpu" "instances:$cap_instances"; do
+  k="limits.${c%%:*}"; v="${c#*:}"
+  [ -n "$v" ] || continue
+  if [ "$v" = none ]; then
+    incus project unset "$project" "$k" </dev/null 2>/dev/null || true
+    echo "caps: $k unset"
+  elif ! err="$(incus project set "$project" "$k" "$v" </dev/null 2>&1)"; then
+    echo "box grant: could not set $k=$v on $project: $err" >&2
+    echo "  (Incus refuses a cap below what the project already uses — see: incus project info $project)" >&2
+    exit 1
+  else
+    echo "caps: $k=$v"
+  fi
+done
+
 if [ "$service" -eq 1 ]; then
   # No host paths for a service (#281): managed volumes only. An instance that
   # already carries a host-path disk blocks this — say which way out.
@@ -370,7 +472,15 @@ fi
 incus --project "$project" profile show box-profile >/dev/null 2>&1 </dev/null \
   || incus --project "$project" profile create box-profile >/dev/null </dev/null
 incus --project "$project" profile edit box-profile < "$here/profiles/box-profile.yaml"
-echo "profile: box-profile installed in $project"
+# The shipped profile roots on 'default'; a grant pool (#282) re-points it, read
+# back from the project's marker so a re-run WITHOUT --pool keeps it.
+grant_pool="$(incus project get "$project" user.box.pool </dev/null 2>/dev/null || true)"
+if [ -n "$grant_pool" ]; then
+  incus --project "$project" profile device set box-profile root pool "$grant_pool" </dev/null
+  echo "profile: box-profile installed in $project, rooted on $grant_pool"
+else
+  echo "profile: box-profile installed in $project"
+fi
 
 # Prove the grant from the USER's side of the socket — the only side that
 # matters. This catches the failure the steps above cannot see one at a time:
