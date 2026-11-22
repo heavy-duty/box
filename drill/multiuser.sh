@@ -565,7 +565,13 @@ phase "m. a raw attach to boxnet — the scoped guarantee, measured"
 # has no DHCP client, so its raw instance holds NO lease — and against a
 # dead NIC every negative probe below "passes" vacuously while the contract
 # goes unmeasured. Caught on this criterion's first run (MU-5).
-rawout="$(as_u "$U1" incus launch images:debian/13/cloud esc2 --network boxnet 2>&1)"; rawrc=$?
+# In container mode the raw instance gets security.nesting=true, as every box
+# container does: Debian 13's systemd stalls without it in an unprivileged
+# container (no D-Bus, networkd stuck 'activating', so no DHCP) — measured on
+# the CI runner. The probe is about NETWORK-level controls, not nesting.
+rawextra=(); case " ${MODE[*]:-} " in *" --container "*) rawextra=(-c security.nesting=true) ;; esac
+[ -e /dev/kvm ] || rawextra=(-c security.nesting=true)
+rawout="$(as_u "$U1" incus launch images:debian/13/cloud esc2 --network boxnet "${rawextra[@]}" 2>&1)"; rawrc=$?
 if [ "$rawrc" -ne 0 ]; then
   # Version fork, measured: 6.0.4 permits a restricted cert a raw --network
   # reference to an allowed network; 6.0.0 refuses it at the permission
