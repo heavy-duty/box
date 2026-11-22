@@ -2532,6 +2532,68 @@ check "help grant documents --pool and the caps" 0 "--pool NAME --pool-size SIZE
 check "new: a pooled grant sizes a container's root too (#282)" 0 "" bash -c '
   awk "/^cmd_new\(\) \{/,/^\}/" "'"$ROOT"'/bin/box" | grep -q "box_grant_pool)\" \]; then extra+=(--device \"root,size=\$T_DISK\")"'
 rm -rf "$GS"
+
+# --- revoke of a SERVICE grant, driven (#285) --------------------------------
+RS="$(mktemp -d)"; mkdir -p "$RS/bin" "$RS/state"
+rs_stub() { printf '#!/usr/bin/env bash\n%s\n' "$2" >"$RS/bin/$1"; chmod +x "$RS/bin/$1"; }
+# shellcheck disable=SC2016  # stub bodies expand when they run
+{
+rs_stub id 'case "$*" in "-u") echo 0 ;; "-u svc") echo 1500 ;; "-nG svc") echo "svc incus" ;; *) exit 2 ;; esac'
+rs_stub getent '[ "$2" = svc ]'
+rs_stub gpasswd 'echo "gpasswd $*" >>"$RS/log"'
+rs_stub pgrep 'exit 1'
+rs_stub ps 'cat "$RS/state/units" 2>/dev/null; exit 0'
+rs_stub incus 'st="$RS/state"; log() { echo "incus $*" >>"$RS/log"; }
+p=""; if [ "$1" = --project ]; then p="$2"; shift 2; fi
+case "$*" in
+  "project show user-1500") [ ! -e "$st/project-gone" ] ;;
+  "project get user-1500 user.box.service") cat "$st/service" 2>/dev/null; exit 0 ;;
+  "project get user-1500 user.box.pool") cat "$st/pool" 2>/dev/null; exit 0 ;;
+  "storage get gig user.box.grant") cat "$st/pool-owner" 2>/dev/null; exit 0 ;;
+  "storage show gig") printf "name: gig\nused_by:\n- /1.0/instances/r1?project=user-1500\n%s\nstatus: Created\n" "$(cat "$st/foreign" 2>/dev/null)" ;;
+  "storage delete gig") log "$*" ;;
+  "list --format csv --columns n") echo r1 ;;
+  "delete -f r1") log "--project $p $*" ;;
+  "image list --format csv --columns f") : ;;
+  "profile list --format csv --columns n") printf "default\nbox-profile\ngig-untrusted\n" ;;
+  "profile delete "*) log "--project $p $*" ;;
+  "storage volume list --format csv --columns ptn") printf "gig,custom,cache\ngig,container,r1\n" ;;
+  "storage volume delete "*) log "--project $p $*" ;;
+  "project delete user-1500") log "$*"; : >"$st/project-gone" ;;
+  "network delete "*|"network show "*) exit 1 ;;
+  "config trust list --format csv --columns nf") : ;;
+  *) echo "STUB: unexpected incus ${p:+--project $p }$*" >&2; exit 3 ;;
+esac'
+}
+rs_reset() { rm -rf "$RS/state" "$RS/log"; mkdir -p "$RS/state"; : >"$RS/log"; echo true >"$RS/state/service"; echo gig >"$RS/state/pool"; echo svc >"$RS/state/pool-owner"; }
+rs_revoke() { env PATH="$RS/bin:$PATH" RS="$RS" BOX_YES=1 bash "$ROOT/host/revoke-user.sh" "$@"; }
+rs_log() { cat "$RS/log"; }
+
+rs_reset; printf 'garm.service\nuser@1500.service\n' >"$RS/state/units"
+check "revoke: refuses a service whose unit still runs, naming it" 1 "garm.service" rs_revoke svc
+check "revoke: the refusal says to stop it first" 1 "stop them first, so it drains" rs_revoke svc
+check "revoke: the user's own systemd manager is not the service" 1 "" bash -c 'env PATH="'"$RS"'/bin:$PATH" RS="'"$RS"'" bash "'"$ROOT"'/host/revoke-user.sh" svc 2>&1 | grep -q "  user@"'
+check "revoke: --force revokes anyway, loudly" 0 "WARNING: --force" rs_revoke svc --force
+rs_reset
+check "revoke --purge on a service: every tool profile and custom volume goes, then the project" 0 "kept: grant pool gig" rs_revoke svc --purge
+check "revoke --purge: a tool's profile is deleted" 0 "profile delete gig-untrusted" rs_log
+check "revoke --purge: a custom volume is deleted" 0 "--project user-1500 storage volume delete gig cache" rs_log
+check "revoke --purge: an instance's own volume is not deleted by hand" 1 "" grep -q "volume delete gig r1" "$RS/log"
+check "revoke --purge: 'default' is never deleted" 1 "" grep -q "profile delete default" "$RS/log"
+check "revoke --purge: the pool survives a plain purge" 1 "" grep -q "storage delete gig" "$RS/log"
+rs_reset
+check "revoke --purge --purge-pool deletes the grant pool" 0 "purge: grant pool gig removed" rs_revoke svc --purge --purge-pool
+rs_reset; echo "- /1.0/instances/other?project=user-1600" >"$RS/state/foreign"
+check "revoke --purge-pool: refused while the pool is shared, before anything is purged" 1 "used outside user-1500" rs_revoke svc --purge --purge-pool
+check "revoke --purge-pool: the refusal deleted nothing" 1 "" grep -q "delete" "$RS/log"
+rs_reset; echo other >"$RS/state/pool-owner"
+check "revoke --purge-pool: someone else's pool is never deleted" 1 "is not svc's grant pool" rs_revoke svc --purge --purge-pool
+check "revoke: --purge-pool without --purge is a usage error" 2 "--purge-pool goes with --purge" rs_revoke svc --purge-pool
+rs_reset; : >"$RS/state/service"; : >"$RS/state/pool"
+check "revoke: --force on a person's grant is refused" 2 "for service grants" rs_revoke svc --force
+printf 'something.service\n' >"$RS/state/units"
+check "revoke: a person's grant ignores running units (unchanged)" 0 "revoked: svc no longer has the restricted tier" rs_revoke svc
+rm -rf "$RS"
 check "revoke: group removal is the lockout" 0 "" \
   grep -qF 'gpasswd -d' "$ROOT/host/revoke-user.sh"
 # Group membership is read at login: purge must terminate live sessions (a

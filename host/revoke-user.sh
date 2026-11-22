@@ -12,17 +12,25 @@
 #     incus-user state. Irreversible, so it asks first.
 set -euo pipefail
 
-usage() { echo "usage: box revoke <user> [--purge]" >&2; exit 2; }
+usage() { echo "usage: box revoke <user> [--purge [--purge-pool]] [--force]" >&2; exit 2; }
 
-user=""; purge=0
+# --force and --purge-pool belong to SERVICE grants (#285): --force overrides
+# the running-unit refusal, --purge-pool also deletes the grant's own pool
+# (#282), which a plain --purge keeps.
+user=""; purge=0; purge_pool=0; force=0
 for a in "$@"; do
   case "$a" in
     --purge) purge=1 ;;
+    --purge-pool) purge_pool=1 ;;
+    --force) force=1 ;;
     -*) usage ;;
     *) [ -z "$user" ] || usage; user="$a" ;;
   esac
 done
 [ -n "$user" ] || usage
+if [ "$purge_pool" -eq 1 ] && [ "$purge" -eq 0 ]; then
+  echo "box revoke: --purge-pool goes with --purge (the pool can only go once the project has)" >&2; exit 2
+fi
 
 if [ "$(id -u)" -eq 0 ]; then
   SUDO=""
@@ -40,6 +48,51 @@ project="user-$uid"
 # unless that would not fit in an interface name (15 chars), then user-<uid>.
 bridge="incusbr-$uid"
 [ "${#bridge}" -gt 15 ] && bridge="user-$uid"
+
+# A SERVICE grant (#281's marker) is revoked differently (#285): its daemon
+# must drain first (gig deregisters its runners on stop), every profile and
+# custom volume a tool made goes with --purge, and the grant's pool stays
+# unless --purge-pool says otherwise.
+service=0; grant_pool=""
+if incus project show "$project" >/dev/null 2>&1 </dev/null; then
+  [ "$(incus project get "$project" user.box.service </dev/null 2>/dev/null || true)" = true ] && service=1
+  grant_pool="$(incus project get "$project" user.box.pool </dev/null 2>/dev/null || true)"
+fi
+if [ "$service" -eq 0 ] && { [ "$force" -eq 1 ] || [ "$purge_pool" -eq 1 ]; }; then
+  echo "box revoke: --force and --purge-pool are for service grants; $project is not one" >&2; exit 2
+fi
+if [ "$purge_pool" -eq 1 ]; then
+  [ -n "$grant_pool" ] || { echo "box revoke: $project has no grant pool to purge" >&2; exit 2; }
+  owner="$(incus storage get "$grant_pool" user.box.grant </dev/null 2>/dev/null || true)"
+  [ "$owner" = "$user" ] || { echo "box revoke: pool $grant_pool is not $user's grant pool (user.box.grant=${owner:-unset}) — not deleting it" >&2; exit 1; }
+  # Refused BEFORE anything is purged: a pool something else uses would leave
+  # the purge half-done at the last step.
+  foreign="$(incus storage show "$grant_pool" </dev/null 2>/dev/null \
+    | awk '/^used_by:/{u=1;next} u&&/^- /{print $2;next} u&&!/^- /{u=0}' \
+    | grep -v "project=$project\(&\|\$\)" || true)"
+  if [ -n "$foreign" ]; then
+    echo "box revoke: pool $grant_pool is used outside $project — refusing --purge-pool:" >&2
+    printf '  %s\n' "${foreign//$'\n'/$'\n'  }" >&2; exit 1
+  fi
+fi
+if [ "$service" -eq 1 ]; then
+  # The units running AS the service, by systemd's own attribution (ps' unit
+  # column), not by name: a service whose unit is named for its engine
+  # (garm.service run as 'gig') is still found. The user's own systemd manager
+  # and login scopes are not the service.
+  # shellcheck disable=SC2009  # pgrep cannot print a process's systemd unit
+  units="$(ps -o unit= -u "$user" 2>/dev/null | grep -E '\.service$' | grep -v '^user@' | sort -u || true)"
+  if [ -n "$units" ]; then
+    if [ "$force" -eq 0 ]; then
+      echo "box revoke: $user is a service and these units still run as it — stop them first, so it drains:" >&2
+      printf '  %s\n' "${units//$'\n'/$'\n'  }" >&2
+      echo "  (systemctl stop ${units//$'\n'/ } — or --force to revoke under it anyway)" >&2
+      exit 1
+    fi
+    echo "WARNING: --force — revoking $user while ${units//$'\n'/ } still run as it. It will not drain:"
+    echo "         whatever it registered elsewhere (CI runners, say) stays registered until cleaned by hand."
+  fi
+fi
 
 if [ "$purge" -eq 1 ]; then
   # Destructive and irreversible: a TTY to ask on, or BOX_YES=1, or refuse —
@@ -168,6 +221,23 @@ if incus project show "$project" >/dev/null 2>&1 </dev/null; then
     incus --project "$project" image delete "$fp" </dev/null
   done < <(incus --project "$project" image list --format csv --columns f 2>/dev/null)
 
+  # A service's project holds what its tool made: profiles beyond box's own and
+  # custom volumes, each of which blocks the project delete (#285). All of them
+  # go — every profile but 'default' (which a project always has), and every
+  # custom volume on every pool the project used.
+  if [ "$service" -eq 1 ]; then
+    while IFS=, read -r prof _; do
+      if [ -z "$prof" ] || [ "$prof" = default ]; then continue; fi
+      echo "purge: deleting profile $prof"
+      incus --project "$project" profile delete "$prof" </dev/null
+    done < <(incus --project "$project" profile list --format csv --columns n 2>/dev/null)
+    while IFS=, read -r vpool vtype vname _; do
+      [ "$vtype" = custom ] || continue
+      echo "purge: deleting custom volume $vpool/$vname"
+      incus --project "$project" storage volume delete "$vpool" "$vname" </dev/null
+    done < <(incus --project "$project" storage volume list --format csv --columns ptn 2>/dev/null)
+  fi
+
   # Both names, for one release (#229 D7). install.sh skips host setup on an
   # upgrade, so a host upgraded to this release still carries box-net in every
   # granted project until an admin runs 'box setup-host' by hand — and in that
@@ -180,6 +250,18 @@ if incus project show "$project" >/dev/null 2>&1 </dev/null; then
   incus project delete "$project" </dev/null \
     || { echo "box revoke: could not delete $project — something is still in it (incus --project $project list / image list / storage volume list)" >&2; exit 1; }
   echo "purge: project $project removed"
+fi
+
+# The grant's pool (#282): kept unless asked, because it may hold what an
+# operator wants back; checked unshared before anything was deleted, above.
+if [ -n "$grant_pool" ]; then
+  if [ "$purge_pool" -eq 1 ]; then
+    incus storage delete "$grant_pool" </dev/null \
+      || { echo "box revoke: could not delete pool $grant_pool (incus storage show $grant_pool)" >&2; exit 1; }
+    echo "purge: grant pool $grant_pool removed"
+  else
+    echo "kept: grant pool $grant_pool ('box revoke $user --purge --purge-pool' deletes it)"
+  fi
 fi
 
 if incus network delete "$bridge" >/dev/null 2>&1 </dev/null; then

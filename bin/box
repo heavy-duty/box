@@ -184,7 +184,7 @@ CMDS=(
   "doctor^[--fix | --pin-dns]^^Is this host fit to mint boxes? Diagnose the daemon, network, DNS, isolation^fn:cmd_doctor^"
   "setup-host^^^One-time host setup: Incus, the boxnet stack, the profile, the firewall^fn:cmd_setup_host^"
   "grant^[--service] [--pool NAME --pool-size SIZE] [--memory SIZE] [--cpu N] [--instances N] <user>^^Admin: give a host user (or a service, --service) the restricted tier — their own boxes, on the hardened boxnet^fn:cmd_grant^"
-  "revoke^<user> [--purge]^^Admin: take the restricted tier back (--purge also deletes their boxes)^fn:cmd_revoke^"
+  "revoke^<user> [--purge [--purge-pool]] [--force]^^Admin: take the restricted tier back (--purge also deletes their boxes)^fn:cmd_revoke^"
   "teardown-host^[--purge-incus]^^Remove the box host stack (both name generations)^fn:cmd_teardown_host^"
   "versions^^^List the installed box versions — the current default and the running one^fn:cmd_versions^"
   "use^<version>^^Switch the default box version (refuses while boxes exist)^fn:cmd_use^"
@@ -1002,8 +1002,17 @@ project becomes unreachable — grant's "no re-grant needed" holds only while
 they still hold 'incus'. --purge unmakes the provisioning the same way. Only
 'gpasswd -d <user> incus-admin' ends their access, and revoke says so.
 
+A SERVICE grant (#281) is revoked so its daemon can drain (#285): revoke
+refuses while a systemd unit runs as the service (found by systemd's own
+attribution, so garm.service running as 'gig' counts), naming the unit to
+stop; --force overrides, loudly. --purge also deletes every profile and
+custom volume a tool made in the project, not only box's own. The grant's
+pool (#282) is kept unless --purge-pool is given, which is refused before
+anything is deleted while anything outside the project uses the pool.
+
   box revoke dev1            # take the tier; their boxes keep running
   box revoke dev1 --purge    # ...or end their sessions and delete everything
+  box revoke gig --purge --purge-pool   # a stopped service, its pool too
 EOF
 ;;
     teardown-host) cat <<'EOF'
