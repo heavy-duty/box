@@ -916,7 +916,12 @@ phase "s. can a granted user reach a SECOND project? (#253 member 2, measured)"
 # The whole price of a shared-project design turned on this, and it was read
 # from documentation. Measured here on the real daemon: a hand-made project
 # with a profile in it, read by a granted user over incus-user's socket.
-box grant --service "$US" >/dev/null 2>&1
+if out="$(box grant --service "$US" 2>&1)"; then
+  ok "(s) the service is re-granted after its purge (the precondition for this measurement)"
+else
+  no "(s) re-granting the service after its purge FAILED — the measurement below would be vacuous:"
+  printf '%s\n' "$out" | tail -4 | sed 's/^/        /'
+fi
 svch="$(mktemp -d)"; chown "$US" "$svch"
 incus project create boxdrill-shared >/dev/null 2>&1
 incus --project boxdrill-shared profile create drill-secret >/dev/null 2>&1

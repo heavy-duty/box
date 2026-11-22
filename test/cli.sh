@@ -1612,7 +1612,8 @@ check "tenant seed: package_update is on — the seed installs packages (#214)" 
 check "seed: names no BOX_USER (#291)" 1 "" grep -q '^BOX_USER=' "$ROOT/seed/box.env"
 # shellcheck disable=SC2016  # a literal in the target file
 check "bin/box: has no default tenant user any more (#291)" 1 "" grep -qF 'user="${user:-dev}"' "$ROOT/bin/box"
-check "tenant seed: the rendered payload creates no user (#291)" 1 "" grep -qE '^users:' "$SEEDLOG"
+check "tenant seed: the rendered payload says users: [] — no default user either (#291)" 0 "" grep -qxF 'users: []' "$SEEDLOG"
+check "tenant seed: ...and lists no user entry at all" 1 "" grep -qE '^[[:space:]]*-[[:space:]]+name:' "$SEEDLOG"
 rm -f "$RUFN" "$SEED"
 
 # YAML well-formedness needs python3 + pyyaml; the CI runner has both. Skip
@@ -1693,8 +1694,10 @@ for d in "$ROOT"/seed/; do
   # The half of the seed's user block that #177 did NOT change: no password
   # login, in every template. Dropping sudo while leaving the account
   # unlocked would trade one door for another.
-  check "template '$t': creates no users at all — a role does (#291)" 1 "" \
-    grep -qE '^users:' "$d/user-data.yaml"
+  # 'users: []', never an absent key: absent means cloud-init's distro default
+  # user (debian, passwordless sudo) — found on real Incus by the rehearsal.
+  check "template '$t': creates no users at all, not even the distro default (#291)" 0 "" \
+    grep -qxF 'users: []' "$d/user-data.yaml"
   # #289: 'box tmux' went with the package (#253 D7(a)); the seed carries none.
   check "template '$t': installs no tmux (#289)" 1 "" \
     grep -qE '^[[:space:]]*-[[:space:]]+tmux$' "$d/user-data.yaml"
@@ -3500,7 +3503,7 @@ check "mint: the default path takes the small cpu row (#159)" 0 "" \
 check "mint: the default path takes the small memory row (#159)" 0 "" \
   launch_has "$MLOG" 'limits\.memory=2GiB'
 check "mint: cloud-init creates no user (#291)" 1 "" \
-  launch_has "$MLOG" '^users:|name: "'
+  launch_has "$MLOG" 'name: "'
 check "mint: no user is stamped (#291)" 1 "" \
   launch_has "$MLOG" 'user\.box\.user='
 # THE OFFLINE PROOF, at the mint rather than at the renderer (#214). A mint of

@@ -345,8 +345,18 @@ if ! incus project show "$project" >/dev/null 2>&1 </dev/null; then
   echo "project: touching incus-user as $user to create $project..."
   # The touch's own stderr is kept (#281): swallowed, a client that failed
   # before it ever connected (no home for its config) read as incus-user's fault.
+  # Up to three attempts, 2s apart: right after a purge removed this uid's
+  # incus-user state, the first contact can meet a reset socket (measured in
+  # the rehearsal: "read: connection reset by peer") and succeed a moment
+  # later. A timeout (124) is not retried — that is a wedge, not a blip.
   touch_rc=0
-  touch_err="$(run_as_incus timeout 60 incus project list 2>&1 >/dev/null)" || touch_rc=$?
+  for attempt in 1 2 3; do
+    touch_rc=0
+    touch_err="$(run_as_incus timeout 60 incus project list 2>&1 >/dev/null)" || touch_rc=$?
+    if [ "$touch_rc" -eq 0 ] || [ "$touch_rc" -eq 124 ]; then break; fi
+    if incus project show "$project" >/dev/null 2>&1 </dev/null; then break; fi
+    [ "$attempt" -eq 3 ] || sleep 2
+  done
   if ! incus project show "$project" >/dev/null 2>&1 </dev/null; then
     echo "box grant: incus-user did not create $project — is incus-user.socket healthy? (journalctl -u incus-user)" >&2
     if [ "$touch_rc" -eq 124 ]; then

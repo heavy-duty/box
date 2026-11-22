@@ -9,6 +9,10 @@
 # with convergence (a role's USER=, created by the converger). The
 # unprivileged-tenant posture of #177 is the role's to keep now: a role that
 # wants a sudo-less agent creates it without sudo.
+# 'users: []' and not an absent key: with no 'users' at all, cloud-init falls
+# back to the distro's default user ('debian', with passwordless sudo) — the
+# rehearsal on real Incus found it. The empty list is what "no users" means.
+users: []
 package_update: true
 # curl + ca-certificates: they no longer carry box's installer — they carry
 # the OPERATOR's (#214). The first line of the by-hand converge is a
