@@ -883,9 +883,15 @@ as_svc incus --project "$ps_" storage volume create default drill-vol size=8MiB 
 as_svc incus --project "$ps_" storage volume create "$POOL" drill-vol size=8MiB >/dev/null 2>&1 \
   && ok "(r) a volume on its own pool works" \
   || no "(r) the service could not create a volume on its own pool $POOL"
-# No sizing flags on purpose (#283): a capped, pooled grant must mint with a
-# plain 'box new' — box clamps what the caller did not choose to the caps.
-if out="$(as_svc box new --name drill-pool "${MODE[@]}" 2>&1)"; then
+# #283 (ruled: fail loudly): a plain 'box new' whose defaults exceed the caps
+# refuses before minting, naming the sizes that fit; sized to fit, it mints.
+pout="$(as_svc box new --name drill-pool "${MODE[@]}" 2>&1)"; prc=$?
+if [ "$prc" -eq 2 ] && printf '%s' "$pout" | grep -q -- '--disk <less than'; then
+  ok "(r) a plain box new over the caps refuses before minting, naming the sizes that fit"
+else
+  no "(r) a plain box new over the caps did not refuse cleanly (rc=$prc):"; printf '%s\n' "$pout" | tail -3 | sed 's/^/        /'
+fi
+if out="$(as_svc box new --name drill-pool "${MODE[@]}" --disk 1GiB 2>&1)"; then
   rp="$(as_svc incus --project "$ps_" config device get drill-pool root pool 2>/dev/null \
         || as_svc incus --project "$ps_" profile device get box-profile root pool 2>/dev/null)"
   [ "$rp" = "$POOL" ] && ok "(r) box new as the service lands on $POOL" || no "(r) box new landed on '$rp', not $POOL"

@@ -351,8 +351,9 @@ so a full tenant pool fails that tenant and never `default`. `--memory`,
 `--cpu` and `--instances` set the project's own `limits.*`, so a tenant can
 never starve the host's other guests (`none` unsets one). Under a cap, Incus
 refuses an instance that sets no `limits.cpu`/`limits.memory`: `box new`
-always stamps both, clamping any resource you didn't choose to the cap so a
-plain `box new` fits, and a tool's own profiles must set them too. Revoking a service
+always stamps both, and a tool's own profiles must set them too. When a
+default would exceed a cap, `box new` refuses before minting and prints the
+exact sizes that fit; it never adjusts them for you. Revoking a service
 (#285) refuses while a unit still runs as it (stop it first, so it drains),
 purges every profile and custom volume with `--purge`, and keeps the pool
 unless `--purge-pool`.

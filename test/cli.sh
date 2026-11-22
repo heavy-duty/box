@@ -355,14 +355,14 @@ exec_fixture() { # exec_fixture <command> [arg...]
   bash -c '
     set -e
     . "$0"
-    require_guest_user() { :; }
+    require_guest_user() { guest_shell=/bin/bash; }
     # Strict: an && chain does not abort under set -e, so a mismatch must exit
     # explicitly or the fixture passes by running the payload anyway.
     incus() {
       if ! { [ "$1" = exec ] && [ "$2" = fixture ] && [ "$3" = -- ]; }; then echo "BAD WRAPPER: $*" >&2; exit 9; fi
       shift 3
-      if ! { [ "$1" = runuser ] && [ "$2" = -u ] && [ "$3" = fixture-user ] && [ "$4" = -- ]; }; then echo "BAD WRAPPER: $*" >&2; exit 9; fi
-      shift 4
+      if ! { [ "$1" = runuser ] && [ "$2" = -u ] && [ "$3" = fixture-user ] && [ "$4" = -- ] && [ "$5" = env ] && [ "$6" = SHELL=/bin/bash ]; }; then echo "BAD WRAPPER: $*" >&2; exit 9; fi
+      shift 6
       "$@"
     }
     inst=fixture; user=fixture-user
@@ -2643,13 +2643,15 @@ check "box revoke passes --force through verbatim (#285)" 0 "SCRIPT-ARGS: gig --
 check "box grant --help is still box's help" 0 "--pool NAME --pool-size SIZE gives the grant" \
   bash "$PT/bin/box" grant --help
 rm -rf "$PT"
-# clamp_to_grant_caps (#283, review round): a capped grant's plain 'box new'
-# mints inside the caps; a resource the caller chose is never touched.
+# check_grant_caps (#283, ruled 2026-11-22: fail loudly): a plain 'box new'
+# whose defaults exceed the grant's caps refuses BEFORE minting and names the
+# sizes that fit; a resource the caller chose is never second-guessed.
 CLFN="$(mktemp)"
-awk '/^size_bytes\(\) \{/,/^\}/; /^clamp_to_grant_caps\(\) \{/,/^\}/' "$BOX" > "$CLFN"
+awk '/^size_bytes\(\) \{/,/^\}/; /^check_grant_caps\(\) \{/,/^\}/' "$BOX" > "$CLFN"
 # shellcheck disable=SC2016  # $-strings expand in the child shell, by design
-clamp() { env "$@" bash -c '
+capcheck() { env "$@" bash -c '
   . "$0"
+  usage_error() { echo "box: $*" >&2; exit 2; }
   box_tier() { echo restricted; }
   id() { echo 1500; }
   incus() { case "$*" in
@@ -2657,21 +2659,24 @@ clamp() { env "$@" bash -c '
       "project get user-1500 limits.memory") echo "${CAP_MEM:-}" ;;
       "project get user-1500 limits.disk") echo "${CAP_DISK:-}" ;;
     esac; }
-  T_CPU=2 T_MEMORY=2GiB T_DISK=20GiB
-  clamp_to_grant_caps
-  printf "CPU=%s MEM=%s DISK=%s\n" "$T_CPU" "$T_MEMORY" "$T_DISK"' "$CLFN"; }
-check "clamp: defaults above the caps are clamped to them, each said once" 0 "CPU=1 MEM=1GiB DISK=3GiB" \
-  clamp CAP_CPU=1 CAP_MEM=1GiB CAP_DISK=3GiB cpu= memory= disk= size=
-check "clamp: ...and the operator is told" 0 "your grant caps CPU at 1" \
-  clamp CAP_CPU=1 CAP_MEM=1GiB CAP_DISK=3GiB cpu= memory= disk= size=
-check "clamp: caps above the defaults change nothing" 0 "CPU=2 MEM=2GiB DISK=20GiB" \
-  clamp CAP_CPU=8 CAP_MEM=16GiB CAP_DISK=200GiB cpu= memory= disk= size=
-check "clamp: a resource the caller chose is left for Incus to judge" 0 "CPU=2 MEM=1GiB DISK=3GiB" \
-  clamp CAP_CPU=1 CAP_MEM=1GiB CAP_DISK=3GiB cpu=2 memory= disk= size=
-check "clamp: no caps, no change" 0 "CPU=2 MEM=2GiB DISK=20GiB" clamp cpu= memory= disk= size=
+  T_CPU=2 T_MEMORY=2GiB T_DISK=20GiB name=web
+  check_grant_caps
+  printf "MINT CPU=%s MEM=%s DISK=%s\n" "$T_CPU" "$T_MEMORY" "$T_DISK"' "$CLFN"; }
+check "caps: defaults above the caps refuse (exit 2), naming every one" 2 "your grant caps cpu 1 (default 2), memory 1GiB (default 2GiB), disk 3GiB in total (default root 20GiB)" \
+  capcheck CAP_CPU=1 CAP_MEM=1GiB CAP_DISK=3GiB cpu= memory= disk= size=
+check "caps: ...and print the line that fits, leaving disk room for images" 2 "box new --name web --cpu 1 --memory 1GiB --disk <less than 3GiB>" \
+  capcheck CAP_CPU=1 CAP_MEM=1GiB CAP_DISK=3GiB cpu= memory= disk= size=
+caps_never_mint() { ! capcheck CAP_CPU=1 cpu= memory= disk= size= 2>&1 | grep -q MINT; }
+check "caps: ...and never mint anything adjusted" 0 "" caps_never_mint
+check "caps: caps above the defaults pass untouched" 0 "MINT CPU=2 MEM=2GiB DISK=20GiB" \
+  capcheck CAP_CPU=8 CAP_MEM=16GiB CAP_DISK=200GiB cpu= memory= disk= size=
+check "caps: sizes the caller chose are left for Incus to judge" 0 "MINT CPU=2 MEM=2GiB DISK=20GiB" \
+  capcheck CAP_CPU=1 CAP_MEM=1GiB CAP_DISK=3GiB cpu=2 memory=2GiB disk=20GiB size=
+check "caps: no caps, no refusal" 0 "MINT CPU=2" capcheck cpu= memory= disk= size=
+check "caps: clamping is gone — nothing adjusts a size behind the caller's back" 1 "" grep -q 'clamp_to_grant_caps' "$BOX"
 # shellcheck disable=SC2016  # $-strings expand in the child shell, by design
-check "new: cmd_new clamps after load_seed" 0 "" bash -c '
-  awk "/^cmd_new\(\) \{/,/^\}/" "$1" | grep -A1 "^    load_seed$" | grep -q "clamp_to_grant_caps"' _ "$BOX"
+check "new: cmd_new checks the caps after load_seed" 0 "" bash -c '
+  awk "/^cmd_new\(\) \{/,/^\}/" "$1" | grep -A1 "^    load_seed$" | grep -q "check_grant_caps"' _ "$BOX"
 rm -f "$CLFN"
 check "help grant documents --pool and the caps" 0 "--pool NAME --pool-size SIZE gives the grant a storage pool" "$BOX" help grant
 # shellcheck disable=SC2016  # the $-strings are literals in the target file

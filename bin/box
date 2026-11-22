@@ -129,27 +129,30 @@ size_bytes() {
     *) return 1 ;;
   esac
 }
-# A capped grant (#283): a plain 'box new' must still mint. Any resource the
-# caller did NOT choose (no flag, no BOX_* env, no --size) is clamped to the
-# project's own cap when the default would exceed it, and said so. A choice
-# the caller made is left alone: Incus refuses it loudly, which is right.
-clamp_to_grant_caps() {
+# A capped grant (#283, ruled 2026-11-22: fail loudly, never adjust): when a
+# resource the caller did NOT choose (no flag, no BOX_* env, no --size) has a
+# default above the project's own cap, refuse before minting and print the
+# exact line that fits. Box never quietly mints something other than what the
+# defaults say; a value the caller DID choose is left for Incus to judge.
+check_grant_caps() {
   [ "$(box_tier)" = restricted ] || return 0
-  local p c m d; p="user-$(id -u)"
+  local p c m d over="" fit=""; p="user-$(id -u)"
   c="$(incus project get "$p" limits.cpu </dev/null 2>/dev/null || true)"
   m="$(incus project get "$p" limits.memory </dev/null 2>/dev/null || true)"
   d="$(incus project get "$p" limits.disk </dev/null 2>/dev/null || true)"
   if [ -z "$cpu$size${BOX_CPU:-}" ] && [ -n "$c" ] && [ "$c" -lt "$T_CPU" ] 2>/dev/null; then
-    echo "box: note — your grant caps CPU at $c; minting with $c (pass --cpu to choose)" >&2; T_CPU="$c"
+    over="$over cpu $c (default $T_CPU),"; fit="$fit --cpu $c"
   fi
   if [ -z "$memory$size${BOX_MEMORY:-}" ] && [ -n "$m" ] \
      && [ "$(size_bytes "$m" || echo 0)" -gt 0 ] && [ "$(size_bytes "$m")" -lt "$(size_bytes "$T_MEMORY" || echo 0)" ]; then
-    echo "box: note — your grant caps memory at $m; minting with $m (pass --memory to choose)" >&2; T_MEMORY="$m"
+    over="$over memory $m (default $T_MEMORY),"; fit="$fit --memory $m"
   fi
   if [ -z "$disk$size${BOX_DISK:-}" ] && [ -n "$d" ] \
      && [ "$(size_bytes "$d" || echo 0)" -gt 0 ] && [ "$(size_bytes "$d")" -lt "$(size_bytes "$T_DISK" || echo 0)" ]; then
-    echo "box: note — your grant's disk budget is $d; minting a $d root (pass --disk to choose)" >&2; T_DISK="$d"
+    over="$over disk $d in total (default root $T_DISK),"; fit="$fit --disk <less than $d>"
   fi
+  [ -n "$over" ] || return 0
+  usage_error "your grant caps${over%,} — below box new's defaults. Pass sizes that fit:  box new --name ${name:-<box>}$fit$( [[ "$fit" == *--disk* ]] && echo "   (the disk budget counts every root and image in your project — leave room)")"
 }
 
 box_tier() {
@@ -1032,9 +1035,9 @@ the new pool is confined too.
 limits.memory / limits.cpu / limits.instances, so a tenant can never starve
 the host's other guests; 'none' unsets one. Under a cap Incus refuses any
 instance that does not set limits.cpu and limits.memory itself or by
-profile: 'box new' always stamps both — clamping any resource you did not
-choose to the cap, so a plain 'box new' fits — and a tool minting through the
-API must set them too. A re-run without a flag leaves that setting as it is.
+profile: 'box new' always stamps both, and a tool minting through the API
+must too. When a default would exceed a cap, 'box new' refuses before
+minting and prints the sizes that fit — it never adjusts them for you. A re-run without a flag leaves that setting as it is.
 
 --share GROUP (with --service) makes a SHARED TENANT (#287): GROUP may run
 box itself, and nothing else, as the service, through a visudo-checked
@@ -2453,7 +2456,7 @@ cmd_new() {
   else
     local m extra=()
     load_seed
-    clamp_to_grant_caps
+    check_grant_caps
     m="$(pick_mode)"
     # A server-class template (BOX_REQUIRE_VM, #68) has no weaker mode: the VM
     # is its trust boundary, and its guest runs docker. BOX_NO_CONTAINER_FALLBACK
@@ -2974,7 +2977,9 @@ require_guest_user() {
   [[ "$3" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || usage_error "--user must be a plain Linux user name, got '$3'"
   local rc=0 err
   err="$(incus exec "$1" -- getent passwd "$3" 2>&1 </dev/null)" || rc=$?
-  [ "$rc" -eq 0 ] && return 0
+  # The user's login shell, so --user's environment matches a login (runuser
+  # -u sets USER/LOGNAME/HOME but not SHELL — the rehearsal's #169 diff).
+  if [ "$rc" -eq 0 ]; then guest_shell="${err##*:}"; guest_shell="${guest_shell:-/bin/sh}"; return 0; fi
   # getent's 2 is "not found"; anything else is Incus or the guest failing
   # (a stopped box, an agent not up yet) and must not read as a missing user.
   if [ "$rc" -ne 2 ]; then
@@ -3009,7 +3014,7 @@ cmd_root()  { incus exec "$inst" -- bash -l; }
 cmd_exec() {
   if [ -n "$user" ]; then
     require_guest_user "$inst" "${args[0]}" "$user"
-    incus exec "$inst" -- runuser -u "$user" -- bash -lc 'cd ~ && exec "$@"' _ "${args[@]:1}"
+    incus exec "$inst" -- runuser -u "$user" -- env SHELL="$guest_shell" bash -lc 'cd ~ && exec "$@"' _ "${args[@]:1}"
   else
     incus exec "$inst" -- bash -lc 'cd ~ && exec "$@"' _ "${args[@]:1}"
   fi
