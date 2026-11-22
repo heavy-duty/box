@@ -1155,7 +1155,12 @@ iname_of() { echo "$remote$1"; }   # instance name = box name
 resolve_box() {
   local box="$1" i tag
   i="$(iname_of "$box")"
-  tag="$(incus config get "$i" user.box 2>/dev/null || true)"
+  # EXPANDED (#284): a tool minting through the Incus API inside its granted
+  # project marks its instances by PROFILE (user.box: "1"), and they are boxes
+  # to 'box list' already — its user.box=1 filter is server-side over
+  # expanded_config — so every other verb reads the same view, or 'box rm'
+  # would refuse an instance 'box list' just showed.
+  tag="$(incus config get --expanded "$i" user.box 2>/dev/null || true)"
   # A pre-rename box carries user.claudebox=1 and nothing else. Snapshots of
   # old boxes outlive the release that minted them — the legacy tag is honored
   # forever, or an old box stops being a box at all.
@@ -2702,6 +2707,10 @@ box_provenance() {
   echo
   if [ -n "$created" ] || [ -n "$ver" ]; then
     printf '%-11s%s\n' MINTED "${created:-(time not recorded)} by box ${ver:-unknown}"
+  elif [ "$(box_cfg "$i" user.box)" != 1 ] && [ "$(box_cfg "$i" user.claudebox)" != 1 ]; then
+    # Tagged by a profile and never stamped (#284): a tool minted it through
+    # the API, inside its grant. Say so rather than calling it old.
+    printf '%-11s%s\n' MINTED "minted outside box new (a profile marks it a box; no box stamps)"
   else
     printf '%-11s%s\n' MINTED "(not recorded — this box predates the mint stamp)"
   fi

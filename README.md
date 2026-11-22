@@ -345,6 +345,26 @@ its groups once at start, and one that reaches incus-user before the grant
 creates an unhardened project. This is how other tools mint instances under
 box's contract without admin rights (heavy-duty/handbook proposal 0011).
 
+**A grant's pool and caps** (#282, #283). `--pool NAME --pool-size SIZE`
+gives the grant a btrfs loop pool of its own and confines the project to it,
+so a full tenant pool fails that tenant and never `default`. `--memory`,
+`--cpu` and `--instances` set the project's own `limits.*`, so a tenant can
+never starve the host's other guests (`none` unsets one). Under a cap, Incus
+refuses an instance that sets no `limits.cpu`/`limits.memory`: `box new`
+always stamps both, and so must a tool's own profiles. Revoking a service
+(#285) refuses while a unit still runs as it (stop it first, so it drains),
+purges every profile and custom volume with `--purge`, and keeps the pool
+unless `--purge-pool`.
+
+**A tool's instances can be boxes** (#284). A tool that mints through the
+Incus API inside its grant marks its instances with a profile carrying
+`user.box: "1"`, and box reads that key from the expanded config: `box list`,
+`box info` (which says *minted outside box new*) and `box rm`, run as that
+user, all see them. Setting it is a contract. The profile carries the
+`boxnet` NIC exactly as `box-profile` does (copy its `eth0`), adds no other
+NIC, and attaches no host-path disk. A service grant already refuses host
+paths.
+
 What a restricted user gets is the full contract: same ACL, same DNS
 isolation, same pinned resolver, same port isolation, same box↔box drop —
 and their boxes cannot reach another user's box, which is the same

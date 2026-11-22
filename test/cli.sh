@@ -2874,7 +2874,7 @@ cat > "$CSHIM/incus" <<'SHIM'
 # one probe resolve_box makes so a box called 'work' exists and is ours.
 [ -n "${FAKE_INCUS_LOG:-}" ] && printf 'incus %s\n' "$*" >> "$FAKE_INCUS_LOG"
 case "$*" in
-  "config get work user.box") echo 1 ;;
+  "config get work user.box"|"config get --expanded work user.box") echo 1 ;;
   "exec work -- bash -l")
     if [ "${FAKE_ROOT_STOPPED:-0}" = 1 ]; then
       echo "Error: Instance is not running" >&2
@@ -3218,10 +3218,16 @@ case "$*" in
   # Both 'config get <i> <key>' and its --expanded form (#171 reads what the
   # instance will RUN with, profiles included) — the key is the last word
   # either way, so one arm answers both.
+  # FAKE_CFG_EXPANDED, when set, adds keys only the --expanded view carries —
+  # a profile's user.box (#284).
   "config get "*)
     [ -n "${FAKE_CFG:-}" ] || exit 0
     key="$*"; key="${key##* }"
-    awk -v k="$key" '$1 == k { $1 = ""; sub(/^ /, ""); print }' "$FAKE_CFG" ;;
+    hit="$(awk -v k="$key" '$1 == k { $1 = ""; sub(/^ /, ""); print }' "$FAKE_CFG")"
+    if [ -z "$hit" ] && [ -n "${FAKE_CFG_EXPANDED:-}" ] && [[ "$*" == *--expanded* ]]; then
+      hit="$(awk -v k="$key" '$1 == k { $1 = ""; sub(/^ /, ""); print }' "$FAKE_CFG_EXPANDED")"
+    fi
+    [ -z "$hit" ] || printf '%s\n' "$hit" ;;
   "snapshot list "*)     printf '%s' "${FAKE_SNAPS-}" ;;
   "config device get "*) printf '%s\n' "${FAKE_ROOT_SIZE-}" ;;
   "config show "*)       printf '%s\n' "${FAKE_SHOW-}"; exit "${FAKE_SHOW_RC:-0}" ;;
@@ -4390,6 +4396,17 @@ infobox() {  # infobox <cfg-file> — 'box info work' against a canned config
   env FAKE_INCUS_LOG=/dev/null FAKE_CFG="$1" FAKE_ROW='work,RUNNING,VIRTUAL-MACHINE,0' \
     PATH="$MSHIM:$PATH" "$BOX" info work </dev/null 2>&1
 }
+# A tool's instance, tagged by its profile and never stamped (#284): it
+# resolves as a box, and info says where it came from instead of calling it old.
+PROFILE_ONLY="$(mktemp)"; : >"$PROFILE_ONLY"
+PROFILE_TAG="$(mktemp)"; echo "user.box 1" >"$PROFILE_TAG"
+check "info: an instance tagged only by profile resolves as a box (#284)" \
+  0 "minted outside box new" env FAKE_CFG_EXPANDED="$PROFILE_TAG" bash -c 'infobox_x() { env FAKE_INCUS_LOG=/dev/null FAKE_CFG="$1" FAKE_ROW="work,RUNNING,VIRTUAL-MACHINE,0" PATH="'"$MSHIM"':$PATH" "'"$BOX"'" info work </dev/null 2>&1; }; infobox_x "'"$PROFILE_ONLY"'"'
+check "info: an instance with no user.box on either level is not a box (#284)" \
+  1 "no such box: work" infobox "$PROFILE_ONLY"
+rm -f "$PROFILE_ONLY" "$PROFILE_TAG"
+check "resolve_box: reads user.box from the expanded config (#284)" 0 "" bash -c '
+  awk "/^resolve_box\(\) \{/,/^\}/" "'"$ROOT"'/bin/box" | grep -q "incus config get --expanded \"\$i\" user.box "'
 check "info: surfaces the mint time and the box that minted it (#103)" \
   0 "MINTED     2026-07-19T14:22:07Z by box 0.8.0" infobox "$STAMPED"
 check "info: surfaces the image alias AND what it resolved to (#103)" \
@@ -10065,9 +10082,11 @@ case "${1:-}" in
     exit 0 ;;
   config)
     # resolve_box()'s boundary read, for the single-box path.
+    # Read --expanded since #284; the flag is skipped so both spellings answer.
     if [ "${2:-}" = get ]; then
+      shift 2; [ "${1:-}" != --expanded ] || shift
       for b in ${FAKE_BOXES:-}; do
-        if [ "$b" = "${3:-}" ] && [ "${4:-}" = user.box ]; then echo 1; exit 0; fi
+        if [ "$b" = "${1:-}" ] && [ "${2:-}" = user.box ]; then echo 1; exit 0; fi
       done
     fi
     exit 0 ;;
