@@ -3,6 +3,58 @@
 History before 0.5.0 lives in git and in [drill/RUNS.md](drill/RUNS.md),
 which records not just what changed but what each drill run proved.
 
+## 0.11.0 — 2026-11-23
+
+### Added
+
+- The drill gains phase G, guest interiors: chrony and skew convergence, no tenant, root entry, the `/tmp` cap and ENOSPC, no swap on an unconverged VM, no converger, `--autostart`, `box checkup`, `box restart` and a firewall drop-in, all measured inside a real box (#292).
+- `box new --autostart` (back after a host reboot) and `--require-vm` (refuses container mode outright), the two things box's `staging-box` template carried that no flag could express (#288).
+- Shared tenants: `box grant --service NAME --share GROUP` lets a host group run box, and only box, as the service through a `visudo`-checked sudoers rule; `box --as NAME …` acts as it without a prompt; `--unshare` and revoke remove it (#287).
+- `box doctor` lists every grant with its pool fill, caps, service marker and share group (#287).
+- `docs/plans/multi-owner-boxes.md` plans per-box co-ownership on Incus's authorization scriptlet, and the multiuser drill measures whether a granted user can reach a second project (#287).
+- `box revoke` of a service grant refuses while a systemd unit runs as the service, so it can drain (`--force` overrides). `--purge` also deletes every tool profile and custom volume, and `--purge-pool` deletes the grant's pool, refused while it is shared (#285).
+- `box grant --memory SIZE --cpu N --instances N` caps the granted project with its own `limits.*`, so a tenant cannot starve the host's other guests; `none` unsets a cap (#283).
+- `box new` under a capped grant refuses before minting when a default would exceed a cap, naming the sizes that fit; it never adjusts a size on its own (#283).
+- `box grant --pool NAME --pool-size SIZE` gives a grant its own btrfs loop pool, confines the project to it (every other pool's disk limit is 0), roots its `box-profile` on it, and sizes container roots too (#282).
+- `box grant --service <user>` grants a no-login service account: no home needed, managed disks only, the project marked `user.box.service=true`, refused for an `incus-admin` member (#281).
+- box-firewall reads drop-ins in `/etc/box/firewall.d/*.conf` (`tcp PORT` / `udp PORT`), accepting each port from boxnet to the gateway only; a malformed file fails closed; `box-firewall --supports dropins` detects it, and `box doctor` lists the ports (#279).
+- `box cp [--user U] SRC DST` copies a file or directory between the host and a box, scp-style (one side `<box>:<path>`), over `incus file push/pull` with no SSH, on the restricted tier too (#278).
+- `box cp` follows the entry model: root by default (remote paths against `/root`, files `root:root`); `--user U` resolves against U's passwd home in the box, owns pushed files as U, and refuses a missing U before copying (#278).
+- `box --as NAME cp` uses the plain grammar, directories included: box reads and writes the host side as the member before sudo and hands the service a tar stream; a pulled stream with an unsafe path or an outside symlink is refused (#278).
+- `-` as the host side of `box cp` is stdin or stdout, for one file (#278).
+- `test/cli.sh` asserts that `.github/labeler.yml`, `.github/labels.conf` and `CONTRIBUTING.md` name one set of scope labels, so a scope minted into one of the three and forgotten in the other two reds (#275).
+
+### Changed
+
+- **Breaking:** `box shell` and `box exec` enter as root by default; `--user NAME` enters as a user that exists in the box and is refused otherwise, never falling back to root. Callers that relied on the stamped tenant must pass `--user` (#291).
+- `box exec --user` and `box shell --user` enter through `runuser` with the user's own login shell (or `/bin/sh` for a nologin one), so a role that removes `sudo` cannot break them (#291).
+- `box shell`'s root entry prints a one-line hint naming the user when the box has exactly one regular user (#291).
+- box reads `user.box` from the expanded config, so a tool's profile carrying `user.box: "1"` makes its instances boxes to every verb, and `box info` says "minted outside box new" for one with no stamps (#284).
+- The `scope:cli` and `scope:templates` descriptions in `.github/labels.conf` and `CONTRIBUTING.md` now name the surfaces the path map already labelled: `bin/box`'s test harness, and `profiles/` beside `templates/` (#275).
+
+### Fixed
+
+- `box cp` copies a directory onto a missing path under any name, as scp does, and a `--user` copy owns the parents it creates (#303).
+- The drill gives chrony 300s to step a skewed guest clock back, and a timeout records what chrony saw (#303).
+- The drill's clock probes no longer blind the rest of the guest-interiors phase: chrony is polled until it has a source, and each skew trial runs inside the guest against its monotonic clock, last, with a restart after (#300).
+- A firewall drop-in port now reaches the host from a box: Incus orders ACL drops before allows, so the private-range drop is written around the gateway, and box doctor flags an old ACL; re-run box setup-host (#298).
+- The drill's firewall drop-in probe waits for its listener and names what the box saw, so a slow listener is no longer graded as a dropped port (#296).
+- The drill no longer hides a box that did not come up at the start of the guest-interiors phase: the timeout is one finding with the instance state and console tail, then one restart (#295).
+- The drill accepts an operator with passwordless sudo who is also in a group whose rule asks for a password: it tries `sudo -n true` before `sudo -v`, and still refuses loudly when neither works (#293).
+- `box revoke --purge` restarts incus-user after removing a user's state, which it caches; other users' open `box shell`/`box exec` sessions drop, and new commands reconnect (#285).
+- `box grant` reports the first-contact touch's own error instead of blaming incus-user when the client failed before it connected (#281).
+- `box grant`'s first contact retries a reset incus-user socket twice and names the remedy if it persists (#281).
+- `setup-host` installs `dnsmasq-base`, which boxnet's DHCP and DNS need and Debian cloud images skip as a Recommends, so `box doctor`'s dnsmasq check passes with no manual step (#280).
+- `scope:drill` now attaches to PRs under `drills/`, the release drill records. The path map reached only `drill/`, the rehearsal machinery, so the drill-record PR every release window produces landed with no scope label at all (#275).
+- Make changelog corpus checks survive fragment consumption and future release sections. (#271).
+
+### Removed
+
+- **Breaking:** box creates no users: the seed says `users: []` (not even the distro default), and `box new --user`, `BOX_USER`, `@BOX_USER@` and the `user.box.user` stamp are gone; a converged role creates the tenant (#291).
+- **Breaking:** the seed no longer installs `python3-venv` or `shellcheck` or lays a 4GiB swapfile: they are convergence now, so an unconverged box has neither; `box checkup` notes a `seed/3` VM's missing swap instead of flagging it (#290).
+- **Breaking:** `box tmux` and the seed's `tmux` package are gone; `box tmux` refuses with the replacement, `box exec --user <user> <box> -- tmux new-session -A -s main` on a box whose converger installed tmux (#289).
+- **Breaking:** box has no templates: `templates/staging-box/`, `--template` and `box templates` are gone, each refusing with its replacement (`--size medium --autostart --require-vm`, then converge a role); the seed lives in `seed/` (#288).
+
 ## 0.10.0 — 2026-09-02
 
 ### Added
