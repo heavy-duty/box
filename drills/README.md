@@ -19,15 +19,15 @@ careful whole-version field matching inside one shared file; now it is free.
 
 ## The rc ladder: the record before the merge, the round after it
 
-A release candidate's \`drills/X.Y.Z-rcN.md\` may be a **pending record**: it says
+A release candidate's `drills/X.Y.Z-rcN.md` may be a **pending record**: it says
 what the candidate is, what changed since the last drilled tree, and which phases
 are owed. It is explicitly not a waiver. The gate asks for a record, not a
 result. The round then runs **after the merge, against the published
-\`X.Y.Z-rcN\` tag** (\`git clone --branch X.Y.Z-rcN\`), and its record is appended
-to the same file. The final \`X.Y.Z\` is promoted only once a candidate's round is
+`X.Y.Z-rcN` tag** (`git clone --branch X.Y.Z-rcN`), and its record is appended
+to the same file. The final `X.Y.Z` is promoted only once a candidate's round is
 appended and green. A pending record is never carried forward as evidence for
 the final. This matches heavy-duty/crew's ladder; the ladder itself is
-[\`.ceremony/RELEASES.md\`](../.ceremony/RELEASES.md)'s.
+[`.ceremony/RELEASES.md`](../.ceremony/RELEASES.md)'s.
 
 ## This is not `drill/RUNS.md`
 
