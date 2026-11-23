@@ -741,30 +741,32 @@ fi
 # died inside the 10.0.0.0/8 drop, looking like a dead resolver, not a stale
 # ACL. A conditional 'rule add' cannot converge that (the stale carve-out
 # would survive beside the new one); replacing the ruleset does, idempotently.
+# Incus renders EVERY drop ahead of every allow, whatever order the ACL lists
+# them in (#298, measured: 'acl.boxnet' puts the 10/8 drop above the gateway
+# accept). So the gateway cannot be carved out by an allow: the private block
+# holding it is written as two ranges AROUND it instead. Host-bound traffic to
+# the gateway then reaches box-firewall's nft table, which drops all but DNS,
+# DHCP and the drop-ins (#279) — the layering this ACL always assumed. The
+# /32 allow stays: it is harmless, and box doctor reads it as the carve-out.
+ip2int() { local a b c d; IFS=. read -r a b c d <<<"$1"; echo $(( (a << 24) | (b << 16) | (c << 8) | d )); }
+int2ip() { echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"; }
+acl_drop_dest() {   # acl_drop_dest <cidr> <gw> → the cidr, or two ranges around gw
+  local net="${1%/*}" len="${1#*/}" lo hi g
+  lo="$(ip2int "$net")"; hi=$(( lo + (1 << (32 - len)) - 1 )); g="$(ip2int "$2")"
+  if [ "$g" -lt "$lo" ] || [ "$g" -gt "$hi" ]; then echo "$1"; return; fi
+  local parts=()
+  [ "$g" -gt "$lo" ] && parts+=("$(int2ip "$lo")-$(int2ip $((g - 1)))")
+  [ "$g" -lt "$hi" ] && parts+=("$(int2ip $((g + 1)))-$(int2ip "$hi")")
+  local IFS=,; echo "${parts[*]}"
+}
 incus network acl show box-isolate >/dev/null 2>&1 || incus network acl create box-isolate
-incus network acl edit box-isolate <<ACL
-description: ""
-egress:
-- action: allow
-  destination: $BOX_GW/32
-  state: enabled
-- action: drop
-  destination: 10.0.0.0/8
-  state: enabled
-- action: drop
-  destination: 172.16.0.0/12
-  state: enabled
-- action: drop
-  destination: 192.168.0.0/16
-  state: enabled
-- action: drop
-  destination: 169.254.0.0/16
-  state: enabled
-- action: drop
-  destination: 100.64.0.0/10
-  state: enabled
-ingress: []
-ACL
+{
+  printf 'description: ""\negress:\n- action: allow\n  destination: %s/32\n  state: enabled\n' "$BOX_GW"
+  for blk in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do
+    printf -- '- action: drop\n  destination: %s\n  state: enabled\n' "$(acl_drop_dest "$blk" "$BOX_GW")"
+  done
+  printf 'ingress: []\n'
+} | incus network acl edit box-isolate
 incus network set boxnet security.acls=box-isolate \
   security.acls.default.egress.action=allow \
   security.acls.default.ingress.action=drop
