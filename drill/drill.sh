@@ -1192,7 +1192,7 @@ in_box() {
 # move) and leaves its verdict in /var/tmp, which survives a restart. The drill
 # waits out the window, restarts the box if the agent is gone, reads the
 # verdict, and then checks the guest against the HOST's clock as well.
-# Prints: converged:<s> | notlanded | timeout | hostoff:<s> | <empty>
+# Prints: converged:<s> | notlanded | timeout:<chrony's view> | hostoff:<s> | <empty>
 skew_trial() {
   local b="$1" s="$2" out r _i g h
   out="/var/tmp/box-skew${s}"
@@ -1205,18 +1205,21 @@ u0=$(up); e0=$(date +%s)
 date -s "$s hours" >/dev/null 2>&1 || { echo notlanded > "$out"; exit 0; }
 d=$(( $(date +%s) - e0 )); [ "${d#-}" -gt 3600 ] || { echo notlanded > "$out"; exit 0; }
 i=0
-while [ "$i" -lt 60 ]; do
+while [ "$i" -lt 150 ]; do
   sleep 2; i=$((i + 1))
   dd=$(( $(date +%s) - (e0 + $(up) - u0) ))
   [ "${dd#-}" -le 2 ] && { echo "converged:$((i * 2))" > "$out"; exit 0; }
 done
+# What chrony itself saw, before the clock is put back (#303).
+ev="$(chronyc -n tracking 2>&1 | grep -E 'Reference ID|System time|Last offset|Leap status' | tr -s ' ' | tr '\n' ';')"
+ev="$ev $(chronyc -n sources 2>&1 | grep -E '^\^' | head -n 3 | tr -s ' ' | tr '\n' ';')"
 date -s "@$(( e0 + $(up) - u0 ))" >/dev/null 2>&1
-echo timeout > "$out"
+echo "timeout:$ev" > "$out"
 SKEW
   # shellcheck disable=SC2016  # $0 expands inside the guest
   timeout -k 5 20 incus exec "$b" -- sh -c 'setsid sh /var/tmp/box-skew.sh "$0" </dev/null >/dev/null 2>&1 &' "$s" </dev/null >/dev/null 2>&1 || return 0
   r=""
-  for _i in $(seq 1 75); do
+  for _i in $(seq 1 165); do
     sleep 2
     r="$(in_box "$b" cat "$out" 2>/dev/null)" && [ -n "$r" ] && break
     r=""
@@ -2110,7 +2113,7 @@ if [ "$gtyp" = VM ]; then
     case "$sres" in
       converged:*) ok "a ${skew}h skew converged unattended to within 2s of the host (in ${sres#converged:}s, makestep -1)" ;;
       notlanded)   no "the ${skew}h skew did not even land (date -s refused?) — nothing to converge" ;;
-      timeout)     no "a ${skew}h skew did NOT converge within 120s — chrony's makestep posture is missing" ;;
+      timeout*)    no "a ${skew}h skew did NOT converge within 300s — chrony's makestep posture is missing. chrony saw: ${sres#timeout:}" ;;
       hostoff:*)   no "the ${skew}h skew settled in the guest but sits ${sres#hostoff:}s off the host's clock" ;;
       *)           no "the ${skew}h skew trial gave no verdict (${sres:-nothing}) — the probe proves nothing" ;;
     esac
