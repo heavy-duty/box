@@ -3168,6 +3168,8 @@ case "$*" in
   "exec work -- getent passwd ops") echo "ops:x:1500:1600:Ops:/srv/ops:/bin/bash"; exit 0 ;;
   "exec work -- getent passwd") echo "root:x:0:0:root:/root:/bin/bash"; echo "ops:x:1500:1600:Ops:/srv/ops:/bin/bash"; exit 0 ;;
   "exec work -- getent passwd "*) exit 2 ;;
+  "exec work -- sh -c top="*) echo "${*: -1}/.box-cp.TEST"; [ -z "${FAKE_MADE:-}" ] || echo "$FAKE_MADE"; exit 0 ;;
+  "exec work -- sh -c mv"*) exit 0 ;;
   "exec work -- sh -c "*)
     for d in ${FAKE_REMOTE_DIRS:-}; do [ "$d" = "${*: -1}" ] && { echo d; exit 0; }; done; echo f; exit 0 ;;
   "file pull "*) [ -z "${FAKE_PULL_FAIL:-}" ] || { echo "Error: not found" >&2; exit 1; } ;;&
@@ -3290,13 +3292,22 @@ check "cp --user ghost: ...nothing was copied" 1 "" grep -qE '\[file\]|chown' "$
 check "cp: a ~name remote path is refused, not guessed" 2 "'~name' paths are not expanded" cpbox "$CPL" cp notes.md 'work:~ops/x'
 cpdir_new() { cpbox "$CPL" cp --user ops dist work:proj/dist; }
 check "cp: a directory recursively onto a missing path named for it" 0 "work:/srv/ops/proj/dist" cpdir_new
-check "cp: ...push -r -p into its parent" 0 "" grep -qF "[file] [push] [-r] [-p] [--] [$(cd "$CPW/dist" && pwd)] [work/srv/ops/proj/]" "$CPL"
+check "cp: ...pushed into a private dir under its parent, then moved" 0 "" grep -qF "[file] [push] [-r] [--] [$(cd "$CPW/dist" && pwd)] [work/srv/ops/proj/.box-cp.TEST/]" "$CPL"
 check "cp: ...then the tree is chowned to ops (push -r keeps host owners)" 0 "" \
   grep -qFx 'incus [exec] [work] [--] [chown] [-R] [-h] [--] [1500:1600] [/srv/ops/proj/dist]' "$CPL"
+cpdir_made() { FAKE_MADE=/srv/ops/proj cpbox "$CPL" cp --user ops dist work:proj/dist; }
+check "cp: a --user directory copy chowns the parents it created (#303)" 0 "" \
+  bash -c "$(declare -f cpbox cpdir_made); CPW='$CPW' CPSHIM='$CPSHIM' BOX='$BOX' CPL='$CPL'; cpdir_made >/dev/null && grep -qF '[chown] [-R] [-h] [--] [1500:1600] [/srv/ops/proj]' '$CPL'"
 cpdir_in() { FAKE_REMOTE_DIRS=/root/proj cpbox "$CPL" cp dist/ work:proj; }
 check "cp: a directory onto an existing remote directory lands inside, as root" 0 "work:/root/proj/dist" cpdir_in
 check "cp: ...chowned 0:0" 0 "" grep -qF '[chown] [-R] [-h] [--] [0:0] [/root/proj/dist]' "$CPL"
-check "cp: a directory onto a missing path with another name is refused" 2 "does not exist and is not named 'dist'" cpbox "$CPL" cp dist work:other
+check "cp: a directory onto a missing path with another name BECOMES it, as scp (#303)" 0 "copied dist → work:/root/other" cpbox "$CPL" cp dist work:other
+check "cp: ...pushed into a private dir beside the target, not into the target" 0 "" \
+  grep -qF '[file] [push] [-r] [--] ['"$CPW"'/dist] [work/root/.box-cp.TEST/]' "$CPL"
+# shellcheck disable=SC2016  # the $1/$2/$3 are a literal guest script
+check "cp: ...then moved into place and the private dir removed" 0 "" \
+  grep -qF '[mv -- "$1/$2" "$3" && rmdir -- "$1"] [sh] [/root/.box-cp.TEST] [dist] [/root/other]' "$CPL"
+check "cp: ...and owned by the entry user" 0 "" grep -qF '[chown] [-R] [-h] [--] [0:0] [/root/other]' "$CPL"
 check "cp: box → host, a file" 0 "copied work:/root/out.log → got.log" cpbox "$CPL" cp work:out.log got.log
 check "cp: ...through incus file pull" 0 "" grep -qFx 'incus [file] [pull] [--] [work/root/out.log] [got.log]' "$CPL"
 check "cp: ...and it landed" 0 "pulled" cat "$CPW/got.log"
@@ -7040,7 +7051,14 @@ n=$(( $(cat "$SKT/n") + 1 )); echo "$n" > "$SKT/n"
 [ "${CONVERGE_AFTER:-0}" -gt 0 ] && [ "$n" -ge "$CONVERGE_AFTER" ] && echo 0 > "$SKT/off"
 exit 0
 FAKE
-chmod +x "$SKT/bin/date" "$SKT/bin/sleep"
+cat > "$SKT/bin/chronyc" <<'FAKE'
+#!/bin/sh
+case "$*" in
+  "-n tracking") printf 'Reference ID    : C0A80001 (192.168.0.1)\nSystem time     : 10800.0 seconds fast of NTP time\nLeap status     : Normal\n' ;;
+  "-n sources") printf '^* 192.168.0.1   2   6   377   12   +3h[+3h] +/- 10ms\n' ;;
+esac
+FAKE
+chmod +x "$SKT/bin/date" "$SKT/bin/sleep" "$SKT/bin/chronyc"
 skew_sim() {  # skew_sim <sign> → the verdict file's contents
   echo "100.00 0" > "$SKT/uptime"; echo 0 > "$SKT/off"; echo 0 > "$SKT/n"
   env SKT="$SKT" PATH="$SKT/bin:$PATH" sh "$SKT/skew.sh" "$1"; cat "$SKT/box-skew$1"
@@ -7051,6 +7069,10 @@ check "skew trial: -3h converges too (#300)" 0 "converged:4" \
   env CONVERGE_AFTER=2 bash -c "$(declare -f skew_sim); SKT='$SKT' skew_sim -3"
 check "skew trial: no makestep is a timeout, and the clock is put back (#300)" 0 "timeout" \
   env CONVERGE_AFTER=0 bash -c "$(declare -f skew_sim); SKT='$SKT' skew_sim +3; [ \"\$(cat '$SKT/off')\" = 0 ]"
+check "skew trial: ...and a timeout carries chrony's own view (#303)" 0 "System time : 10800.0 seconds fast" \
+  env CONVERGE_AFTER=0 bash -c "$(declare -f skew_sim); SKT='$SKT' skew_sim +3"
+check "skew trial: the window is 300s, not 120s (#303)" 0 "" \
+  bash -c "$(declare -f skew_sim); SKT='$SKT'; CONVERGE_AFTER=140 skew_sim +3 | grep -qx 'converged:280'"
 check "skew trial: a refused date -s is 'notlanded' (#300)" 0 "notlanded" \
   env SKEW_REFUSE=1 bash -c "$(declare -f skew_sim); SKT='$SKT' skew_sim +3"
 check "drill: the clock probes run after every agent probe in G (#300)" 0 "" \

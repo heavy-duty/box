@@ -670,8 +670,8 @@ from the guest's passwd, and pushed files are owned by NAME and its group —
 also outside that home. ~ is expanded in the box, never on the host.
 
 A directory copied onto an existing directory lands inside it; onto a missing
-path it becomes that path (when pushing, the path must end in the directory's
-own name: proj/dist for ./dist). A host path with a colon is written ./a:b.
+path it becomes that path, under any name, as with scp. A host path with a
+colon is written ./a:b.
 
 '-' as the host side is stdin or stdout, for one file.
 
@@ -3268,17 +3268,34 @@ cmd_cp() {
       # cannot spell alone: an existing remote directory receives the tree;
       # a missing path ending in the tree's own name becomes it.
       local t="${abs%/}"; [ -n "$t" ] || t=/
+      local made=""
       if [ "$(cp_remote_kind "$inst" "$box" "$t")" = d ]; then
-        parent="$t"
-      elif [ "${t##*/}" = "$name" ]; then
-        parent="${t%/*}"; [ -n "$parent" ] || parent=/
+        parent="$t"; target="${parent%/}/$name"
+        cp_incus file push -r -p -- "$srcdir" "$inst${parent%/}/" || exit 1
       else
-        usage_error "cp: $box:$t does not exist and is not named '$name' — push into an existing directory, or name it $box:${t%/*}/$name"
+        # A missing path BECOMES the tree, under any name (scp's rule, #303):
+        # 'push -r' always lands inside its target, so push into a private
+        # directory beside the target in the box, then move the tree into place.
+        parent="${t%/*}"; [ -n "$parent" ] || parent=/
+        target="$t"
+        local rtmp rout
+        # Also report the first ancestor this creates, so the parents a
+        # --user copy makes are that user's, like the file push's -p (#278).
+        # shellcheck disable=SC2016  # expands inside the guest
+        rout="$(incus exec "$inst" -- sh -c 'top=""; d="$1"; while [ ! -e "$d" ]; do top="$d"; d="$(dirname "$d")"; done
+                mkdir -p "$1" && t="$(mktemp -d "$1/.box-cp.XXXXXXXX")" && printf "%s\n%s\n" "$t" "$top"' sh "$parent" </dev/null)" \
+          || die "could not make a private directory under $box:$parent"
+        rtmp="$(printf '%s\n' "$rout" | sed -n 1p)"; made="$(printf '%s\n' "$rout" | sed -n 2p)"
+        [[ "$rtmp" == /*/.box-cp.* ]] || die "could not make a private directory under $box:$parent"
+        cp_incus file push -r -- "$srcdir" "$inst$rtmp/" \
+          || { incus exec "$inst" -- rm -rf -- "$rtmp" </dev/null; exit 1; }
+        # shellcheck disable=SC2016  # expands inside the guest
+        cp_incus exec "$inst" -- sh -c 'mv -- "$1/$2" "$3" && rmdir -- "$1"' sh "$rtmp" "$name" "$target" \
+          || { incus exec "$inst" -- rm -rf -- "$rtmp" </dev/null; exit 1; }
       fi
-      target="${parent%/}/$name"
-      cp_incus file push -r -p -- "$srcdir" "$inst${parent%/}/" || exit 1
-      # push -r keeps the HOST's numeric owners; the tree is the entry user's.
-      cp_incus exec "$inst" -- chown -R -h -- "$uid:$gid" "$target" || exit 1
+      # push -r keeps the HOST's numeric owners; the tree is the entry user's,
+      # and so are any parents this copy created.
+      cp_incus exec "$inst" -- chown -R -h -- "$uid:$gid" "${made:-$target}" || exit 1
     else
       if [[ "$abs" == */ ]] || [ "$(cp_remote_kind "$inst" "$box" "$abs")" = d ]; then
         target="${abs%/}/${hpath##*/}"
