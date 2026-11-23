@@ -1312,7 +1312,12 @@ EOF
   # has to precede the install too: install.sh runs the host setup itself, so
   # the first thing needing root is no longer further down — it is inside the
   # very next command.
-  sudo -v || { echo "drill: need sudo (the host setup installs packages and firewall rules)"; exit 1; }
+  # Either kind of root counts (#293). 'sudo -n true' answers for an unattended
+  # NOPASSWD operator. 'sudo -v' alone prompts for any user that ALSO matches a
+  # password rule (verifypw=all, e.g. the stock %sudo line), and with no
+  # terminal it fails, although every command below would run without a
+  # password. 'sudo -v' remains the interactive fallback.
+  sudo -n true 2>/dev/null || sudo -v || { echo "drill: need sudo (the host setup installs packages and firewall rules)"; exit 1; }
 
   # Pre-setup observations must be READ BEFORE install.sh, because install.sh
   # is now what runs setup-host. Read after it and setup has already had its
@@ -1338,7 +1343,7 @@ EOF
 
   # The first of the two window guards runs HERE, above the rm -rf, and not
   # beside the install below it. It is the whole of the operator's think-time —
-  # the consent prompt and `sudo -v` — and its comment claims it refuses with
+  # the consent prompt and the sudo check — and its comment claims it refuses with
   # the host still untouched; below the rm -rf that sentence was false, because
   # a refusal would already have destroyed the operator's previous install
   # (round 4, #225). Nothing between here and the install reads the checkout, so
