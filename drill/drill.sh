@@ -56,7 +56,7 @@
 #      These were only ever verified against a stub.                        [8]
 #   B. The box surface — the whole CLI, end to end, including the boundary. [47]
 #   G. Guest interiors — what a fresh box holds, measured from inside (#292).
-#      chrony, skew, no tenant, root entry, /tmp, no swap, drop-ins.        [16]
+#      chrony, skew, no tenant, root entry, /tmp, no swap, drop-ins, cp.    [19]
 #   C. Isolation baseline — does the trust boundary actually hold?
 #      (#15 section A)                                                      [9]
 #   E. box expose — a deliberate loopback door, opened and shut (#55).      [7]
@@ -287,10 +287,10 @@ declare -A PHASE_EXPECT=(
             # box no longer installs (6 probes), and the drill box's own two agent
             # probes became two seed-payload probes, which is a swap and not a cut.
             # 0.11.0 (#291) added two to the blank mint: no tenant, and --user refusing.
-  [G]=16    # guest interiors (#292): chrony 1 + skew 2 (all three skipped in
+  [G]=19    # guest interiors (#292): chrony 1 + skew 2 (all three skipped in
             # a container) + no tenant + box root + checkup seed + /tmp cap +
             # ENOSPC + no swap + no converger + no stamp + role refused +
-            # --autostart + restart + drop-in 2
+            # --autostart + restart + drop-in 2 + box cp 3 (#278)
   [C]=9     # C1–C7, plus archive-is-up and the peer clone
   [E]=7     # box expose: add, list, info, the door, per-port, remove, shut
   [D]=0     # D states the settled contract; it judges only a failed baseline
@@ -2068,6 +2068,30 @@ else no "the drop-in port $DP on $GWD was not reachable from the box: the box sa
 kill "$DROPIN_PID" 2>/dev/null; DROPIN_PID=""; rm -rf "$dsrv"
 sudo rm -f /etc/box/firewall.d/cbdrill.conf
 sudo systemctl restart box-firewall.service >/dev/null 2>&1 || sudo /usr/local/sbin/box-firewall >/dev/null 2>&1
+
+# box cp (#278) on a real daemon: what the shims could not confirm — the push
+# lands with the right owner, a pull returns the same bytes, and --user owns
+# the file AND the parents -p made. The user is made for the probe and removed
+# after it; the no-tenant probe above has already run.
+cpd="$(mktemp -d)"; printf 'box-cp-%s\n' "$RUN_ID" > "$cpd/f.txt"
+if box cp "$cpd/f.txt" archive:cpdrill/f.txt >/dev/null 2>&1 \
+   && [ "$(in_box archive stat -c '%U:%G' /root/cpdrill/f.txt)" = root:root ] \
+   && box cp archive:cpdrill/f.txt "$cpd/back.txt" >/dev/null 2>&1 && cmp -s "$cpd/f.txt" "$cpd/back.txt"; then
+  ok "box cp round-trips a file through /root as root:root (#278)"
+else no "box cp did not round-trip a file through /root as root:root"; fi
+mkdir -p "$cpd/tree/sub"; echo x > "$cpd/tree/sub/y"
+if box cp "$cpd/tree" archive:cptree >/dev/null 2>&1 \
+   && [ "$(in_box archive sh -c 'find /root/cptree -not -user root | wc -l')" = 0 ] \
+   && [ "$(in_box archive cat /root/cptree/sub/y)" = x ]; then
+  ok "box cp copies a directory recursively, every entry root-owned (#278)"
+else no "box cp did not copy a directory recursively with root ownership"; fi
+in_box archive useradd -m -s /bin/bash cpprobe >/dev/null 2>&1
+if box cp --user cpprobe "$cpd/f.txt" archive:deep/er/f.txt >/dev/null 2>&1 \
+   && [ "$(in_box archive sh -c 'stat -c %U /home/cpprobe/deep /home/cpprobe/deep/er /home/cpprobe/deep/er/f.txt | sort -u')" = cpprobe ]; then
+  ok "box cp --user lands in the user's home, owning the file and the parents it made (#278)"
+else no "box cp --user did not leave the file and its new parents owned by the user: $(in_box archive sh -c 'stat -c "%U %n" /home/cpprobe/deep /home/cpprobe/deep/er /home/cpprobe/deep/er/f.txt 2>&1' | tr '\n' ' ')"; fi
+in_box archive sh -c 'userdel -r cpprobe; rm -rf /root/cpdrill /root/cptree' >/dev/null 2>&1
+rm -rf "$cpd"
 
 # The clock probes run LAST in G, after every probe that needs the agent (#300):
 # a ±3h step of the guest clock drops the incus-agent connection until the box

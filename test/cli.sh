@@ -7969,14 +7969,14 @@ check "probe ledger: the extracted block is valid bash" 0 "" bash -n "$LEDGERFN"
 # script around it, so the harness supplies it, exactly as the drill does.
 led() { bash -c "set -u; findings=(); . '$LEDGERFN'; $1"; }
 # A complete run: every phase emits what it declared.
-FULL='PHASE_RAN=([I]=1 [A]=8 [B]=47 [G]=16 [C]=9 [E]=7 [D]=0 [T]=1)'
+FULL='PHASE_RAN=([I]=1 [A]=8 [B]=47 [G]=19 [C]=9 [E]=7 [D]=0 [T]=1)'
 
 # shellcheck disable=SC2016  # the snippet is evaluated by led(), not here
-check "probe ledger: the declared total is 89" 0 "[89]" led 'printf "[%s]" "$(ledger_declared)"'
+check "probe ledger: the declared total is 92" 0 "[92]" led 'printf "[%s]" "$(ledger_declared)"'
 # The number CONTRIBUTING and drills/README.md have quoted all along with
 # nothing checking it. If a phase gains probes, both move together or this reds.
 check "probe ledger: ...which is the contract CONTRIBUTING states" 0 "" \
-  grep -qF '89-probe' "$ROOT/CONTRIBUTING.md"
+  grep -qF '92-probe' "$ROOT/CONTRIBUTING.md"
 # The README quotes the total too, and it was the ONE copy nothing checked —
 # so it sat at "84 checks, 84 passing" through a cut that moved every other
 # copy to 81. Driven off ledger_declared() like the rest, rather than a
@@ -8023,25 +8023,25 @@ check "probe ledger: ...and the total the README advertises (#214)" 0 "" \
 # The guard's own test, on the axis the round moved it: the denominator is
 # pinned and the numerator is free, so a run that HAD a failure is reportable.
 RQPROBE="$(mktemp)"
-printf 'currently **89 checks, 88 passing**\n' > "$RQPROBE"
-check "probe ledger: ...and a run with a failure is still quotable, 88/89" 0 "" \
+printf 'currently **92 checks, 91 passing**\n' > "$RQPROBE"
+check "probe ledger: ...and a run with a failure is still quotable, 91/92" 0 "" \
   readme_quotes_the_total "$RQPROBE"
 printf 'currently **84 checks, 84 passing**\n' > "$RQPROBE"
 check "probe ledger: ...while the drift that started this, 84/84, reds" 1 "advertises 84" \
   readme_quotes_the_total "$RQPROBE"
-printf 'currently **89 checks, 99 passing**\n' > "$RQPROBE"
+printf 'currently **92 checks, 99 passing**\n' > "$RQPROBE"
 check "probe ledger: ...and so does passing more probes than exist" 1 "more probes than exist" \
   readme_quotes_the_total "$RQPROBE"
 # The second copy, which 'head -1' would have read straight past: the first
 # total is correct here and the guard must still red.
-printf 'currently **89 checks, 88 passing**\nand elsewhere **84 checks, 84 passing**\n' > "$RQPROBE"
+printf 'currently **92 checks, 91 passing**\nand elsewhere **84 checks, 84 passing**\n' > "$RQPROBE"
 check "probe ledger: ...and a second total nothing would have read reds too" 1 "quotes 2 totals" \
   readme_quotes_the_total "$RQPROBE"
 rm -f "$RQPROBE"
 
 check "probe ledger: a complete run is short in nothing" 0 "[]" \
   led "$FULL; printf '[%s]' \"\$(ledger_short)\""
-check "probe ledger: a complete run's floor is the declared total" 0 "[89]" \
+check "probe ledger: a complete run's floor is the declared total" 0 "[92]" \
   led "$FULL; printf '[%s]' \"\$(ledger_expected)\""
 
 # THE regression. A phase that never executed used to be invisible: the pass
@@ -8057,7 +8057,7 @@ check "probe ledger: overshooting a phase is not a shortfall" 0 "[]" \
 
 # A declared skip is honest — it lowers the expectation by exactly its probes
 # and says so. The whole point is that the floor is never tuned down silently.
-check "probe ledger: a declared skip lowers the floor by its probes" 0 "[80]" \
+check "probe ledger: a declared skip lowers the floor by its probes" 0 "[83]" \
   led "$FULL; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; printf '[%s]' \"\$(ledger_expected)\""
 check "probe ledger: ...so a declared skip is not a shortfall" 0 "[]" \
   led "$FULL; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; printf '[%s]' \"\$(ledger_short)\""
@@ -8185,39 +8185,39 @@ summary_lacks() {   # 0 when the composed run does NOT say $1
   local needle="$1"; shift
   ! run_summary "$1" 2>&1 | grep -qF -e "$needle"
 }
-COMPLETE="$FULL; pass=89; fail=0"
+COMPLETE="$FULL; pass=92; fail=0"
 
-check "drill summary: a complete run reports 89/89 and EXITS 0" 0 "89/89 passed, 0 failed" \
+check "drill summary: a complete run reports 92/92 and EXITS 0" 0 "92/92 passed, 0 failed" \
   run_summary "$COMPLETE"
 
 # THE regression, end to end. Phase C never executed: 62 verdicts, none of them
 # failing, and the drill used to leave here 0 with "62 passed, 0 failed" on the
 # line an operator transcribes into drills/<version>.md as proof.
 check "drill summary: a phase that never ran EXITS NON-ZERO" 1 "the drill ran SHORT:" \
-  run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
+  run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=83"
 check "drill summary: ...naming the short phase, against the full denominator" 1 \
-  "short in: C(0/9)" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
-check "drill summary: ...and the record carries 80/89, not a clean 80" 1 \
-  "80/89 passed, 1 failed" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
+  "short in: C(0/9)" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=83"
+check "drill summary: ...and the record carries 83/92, not a clean 83" 1 \
+  "83/92 passed, 1 failed" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=83"
 # The verdict names both roads to a short phase, not just the commoner one.
 check "drill summary: ...and does not diagnose 'never ran' as the only cause" 1 \
-  "or failed before emitting the rest" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
+  "or failed before emitting the rest" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=83"
 
 # A DECLARED skip is the line between honest and tuned-down: same 62 verdicts,
 # but the run said which nine it was not going to emit, and why.
 check "drill summary: a declared skip lowers the floor and EXITS 0" 0 \
-  "80/80 passed, 0 failed" \
-  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=80"
+  "83/83 passed, 0 failed" \
+  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=83"
 check "drill summary: ...and the SKIP survives into the findings block" 0 \
   "SKIP: no isolation stack" \
-  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=80"
+  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=83"
 
 # The other road to non-zero: nothing short, one thing genuinely failed. Both
 # roads have to work, and the second must not be reported as the first.
 check "drill summary: a complete run with one real FAIL EXITS NON-ZERO" 1 \
-  "88/89 passed, 1 failed" run_summary "$COMPLETE; pass=88; fail=1"
+  "91/92 passed, 1 failed" run_summary "$COMPLETE; pass=91; fail=1"
 check "drill summary: ...and is not mislabelled as a short run" 0 "" \
-  summary_lacks "the drill ran SHORT:" "$COMPLETE; pass=88; fail=1"
+  summary_lacks "the drill ran SHORT:" "$COMPLETE; pass=91; fail=1"
 
 # ---------------------------------------------------------------------------
 # The record emitter (#152). drills/README.md asks a record for six things and
@@ -8619,7 +8619,7 @@ check "drill record: a tree dirtied AFTER the install records the clean ref" 0 \
 # --- the record itself ------------------------------------------------------
 # A finished drill, pinned so every field is assertable. record_collect fills
 # only what is not already set, which is what lets a test pin the world away.
-RECSTATE="PHASE_RAN=([I]=1 [A]=8 [B]=47 [G]=16 [C]=9 [E]=7 [D]=0 [M]=10 [T]=1)
+RECSTATE="PHASE_RAN=([I]=1 [A]=8 [B]=47 [G]=19 [C]=9 [E]=7 [D]=0 [M]=10 [T]=1)
 REC_VERSION=9.9.9; REC_DATE=2026-07-21; REC_HOST='bare Debian 13, Incus 6.0.2'
 REC_RUN_ID=drill-9.9.9-20260721-01; REC_TREE_SHA=abc1234
 REC_TREE_REF=release/9.9.9; REC_TREE_REPO=heavy-duty/box
@@ -8629,7 +8629,7 @@ emit() {   # emit <state> → the record that state produces, on stdout
   rec "$RECSTATE; $1; record_write '$RECOUT'" >/dev/null 2>&1
   cat "$RECOUT" 2>/dev/null
 }
-CLEAN='pass=89; fail=0'
+CLEAN='pass=92; fail=0'
 
 # drills/README.md:34-42 asks for six things. One check each, because a record
 # missing one of them is the hand-transcription this replaces, reintroduced.
@@ -8665,15 +8665,15 @@ record_invocation_names_a_tree() { emit "$1" | grep -qE '^`.*--(repo|ref) '; }
 check "drill record: ...and names no repo or ref in it, there being none to get wrong" \
   1 "" record_invocation_names_a_tree "$CLEAN"
 check "drill record: gives the numbers and the wall clock" 0 \
-  "**89/89 passed, 0 failed.** 41 minutes wall clock." emit "$CLEAN"
+  "**92/92 passed, 0 failed.** 41 minutes wall clock." emit "$CLEAN"
 check "drill record: carries the per-phase ledger a single total cannot say" 0 \
   "B 47/47" emit "$CLEAN"
 check "drill record: states the floor and the table's total as two facts" 0 \
-  "Probe floor: 89 expected this run; the table declares 89." emit "$CLEAN"
+  "Probe floor: 92 expected this run; the table declares 92." emit "$CLEAN"
 # DRILL_EXPECT can raise the floor above the table, and the record must not read
 # that as an error — the operator is deliberately demanding more than the table.
 check "drill record: ...which stays readable when DRILL_EXPECT raises the floor" 0 \
-  "Probe floor: 100 expected this run; the table declares 89." \
+  "Probe floor: 100 expected this run; the table declares 92." \
   emit "DRILL_EXPECT=100; $CLEAN"
 # The record is pasted into a file and read months later. Escape codes in it are
 # the peculiar thing this issue found: every script emitted ANSI unconditionally.
@@ -8696,19 +8696,19 @@ check "drill record: ...and says the judgement is the operator's to write" 0 \
 # 62 of 71 and failed none is not "62/62 passed" — and the record is precisely
 # where that fraction used to get written down as proof a release was drilled.
 check "drill record: a short run's denominator is the FLOOR, not what ran" 0 \
-  "**80/89 passed" emit "pass=80; fail=0; PHASE_RAN[C]=0"
+  "**83/92 passed" emit "pass=83; fail=0; PHASE_RAN[C]=0"
 check "drill record: ...and the short phase is named in it" 0 "C 0/9" \
-  emit "pass=80; fail=0; PHASE_RAN[C]=0"
+  emit "pass=83; fail=0; PHASE_RAN[C]=0"
 # A DECLARED skip is the honest half: the floor moves, and the record says which
 # probes were not expected and why — recorded as skipped, never as passing.
 check "drill record: a declared skip lowers the record's denominator" 0 \
-  "**80/80 passed" emit "pass=80; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
+  "**83/83 passed" emit "pass=83; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
 check "drill record: ...and the skip is recorded AS a skip, beside the failures" 0 \
   "- SKIP: no isolation stack" \
-  emit "pass=80; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
+  emit "pass=83; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
 check "drill record: ...and the waived probes are visible in the ledger line" 0 \
   "9 waived by declared skips" \
-  emit "pass=80; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
+  emit "pass=83; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
 check "drill record: failures land in it verbatim, uncoloured" 0 "- FAIL: the boundary held open" \
   emit "pass=86; fail=1; no 'the boundary held open' >/dev/null"
 check "drill record: a clean run says so rather than leaving a bare heading" 0 \
@@ -8749,7 +8749,7 @@ run_emit() {   # run_emit <state> — EXIT STATUS is the drill's own
 }
 check "drill emit: a clean run writes the record and still EXITS 0" 0 \
   "record written:" run_emit "$CLEAN"
-check "drill emit: ...and the file on disk is the record" 0 "**89/89 passed, 0 failed.**" \
+check "drill emit: ...and the file on disk is the record" 0 "**92/92 passed, 0 failed.**" \
   cat "$RECOUT"
 check "drill emit: ...pinned to the run ID the drill announced at install time" 0 \
   "drill-9.9.9-20260721-01" cat "$RECOUT"
@@ -8767,15 +8767,15 @@ check "drill: ...and no phase header sends the operator to the closed audit" 1 "
 # before that `no` fires would put a clean sweep in the record on a short run,
 # which is the defect #153 closed.
 check "drill emit: a short run EXITS NON-ZERO with a record written" 1 \
-  "record written:" run_emit "pass=80; fail=0; PHASE_RAN[C]=0"
+  "record written:" run_emit "pass=83; fail=0; PHASE_RAN[C]=0"
 check "drill emit: ...and the record it wrote carries the shortfall, not a sweep" 0 \
   "FAIL: the drill ran SHORT:" cat "$RECOUT"
-check "drill emit: ...against the full denominator, 80/89" 0 "**80/89 passed" cat "$RECOUT"
+check "drill emit: ...against the full denominator, 80/89" 0 "**83/92 passed" cat "$RECOUT"
 check "drill emit: a short run has no unattributed summary probe" 1 "" \
   grep -q 'unattributed' "$RECOUT"
 short_ledgers_agree() {
   local out terminal emitted
-  out="$(run_emit 'pass=80; fail=0; PHASE_RAN[C]=0')"
+  out="$(run_emit 'pass=83; fail=0; PHASE_RAN[C]=0')"
   terminal="$(printf '%s\n' "$out" | grep '^  probes')"
   # shellcheck disable=SC2016
   emitted="$(sed -n '/^```$/,/^```$/p' "$RECOUT" | grep '^  probes')"

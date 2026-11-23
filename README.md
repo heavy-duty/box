@@ -949,7 +949,7 @@ drill installs the whole stack, mints the seed cold (box has one since
 0.11.0, #288), snapshots and
 clones, probes every boundary from inside the boxes, opens and shuts the
 `expose` door (and checks the contract survives it), and removes what it
-minted — currently **89 checks, 71 passing** in the last record (0.10.0's, taken before 0.11.0 added the guest interiors and the drop-in probes, #292). [drill/RUNS.md](drill/RUNS.md) is the full
+minted — currently **92 checks, 79 passing** in the last record (0.11.0-rc1's, of the 89 it had; #278 then added three `box cp` probes, and #300 fixed the clock probes that blinded the rest of the guest-interiors phase). [drill/RUNS.md](drill/RUNS.md) is the full
 history, including every trap that fooled a run into a wrong verdict.
 
 ### Run the drill yourself
