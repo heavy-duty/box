@@ -71,15 +71,25 @@ check "unknown flag on list exits 2"           2 "unknown option"   "$BOX" list 
 check "--name with no value exits 2"           2 "--name needs a value" "$BOX" new --name
 # #159's hard cut is resolved before the Incus preflight, so every retired
 # spelling teaches its replacement even on a machine with no daemon.
-check "new: --template blank hard-cuts to the argumentless blank mint (#159)" 2 \
-  "omit --template" "$BOX" new --name work --template blank
-check "new: --template tenant hard-cuts the internal seed (#159)" 2 \
-  "omit --template, that IS the default mint" \
-  "$BOX" new --name work --template tenant
-for retired in claude-box codex-box grok-box kimi-box; do
-  check "new: --template $retired hard-cuts to a blank mint (#159, #214)" 2 \
-    "every box is blank now" "$BOX" new --name work --template "$retired"
+# The template axis is gone (#288): EVERY --template spelling refuses with
+# the replacement, never "no such template".
+for retired in blank tenant claude-box codex-box grok-box kimi-box anything; do
+  check "new: --template $retired is refused — box has no templates (#288)" 2 \
+    "box has no templates since 0.11.0" "$BOX" new --name work --template "$retired"
 done
+check "new: ...and the refusal says to omit it and converge a role" 2 \
+  "omit --template" "$BOX" new --name work --template claude-box
+check "new: --template staging-box teaches the flags that replace it (#288)" 2 \
+  "box new --name staging-box --size medium --autostart --require-vm" \
+  "$BOX" new --name work --template staging-box
+check "box tmux is refused, carrying the replacement (#289)" 2 \
+  "box exec --user <user> <box> -- tmux new-session -A -s main" "$BOX" tmux work
+check "box tmux: ...and the reason the verb existed (SIGHUP)" 2 "SIGHUP" "$BOX" tmux work
+# shellcheck disable=SC2016  # $1 expands in the child shell, by design
+check "box templates is refused, naming where roles live (#288)" 2 \
+  "box has no templates since 0.11.0" "$BOX" templates
+check "new: --from refuses --autostart (the source's boot demands ride along)" 2 \
+  "drop --autostart/--require-vm" "$BOX" new --name copy --from work --autostart
 # --role is a HARD CUT and refuses LOUDLY (#214): unrecognized would be an
 # "unknown option", which teaches nothing to the operator who typed the flag
 # this release removed. Every arm of the message is asserted, because the
@@ -95,10 +105,10 @@ check "new: --role's refusal keeps --size in the taught line (#214)" 2 \
   "box new --name work --size medium" "$BOX" new --name work --role claude-box
 check "new: --role refuses with no value too (#214)" 2 \
   "--role is gone" "$BOX" new --name work --role
-check "new: --user is a plain Linux user name (#159)" 2 \
-  "--user must be a plain Linux user name" "$BOX" new --name work --user 'bad user'
-check "new: --user rides the default mint, not a dedicated template (#214)" 2 \
-  "declares its own user" "$BOX" new --name work --template staging-box --user dev
+check "new: --user is refused — box creates no users (#291)" 2 \
+  "box new creates no users since 0.11.0" "$BOX" new --name work --user claude
+check "new: ...and the refusal says how to enter as one later" 2 \
+  "box shell --user claude <box>" "$BOX" new --name work --user claude
 check "new: --from keeps named sizes on the fresh-mint side (#159)" 2 \
   "explicit --cpu/--memory/--disk overrides, not --size" \
   "$BOX" new --name copy --from work --size medium
@@ -118,10 +128,10 @@ checkup_row() {
   case "$row" in *"fn:cmd_checkup"*) printf checkup ;; *) return 1 ;; esac
 }
 check "checkup: is a separate command from doctor" 0 "checkup" checkup_row
-check "checkup: current mints carry the #178 seed generation" 0 "user.box.seed" \
+check "checkup: current mints carry a seed generation" 0 "user.box.seed" \
   grep -F 'user.box.seed=' "$BOX"
-check "checkup: tenant is the #178 generation" 0 "tenant/2" \
-  grep -F 'seed_generation=tenant/2' "$BOX"
+check "checkup: 0.11.0 mints are the seed/3 generation (#290, #291)" 0 "seed/3" \
+  grep -F 'seed_generation=seed/3' "$BOX"
 
 CHECKUP="$ROOT/guest/checkup.sh"
 check "checkup: guest probe exists" 0 "" test -f "$CHECKUP"
@@ -212,7 +222,7 @@ run_checkup_command() {
 check "checkup: full CLI resolves the box and streams the guest probe" 0 \
   "8.0 GiB available of 40.0 GiB" run_checkup_command
 
-check "checkup: legacy VM names missing swap and #178's seed as the fix" 1 "seed #178" \
+check "checkup: legacy VM names missing swap and #178's seed as the fix" 1 "tenant seed of #178" \
   run_checkup vm unknown
 check "checkup: legacy VM names the 50%-of-RAM /tmp finding" 1 "50% of VM memory" \
   run_checkup vm unknown
@@ -241,7 +251,16 @@ checkup_current_vm_quiet() {
   local out; out="$(checkup_current_vm)"
   ! grep -q "FIX" <<<"$out" && grep -q "4.0 GiB" <<<"$out" && grep -q "1.0 GiB" <<<"$out"
 }
-check "checkup: current VM seed is quiet on swap and /tmp" 0 "" checkup_current_vm_quiet
+check "checkup: a tenant/2 VM with its swapfile is quiet on swap and /tmp" 0 "" checkup_current_vm_quiet
+# seed/3 (#290): box lays no swap, so a VM with none is a NOTE, never a FIX.
+checkup_seed3_no_swap() {
+  local out rc=0
+  out="$(FAKE_TMP_SIZE=1073741824 FAKE_SWAP_TOTAL=0 run_checkup vm seed/3)" || rc=$?
+  [ "$rc" -eq 0 ] && grep -q '^NOTE.*lays no swap since 0.11.0' <<<"$out" && ! grep -q '^FIX' <<<"$out"
+}
+check "checkup: a seed/3 VM with no swap is a note, not a fault (#290)" 0 "" checkup_seed3_no_swap
+checkup_tenant2_no_swap() { FAKE_TMP_SIZE=1073741824 FAKE_SWAP_TOTAL=0 run_checkup vm tenant/2; }
+check "checkup: a tenant/2 VM with no swap is still a fault" 1 "missing swap" checkup_tenant2_no_swap
 checkup_current_small_vm_quiet() {
   local out
   out="$(FAKE_MEM_TOTAL=2147483648 FAKE_MEM_AVAILABLE=1073741824 \
@@ -326,25 +345,43 @@ rm -rf "$CKWORK"
 # marker files.
 # ---------------------------------------------------------------------------
 EXECFN="$(mktemp)"
-grep '^cmd_exec()' "$BOX" > "$EXECFN"
+awk '/^cmd_exec\(\) \{/,/^\}/' "$BOX" > "$EXECFN"
 check "box exec: cmd_exec extracted (guards the grep)" 0 "exec \"\$@\"" cat "$EXECFN"
 check "box exec: extracted function is valid bash" 0 "" bash -n "$EXECFN"
 check "box exec: command argv never rides sudo -i" 1 "" grep -q -- ' -i ' "$EXECFN"
+check "box exec: --user enters through runuser, never guest sudo (#291 review)" 1 "" grep -q 'sudo' "$EXECFN"
 
 exec_fixture() { # exec_fixture <command> [arg...]
   bash -c '
     set -e
     . "$0"
-    box_user() { printf "%s\n" fixture-user; }
+    require_guest_user() { guest_shell=/bin/bash; }
+    # Strict: an && chain does not abort under set -e, so a mismatch must exit
+    # explicitly or the fixture passes by running the payload anyway.
     incus() {
-      [ "$1" = exec ] && [ "$2" = fixture ] && [ "$3" = -- ]
+      if ! { [ "$1" = exec ] && [ "$2" = fixture ] && [ "$3" = -- ]; }; then echo "BAD WRAPPER: $*" >&2; exit 9; fi
       shift 3
-      [ "$1" = sudo ] && [ "$2" = -u ] && [ "$3" = fixture-user ] &&
-        [ "$4" = -H ]
-      shift 4
+      if ! { [ "$1" = runuser ] && [ "$2" = -u ] && [ "$3" = fixture-user ] && [ "$4" = -- ] && [ "$5" = env ] && [ "$6" = SHELL=/bin/bash ]; }; then echo "BAD WRAPPER: $*" >&2; exit 9; fi
+      shift 6
       "$@"
     }
-    inst=fixture
+    inst=fixture; user=fixture-user
+    args=(fixture "$@")
+    cmd_exec
+  ' "$EXECFN" "$@"
+}
+# The ROOT path (#291's default): no sudo at all, the same argv-preserving
+# bash -lc wrapper, straight through incus exec.
+exec_root_fixture() {
+  bash -c '
+    set -e
+    . "$0"
+    incus() {
+      if ! { [ "$1" = exec ] && [ "$2" = fixture ] && [ "$3" = -- ] && [ "$4" = bash ] && [ "$5" = -lc ]; }; then echo "BAD WRAPPER: $*" >&2; exit 9; fi
+      shift 3
+      "$@"
+    }
+    inst=fixture; user=""
     args=(fixture "$@")
     cmd_exec
   ' "$EXECFN" "$@"
@@ -362,6 +399,13 @@ check "box exec: multiline step two was not fused into set argv" 0 "" \
   test -f "$EXEC_STATE/step-two"
 check "box exec: plain argv remains separate" 0 "one argument" \
   exec_fixture printf '%s\n' "one argument"
+rm -f "$EXEC_STATE"/step-*
+check "box exec (root default, #291): a multiline body executes each statement" 0 "" \
+  exec_root_fixture bash -lc "$exec_body"
+check "box exec (root default): step one ran" 0 "" test -f "$EXEC_STATE/step-one"
+check "box exec (root default): step two ran" 0 "" test -f "$EXEC_STATE/step-two"
+check "box exec (root default): plain argv remains separate" 0 "one argument" \
+  exec_root_fixture printf '%s\n' "one argument"
 rm -rf "$EXEC_STATE"
 rm -f "$EXECFN"
 
@@ -548,58 +592,54 @@ rm -rf "$ARTWORK"
 # not KEY="value" fails HERE, not at mint time on a host.
 # ---------------------------------------------------------------------------
 TPLFN="$(mktemp)"
-awk '/^load_template\(\) \{/,/^\}/' "$ROOT/bin/box" > "$TPLFN"
-check "load_template: extracted from bin/box (guards the awk)" 0 "unknown key" cat "$TPLFN"
-check "load_template: the extracted function is valid bash"    0 "" bash -n "$TPLFN"
+awk '/^load_seed\(\) \{/,/^\}/' "$ROOT/bin/box" > "$TPLFN"
+check "load_seed: extracted from bin/box (guards the awk)" 0 "unknown key" cat "$TPLFN"
+check "load_seed: the extracted function is valid bash"    0 "" bash -n "$TPLFN"
 
-# tpl <root> <template> — run the real parser against <root>/templates/, print
-# what it resolved. $0 carries the extracted-function file into the subshell.
+# tpl <root> [autostart require_vm] — run the real parser against
+# <root>/seed/box.env (#288: box has one seed), print what it resolved. $0
+# carries the extracted-function file into the subshell.
 tpl() {
-  root="$1" bash -c '
+  root="$1" autostart="${2:-0}" require_vm="${3:-0}" bash -c '
     die() { echo "box: $*" >&2; exit 1; }
-    . "$0"; load_template "$1"
-    printf "IMAGE=%s USER=%s REQUIRE_VM=%s NO_FALLBACK=%s AUTOSTART=%s\n" \
-      "$T_IMAGE" "$T_USER" "$T_REQUIRE_VM" "$T_NO_CONTAINER_FALLBACK" \
+    . "$0"; load_seed
+    printf "IMAGE=%s REQUIRE_VM=%s NO_FALLBACK=%s AUTOSTART=%s\n" \
+      "$T_IMAGE" "$T_REQUIRE_VM" "$T_NO_CONTAINER_FALLBACK" \
       "$T_AUTOSTART"
-  ' "$TPLFN" "$2"
+  ' "$TPLFN"
 }
 
-# The allowlist itself is load-bearing: a template must not be able to grow a
+# The allowlist itself is load-bearing: the seed must not be able to grow a
 # network key, and the required keys must still be required. Fixture-driven,
 # against a throwaway root — exactly the dies a green parse cannot prove.
-EVILROOT="$(mktemp -d)"; mkdir -p "$EVILROOT/templates/evil"
-printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_USER="dev"\nBOX_NETWORK="lan"\n' \
-  > "$EVILROOT/templates/evil/box.env"
-check "load_template: an unknown key dies (no template grows a network)" 1 "unknown key" \
-  tpl "$EVILROOT" evil
-printf 'BOX_USER="dev"\n' > "$EVILROOT/templates/evil/box.env"
-check "load_template: a missing BOX_IMAGE dies" 1 "required" tpl "$EVILROOT" evil
-# The boot demands' green path, kept as a fixture even now that staging sets
-# them in-tree: fixtures survive a template rename, and a deleted case arm
-# must fail HERE, through the real parser, not at first use on a host.
-mkdir -p "$EVILROOT/templates/server"
-printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_USER="ops"\nBOX_REQUIRE_VM="1"\nBOX_AUTOSTART="1"\n' \
-  > "$EVILROOT/templates/server/box.env"
-check "load_template: REQUIRE_VM and AUTOSTART round-trip (accepted + surfaced)" \
-  0 "REQUIRE_VM=1 NO_FALLBACK= AUTOSTART=1" tpl "$EVILROOT" server
-# The softer demand is independently parsed. Keeping it a second boolean key
-# means a typo cannot quietly degrade into an unpinned template (#175).
-mkdir -p "$EVILROOT/templates/tenant-vm-default"
-printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_USER="dev"\nBOX_NO_CONTAINER_FALLBACK="1"\n' \
-  > "$EVILROOT/templates/tenant-vm-default/box.env"
-check "load_template: NO_CONTAINER_FALLBACK round-trips (accepted + surfaced)" \
-  0 "REQUIRE_VM= NO_FALLBACK=1" tpl "$EVILROOT" tenant-vm-default
+EVILROOT="$(mktemp -d)"; mkdir -p "$EVILROOT/seed"
+printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_NETWORK="lan"\n' \
+  > "$EVILROOT/seed/box.env"
+check "load_seed: an unknown key dies (the seed never grows a network)" 1 "unknown key" \
+  tpl "$EVILROOT"
+printf 'BOX_DESCRIPTION="x"\n' > "$EVILROOT/seed/box.env"
+check "load_seed: a missing BOX_IMAGE dies" 1 "required" tpl "$EVILROOT"
+printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_USER="dev"\n' > "$EVILROOT/seed/box.env"
+check "load_seed: BOX_USER is refused by name — box creates no users (#291)" 1 "unknown key 'BOX_USER'" tpl "$EVILROOT"
+rm -rf "$EVILROOT/seed"; check "load_seed: a missing seed says to re-run install.sh" 1 "re-run install.sh" tpl "$EVILROOT"
+mkdir -p "$EVILROOT/seed"
+# The boot demands as FLAGS (#288): --autostart and --require-vm set what the
+# staging template's keys used to, through the same T_* the mint reads.
+printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_NO_CONTAINER_FALLBACK="1"\n' \
+  > "$EVILROOT/seed/box.env"
+check "load_seed: --autostart and --require-vm surface as the boot demands (#288)" \
+  0 "REQUIRE_VM=1 NO_FALLBACK=1 AUTOSTART=1" tpl "$EVILROOT" 1 1
+check "load_seed: without the flags the seed's own soft demand stands" \
+  0 "REQUIRE_VM= NO_FALLBACK=1 AUTOSTART=" tpl "$EVILROOT"
 # BOX_BOOTSTRAP_ROLE (#81) named the role box auto-ran after mint. #214 cut the
 # hook it fed, so the key is no longer in the allowlist and a box.env carrying
-# it now dies BY NAME at parse time — the loud shape, not a silently ignored
-# key that would leave an operator believing their template still converges.
-mkdir -p "$EVILROOT/templates/tenant"
-printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_USER="claude"\nBOX_BOOTSTRAP_ROLE="claude"\n' \
-  > "$EVILROOT/templates/tenant/box.env"
-check "load_template: BOX_BOOTSTRAP_ROLE is refused by name (#214)" \
-  1 "unknown key 'BOX_BOOTSTRAP_ROLE'" tpl "$EVILROOT" tenant
-check "load_template: ...and the refusal says a template does not converge (#214)" \
-  1 "none for convergence" tpl "$EVILROOT" tenant
+# it now dies BY NAME at parse time.
+printf 'BOX_IMAGE="images:debian/13/cloud"\nBOX_BOOTSTRAP_ROLE="claude"\n' \
+  > "$EVILROOT/seed/box.env"
+check "load_seed: BOX_BOOTSTRAP_ROLE is refused by name (#214)" \
+  1 "unknown key 'BOX_BOOTSTRAP_ROLE'" tpl "$EVILROOT"
+check "load_seed: ...and the refusal says the seed does not converge (#214)" \
+  1 "none for convergence" tpl "$EVILROOT"
 rm -rf "$EVILROOT"
 
 # ---------------------------------------------------------------------------
@@ -643,8 +683,8 @@ check "strong form: no acting line in bin/box names the converger (#214)" 1 "" \
   sf_names_converger "$ROOT/bin/box"
 check "strong form: bin/box names no pin variable where it acts (#214)" 1 "" \
   sf_names_pin "$ROOT/bin/box"
-for f in "$ROOT"/templates/*/box.env "$ROOT"/templates/*/user-data.yaml; do
-  rel="templates/$(basename "$(dirname "$f")")/$(basename "$f")"
+for f in "$ROOT"/seed/box.env "$ROOT"/seed/user-data.yaml; do
+  rel="seed/$(basename "$f")"
   check "strong form: $rel names the converger nowhere at all (#214)" 1 "" \
     grep -qwE 'rig|RIG_REPO|RIG_REF' "$f"
   check "strong form: $rel has no prose exception of its own (#214)" 1 "" \
@@ -721,11 +761,16 @@ rm -f "$SFPRE"
 # ACTS, so everything inside the region is a comment, the refusal function's
 # own frame, or a line that only prints or exits. A line count would red on a
 # reformat and pass on a curl; this reds on the curl.
+# Widened once, visibly (#288): the template axis's refusals name the same
+# registry, so their echo-only frames (refuse_template_*) sit in the region too.
 sf_region_only_prints() {
   local stray
   stray="$(awk '/^# box-strong-form-prose-begin$/,/^# box-strong-form-prose-end$/' "$1" \
-    | grep -vE '^#|^[[:space:]]*$|^refuse_role\(\)[[:space:]]*\{$|^\}$|^[[:space:]]+echo([[:space:]]|$)|^[[:space:]]+exit[[:space:]]+[0-9]+$')"
+    | grep -vE '^#|^[[:space:]]*$|^refuse_(role|template_staging|template_any|template_verb)\(\)[[:space:]]*\{$|^\}$|^[[:space:]]+echo([[:space:]]|$)|^[[:space:]]+exit[[:space:]]+[0-9]+$')"
   [ -z "$stray" ] || { printf 'acting line inside the prose region:\n%s\n' "$stray"; return 1; }
+  # An echo is prose only if it runs nothing: no command substitution inside.
+  stray="$(awk '/^# box-strong-form-prose-begin$/,/^# box-strong-form-prose-end$/' "$1" | grep -E '\$\(|`' || true)"
+  [ -z "$stray" ] || { printf 'a command substitution inside the prose region:\n%s\n' "$stray"; return 1; }
 }
 check "strong form: the prose region only prints and exits (#214)" 0 "" \
   sf_region_only_prints "$ROOT/bin/box"
@@ -1478,7 +1523,8 @@ chmod +x "$NETSHIM/curl"
 
 RUFN="$(mktemp)"
 awk '/^render_userdata\(\) \{/,/^\}/' "$ROOT/bin/box" > "$RUFN"
-check "render_userdata: extracted from bin/box (guards the awk)" 0 "@BOX_USER@" cat "$RUFN"
+check "render_userdata: extracted from bin/box (guards the awk)" 0 "awk" cat "$RUFN"
+check "render_userdata: substitutes nothing since #291 (no @BOX_USER@ arm)" 1 "" grep -q '@BOX_USER@' "$RUFN"
 check "render_userdata: the extracted function is valid bash" 0 "" bash -n "$RUFN"
 
 SEED="$(mktemp)"
@@ -1490,8 +1536,8 @@ rud() { # rud [VAR=val ...] — render the fixture seed through the real functio
   env T_USER=fixture FAKE_CURL_LOG="$NETLOG" PATH="$NETSHIM:$PATH" "$@" \
       bash -c 'die() { echo "box: $*" >&2; exit 1; }; . "$0"; render_userdata "$1"' "$RUFN" "$SEEDFILE"
 }
-check "render_userdata: the tenant user reaches cloud-init (#159)" 0 \
-  'name: "custom"' rud T_USER=custom
+check "render_userdata: a @BOX_USER@ token is inert text now (#291)" 0 \
+  'name: "@BOX_USER@"' rud T_USER=custom
 # The token is INERT TEXT (#214). A test that still expected resolution here
 # would be asserting the thing this release removed, so what is asserted is
 # that the seed comes out carrying its own bytes.
@@ -1524,7 +1570,7 @@ check "render_userdata: the render makes NO network call (#214)" 1 "" \
 # unconditionally. Drive it through the real renderer, then make every
 # assertion against what cloud-init receives rather than against source.
 SEEDLOG="$(mktemp)"
-SEEDFILE="$ROOT/templates/tenant/user-data.yaml"
+SEEDFILE="$ROOT/seed/user-data.yaml"
 rud T_USER=dev > "$SEEDLOG"
 check "render_userdata: the tenant render makes no network call either (#214)" 1 "" \
   grep -q . "$NETLOG"
@@ -1541,22 +1587,25 @@ check "render_userdata: no token survives the render (#214)" 1 "" \
 # against the RENDERED payload — the thing cloud-init is handed.
 check "tenant seed: the tenant has no sudoers entry (#177)" 1 "" \
   grep -qE '^[[:space:]]*sudo:' "$SEEDLOG"
-check "tenant seed: shellcheck ships (#177 decision 3)" 0 "" \
+check "tenant seed: shellcheck is convergence now, not seed (#290)" 1 "" \
   grep -qE '^[[:space:]]*-[[:space:]]+shellcheck$' "$SEEDLOG"
-check "tenant seed: python3-venv ships (#177 decision 3)" 0 "" \
+check "tenant seed: python3-venv is convergence now, not seed (#290)" 1 "" \
   grep -qE '^[[:space:]]*-[[:space:]]+python3-venv$' "$SEEDLOG"
+# shellcheck disable=SC2016  # $1 expands in the child shell, by design
+check "tenant seed: packages are exactly curl, ca-certificates, chrony (#290)" 0 "curl ca-certificates chrony" \
+  bash -c 'awk "/^packages:/{p=1;next} p&&/^[^ ]/{p=0} p&&/^  - /{print \$2}" "$1" | tr "\n" " " | sed "s/ \$//"' _ "$SEEDLOG"
 check "tenant seed: /tmp is capped at a FIXED 1GiB (#178)" 0 "" \
   grep -q 'size=1G' "$SEEDLOG"
-check "tenant seed: a 4GiB swapfile is laid on the disk (#178)" 0 "" \
-  grep -q 'fallocate -l 4G /swapfile' "$SEEDLOG"
+check "tenant seed: lays no swapfile — swap is convergence (#290, #253 D9)" 1 "" \
+  grep -q '/swapfile' "$SEEDLOG"
 # shellcheck disable=SC2016  # $1 expands in the child shell, by design
 check "tenant seed: chrony and its makestep drop-in ship (#174)" 0 "" \
   bash -c 'grep -q "box-makestep.conf" "$1" && grep -qE "^[[:space:]]*-[[:space:]]+chrony$" "$1"' _ "$SEEDLOG"
 check "tenant seed: the container-aware chrony start survives (#174)" 0 "" \
   grep -q 'systemd-detect-virt --quiet --container || systemctl start chrony' "$SEEDLOG"
 # shellcheck disable=SC2016  # $1 expands in the child shell, by design
-check "tenant seed: tmux, curl and ca-certificates ship (#65, #214)" 0 "" \
-  bash -c 'for pkg in tmux curl ca-certificates; do
+check "tenant seed: curl and ca-certificates ship (#214)" 0 "" \
+  bash -c 'for pkg in curl ca-certificates; do
              grep -qE "^[[:space:]]*-[[:space:]]+$pkg\$" "$1" || exit 1; done' _ "$SEEDLOG"
 check "tenant seed: package_update is on — the seed installs packages (#214)" 0 "" \
   grep -qE '^package_update: true$' "$SEEDLOG"
@@ -1564,9 +1613,11 @@ check "tenant seed: package_update is on — the seed installs packages (#214)" 
 # load_template has read one, so BOX_USER cannot be the single source — which
 # makes 'they agree' something to assert rather than to hope.
 # shellcheck disable=SC2016  # $1/$2 expand in the child shell, by design
-check "tenant seed: BOX_USER and bin/box's default are the same 'dev' (#214)" 0 "" \
-  bash -c 'grep -qx '"'"'BOX_USER="dev"'"'"' "$1" && grep -qF '"'"'user="${user:-dev}"'"'"' "$2"' \
-  _ "$ROOT/templates/tenant/box.env" "$ROOT/bin/box"
+check "seed: names no BOX_USER (#291)" 1 "" grep -q '^BOX_USER=' "$ROOT/seed/box.env"
+# shellcheck disable=SC2016  # a literal in the target file
+check "bin/box: has no default tenant user any more (#291)" 1 "" grep -qF 'user="${user:-dev}"' "$ROOT/bin/box"
+check "tenant seed: the rendered payload says users: [] — no default user either (#291)" 0 "" grep -qxF 'users: []' "$SEEDLOG"
+check "tenant seed: ...and lists no user entry at all" 1 "" grep -qE '^[[:space:]]*-[[:space:]]+name:' "$SEEDLOG"
 rm -f "$RUFN" "$SEED"
 
 # YAML well-formedness needs python3 + pyyaml; the CI runner has both. Skip
@@ -1580,14 +1631,17 @@ else
   echo "skip: rendered payload YAML well-formedness (no python3+pyyaml here; CI has both)"
 fi
 
-for d in "$ROOT"/templates/*/; do
-  t="$(basename "$d")"
+# One seed since #288; the loop shape is kept so a second seed directory, if
+# one ever came back, would have to pass the same checks.
+# shellcheck disable=SC2043  # one seed today; the loop keeps a second one honest
+for d in "$ROOT"/seed/; do
+  t=seed
   # The parse itself asserts the allowlist AND the required keys (the driven
   # function dies without BOX_IMAGE/BOX_USER); the greps pin both keys to the
   # FILE, so neither can quietly become an inherited default.
-  check "template '$t': box.env parses against the real allowlist" 0 "USER=" tpl "$ROOT" "$t"
+  check "template '$t': box.env parses against the real allowlist" 0 "IMAGE=images:" tpl "$ROOT"
   check "template '$t': box.env sets BOX_IMAGE" 0 "" grep -q '^BOX_IMAGE=' "$d/box.env"
-  check "template '$t': box.env sets BOX_USER"  0 "" grep -q '^BOX_USER='  "$d/box.env"
+  check "template '$t': box.env sets no BOX_USER (#291)"  1 "" grep -q '^BOX_USER='  "$d/box.env"
   # #175: every shipped seed defaults to the VM trust boundary. Discovery is
   # deliberate: a new template that forgets the pin must fail this same loop.
   check "template '$t': declares one of the two no-fallback demands (#175)" \
@@ -1644,11 +1698,12 @@ for d in "$ROOT"/templates/*/; do
   # The half of the seed's user block that #177 did NOT change: no password
   # login, in every template. Dropping sudo while leaving the account
   # unlocked would trade one door for another.
-  check "template '$t': the tenant password stays locked (#177)" 0 "" \
-    grep -qE '^[[:space:]]*lock_passwd: true$' "$d/user-data.yaml"
-  # #65: 'box tmux' runs 'tmux new-session' INSIDE the box, so every
-  # template's package list must carry tmux or the verb dies inside.
-  check "template '$t': installs tmux (#65)" 0 "" \
+  # 'users: []', never an absent key: absent means cloud-init's distro default
+  # user (debian, passwordless sudo) — found on real Incus by the rehearsal.
+  check "template '$t': creates no users at all, not even the distro default (#291)" 0 "" \
+    grep -qxF 'users: []' "$d/user-data.yaml"
+  # #289: 'box tmux' went with the package (#253 D7(a)); the seed carries none.
+  check "template '$t': installs no tmux (#289)" 1 "" \
     grep -qE '^[[:space:]]*-[[:space:]]+tmux$' "$d/user-data.yaml"
   # #174: host suspend can leave a guest hours adrift. Every discovered
   # template therefore installs chrony, gives it an unlimited post-start
@@ -1739,40 +1794,19 @@ for d in "$ROOT"/templates/*/; do
       # message anywhere — the silent regression this check exists for (#208).
       check "template '$t': restates /var/tmp at its stock 30d — the file MASKS Debian's (#208)" 0 "" \
         grep -qE '^[[:space:]]+q[[:space:]]+/var/tmp[[:space:]]+1777[[:space:]]+root[[:space:]]+root[[:space:]]+30d$' "$d/user-data.yaml"
-      # #178 D2: no swap means every spike is a hard OOM-kill with no grace
-      # period. Four greps, because the four halves fail independently — a
-      # swapfile that is not made, not sized, not activated at boot, or made
-      # in a container that cannot swapon at all.
-      # shellcheck disable=SC2016  # $1 expands in the child shell, by design
-      check "template '$t': provisions a 4GiB swapfile (#178)" 0 "" \
-        bash -c 'grep -v "^[[:space:]]*#" "$1" | grep -qF "fallocate -l 4G /swapfile"' _ "$d/user-data.yaml"
+      # #290: the swapfile left the seed (#253 D9) — convergence lays it.
+      check "template '$t': provisions no swapfile (#290)" 1 "" \
+        grep -qF "/swapfile" "$d/user-data.yaml"
+      # The /tmp fact still belongs next to the line that causes it (#178 D3).
       # shellcheck disable=SC2016
-      check "template '$t': the swapfile is formatted and activated (#178)" 0 "" \
-        bash -c 'grep -v "^[[:space:]]*#" "$1" | grep -qF "mkswap /swapfile" &&
-                 grep -v "^[[:space:]]*#" "$1" | grep -qF "swapon /swapfile"' _ "$d/user-data.yaml"
-      # shellcheck disable=SC2016
-      check "template '$t': the swapfile survives a reboot (fstab, #178)" 0 "" \
-        bash -c 'grep -v "^[[:space:]]*#" "$1" | grep -qF "/swapfile none swap sw 0 0"' _ "$d/user-data.yaml"
-      # Guarded for chrony's reason, not a different one: a container shares
-      # the host's swap and cannot swapon at all, so an unguarded seed writes
-      # 4GiB of nothing into every container mint — CI's own rehearsal
-      # included — and adds an fstab line that fails at every boot.
-      # shellcheck disable=SC2016
-      check "template '$t': swap provisioning is container-guarded (#174's guard, #178)" 0 "" \
-        bash -c 'grep -v "^[[:space:]]*#" "$1" |
-                 grep -qF "! systemd-detect-virt --quiet --container && [ ! -e /swapfile ]"' _ "$d/user-data.yaml"
-      # #178 D3: the fact belongs next to the line that causes it. box.env
-      # already carries a long explanatory header; this asserts it names both
-      # halves and cites the incident, per CONTRIBUTING's comment rule.
-      # shellcheck disable=SC2016
-      check "template '$t': box.env states the /tmp and swap shape it causes (#178)" 0 "" \
-        bash -c 'grep -qE "^#.*/tmp" "$1" && grep -qE "^#.*swap" "$1" && grep -qF "#178" "$1"' _ "$d/box.env" ;;
+      check "template '$t': box.env states the /tmp shape it causes (#178)" 0 "" \
+        bash -c 'grep -qE "^#.*/tmp" "$1" && grep -qF "#178" "$1"' _ "$d/box.env" ;;
   esac
   # A dedicated seed duplicates BOX_USER into cloud-init. box's own tenant seed
   # instead carries exactly the token render_userdata replaces at mint.
-  if [ "$t" = tenant ]; then
-    check "template 'tenant': cloud-init carries the tenant user token (#159)" 0 "" \
-      grep -qE '^[[:space:]]*-[[:space:]]+name:[[:space:]]+"@BOX_USER@"$' "$d/user-data.yaml"
+  if [ "$t" = seed ]; then
+    check "seed: cloud-init carries no tenant user token (#291)" 1 "" \
+      grep -q '@BOX_USER@' "$d/user-data.yaml"
   else
     tuser="$(tpl "$ROOT" "$t" | sed -n 's/.*USER=\([^ ]*\).*/\1/p')"
     check "template '$t': user-data.yaml creates BOX_USER ('$tuser')" 0 "" \
@@ -1829,25 +1863,19 @@ done
 # is its trust boundary (its guest runs docker, once converged) and a server
 # returns from a host reboot without an operator. Pinned to the FILE so neither
 # can quietly vanish in a rewrite.
-check "staging-box: demands VM mode (BOX_REQUIRE_VM=1)" 0 "" \
-  grep -qx 'BOX_REQUIRE_VM="1"' "$ROOT/templates/staging-box/box.env"
-check "staging-box: demands autostart (BOX_AUTOSTART=1)" 0 "" \
-  grep -qx 'BOX_AUTOSTART="1"' "$ROOT/templates/staging-box/box.env"
-check "staging-box: keeps its 'ops' user (#214 kept the whole server shape)" 0 "USER=ops" tpl "$ROOT" staging-box
-check "staging-box: its ops user still creates itself in cloud-init" 0 "" \
-  grep -qE '^[[:space:]]*-[[:space:]]+name:[[:space:]]+ops$' "$ROOT/templates/staging-box/user-data.yaml"
-check "staging-box: BOX_BOOTSTRAP_ROLE is gone from the file (#214)" 1 "" \
-  grep -q 'BOX_BOOTSTRAP_ROLE' "$ROOT/templates/staging-box/box.env"
+check "staging-box: the template directory is gone (#288)" 1 "" \
+  test -e "$ROOT/templates/staging-box"
+check "templates/: nothing remains under it (#288)" 1 "" test -e "$ROOT/templates"
 # #175's five softer declarations are pinned separately from the discovery
 # guard above: the loop catches a future unpinned seed, while this catches one
 # of today's seeds accidentally inheriting staging-box's stronger policy.
 check "tenant: permits only an explicit container override (BOX_NO_CONTAINER_FALLBACK=1)" \
-  0 "" grep -qx 'BOX_NO_CONTAINER_FALLBACK="1"' "$ROOT/templates/tenant/box.env"
+  0 "" grep -qx 'BOX_NO_CONTAINER_FALLBACK="1"' "$ROOT/seed/box.env"
 # box's one tenant seed carries the unprivileged tool floor unconditionally
 # (#214): there is no second shape and no role that could select one.
 for p in python3-venv shellcheck; do
-  check "tenant: ships '$p' — an unprivileged tenant cannot apt-install it (#177)" 0 "" \
-    grep -qE "^[[:space:]]*-[[:space:]]+$p\$" "$ROOT/templates/tenant/user-data.yaml"
+  check "seed: '$p' is not in it — a role installs it (#290)" 1 "" \
+    grep -qE "^[[:space:]]*-[[:space:]]+$p\$" "$ROOT/seed/user-data.yaml"
 done
 for retired in claude-box codex-box grok-box kimi-box; do
   check "templates: retired '$retired' seed is deleted (#159)" 1 "" \
@@ -1883,10 +1911,10 @@ check "new: the soft KVM-less refusal names KVM and the explicit weaker override
     printf "%s\n" "$line" | grep -q "weaker isolation"'
 # #68 is byte-for-byte behavior, not merely an equivalent refusal. Pin both
 # messages so #175 cannot advertise an override staging-box does not permit.
-check "new: REQUIRE_VM keeps the explicit-container refusal wording (#68)" 0 "" \
-  grep -Fq "usage_error \"template '\$t' requires VM mode — it will not mint as a container (drop --container)\"" "$ROOT/bin/box"
-check "new: REQUIRE_VM keeps the KVM-less refusal wording (#68)" 0 "" \
-  grep -Fq "die \"template '\$t' requires VM mode and this host has no /dev/kvm — mint it on a KVM-capable host (or via --remote)\"" "$ROOT/bin/box"
+check "new: --require-vm refuses --container, saying so (#68, #288)" 0 "" \
+  grep -Fq 'usage_error "--require-vm refuses container mode (drop --container)"' "$ROOT/bin/box"
+check "new: --require-vm keeps a KVM-less refusal (#68, #288)" 0 "" \
+  grep -Fq 'die "--require-vm needs VM mode and this host has no /dev/kvm' "$ROOT/bin/box"
 check "new: boot.autostart is stamped under the T_AUTOSTART guard" 0 "" bash -c '
   awk "/^cmd_new\(\) \{/,/^\}/" "'"$ROOT"'/bin/box" \
     | grep -F "boot.autostart=true" | grep -q "T_AUTOSTART"'
@@ -2054,8 +2082,8 @@ check "new: BOX_LAUNCH_TIMEOUT is documented in box help new" 0 "" bash -c '
 # convergence command now, so the assertion is the strongest form of the one
 # that was here: no template names a convergence role at all.
 # shellcheck disable=SC2016  # the path expands in the child shell, by design
-check "templates: no template names a convergence role at all (#214)" 1 "" bash -c '
-  grep -h "^BOX_BOOTSTRAP_ROLE=" "'"$ROOT"'"/templates/*/box.env | grep -q .'
+check "seed: names no convergence role at all (#214)" 1 "" bash -c '
+  grep -h "^BOX_BOOTSTRAP_ROLE=" "'"$ROOT"'"/seed/box.env | grep -q .'
 # shellcheck disable=SC2016  # the $-string is a literal in the target file
 check "new: the ready hint offers 'box root' for a server-class box (#176, #214)" 0 "" bash -c '
   awk "/^cmd_new\(\) \{/,/^\}/" "'"$ROOT"'/bin/box" \
@@ -2344,6 +2372,11 @@ rm -f "$BINFN" "$HOSTFN"
 # The tier scripts parse and refuse bad usage without a daemon — drive them.
 check "grant: no argument is a usage error"      2 "usage: box grant"  bash "$ROOT/host/grant-user.sh"
 check "grant: a flag is not a user"              2 "usage: box grant"  bash "$ROOT/host/grant-user.sh" --frob
+check "grant: --service alone is a usage error"  2 "usage: box grant [--service [--share"  bash "$ROOT/host/grant-user.sh" --service
+check "grant: two users is a usage error"        2 "usage: box grant"  bash "$ROOT/host/grant-user.sh" a b
+check "help grant documents --service (#281)"    0 "box grant --service gig" "$BOX" help grant
+check "help grant: a service gets managed disks only" 0 "restricted.devices.disk=managed" "$BOX" help grant
+check "help grant: grant first, then start the service" 0 "Grant FIRST, then start the service" "$BOX" help grant
 check "revoke: no argument is a usage error"     2 "usage: box revoke" bash "$ROOT/host/revoke-user.sh"
 check "revoke: two users is a usage error"       2 "usage: box revoke" bash "$ROOT/host/revoke-user.sh" a b
 check "box grant with no user exits 2 (via the CLI table)"  2 "usage: box grant"  "$BOX" grant
@@ -2402,11 +2435,347 @@ check "grant: unpins the private-bridge eth0 from the default profile" 0 "" \
   grep -qF 'profile device remove default eth0' "$ROOT/host/grant-user.sh"
 check "grant: an incus-admin member is provisioned, not refused (#99)" 1 "" \
   grep -qF 'there is nothing tighter to grant' "$ROOT/host/grant-user.sh"
+# --service (#281): the three differences from a person's grant, and the
+# refusal that keeps the fence honest.
+check "grant --service: pins managed disks (no host paths)" 0 "" \
+  grep -qE 'restricted\.devices\.disk managed' "$ROOT/host/grant-user.sh"
+check "grant --service: marks the project a service grant" 0 "" \
+  grep -qE 'user\.box\.service true' "$ROOT/host/grant-user.sh"
+check "grant --service: refuses an incus-admin member" 0 "" \
+  grep -qF 'which no grant can fence' "$ROOT/host/grant-user.sh"
+# shellcheck disable=SC2016  # the $-strings are literals in the target file
+check "grant --service: user-side calls run with a throwaway HOME" 0 "" \
+  grep -qF 'env HOME="$svc_home" INCUS_CONF="$svc_home/incus"' "$ROOT/host/grant-user.sh"
+# shellcheck disable=SC2016  # the $-strings are literals in the target file
+check "grant: the touch's stderr is kept, not swallowed (#281)" 0 "" \
+  grep -qF 'the touch as $user said' "$ROOT/host/grant-user.sh"
+check "grant: the old swallowing touch is gone" 1 "" \
+  grep -qF 'incus project list >/dev/null 2>&1 || true' "$ROOT/host/grant-user.sh"
+check "grant --service: the throwaway home is removed on every exit" 0 "" \
+  grep -qF "trap 'cleanup_svc_home || true; backout_share || true; backout' EXIT" "$ROOT/host/grant-user.sh"
+check "grant --service: the throwaway home lives under /tmp, never root's TMPDIR" 0 "" \
+  grep -qF 'mktemp -d /tmp/box-grant.XXXXXX' "$ROOT/host/grant-user.sh"
+# shellcheck disable=SC2016  # the $-strings are literals in the target file
+check "grant --service: the home is made and handed over through \$SUDO" 0 "" \
+  grep -qF '$SUDO chown "$user" "$svc_home"' "$ROOT/host/grant-user.sh"
+
+# --- grant, driven (#282, #283): a stubbed host --------------------------------
+# A fake root host: id/getent/usermod/runuser/systemctl/pgrep/chown/timeout and
+# an incus whose storage and project config live in files under $GS/state. Every
+# mutating call lands in $GS/log, so the pool and caps logic is asserted on what
+# it DID, not on what the file says.
+GS="$(mktemp -d)"; mkdir -p "$GS/bin" "$GS/state"
+gs_stub() { printf '#!/usr/bin/env bash\n%s\n' "$2" >"$GS/bin/$1"; chmod +x "$GS/bin/$1"; }
+# The stubs are single-quoted scripts: their $-expressions expand when they RUN.
+# shellcheck disable=SC2016
+{
+gs_stub id 'case "$*" in
+  "-u") echo 0 ;; "-u svc") echo 1500 ;; "-nG svc") cat "$GS/state/groups" 2>/dev/null || echo svc ;;
+  *) echo "fake id: $*" >&2; exit 2 ;; esac'
+gs_stub getent '[ "$2" = svc ]'
+gs_stub usermod 'echo "usermod $*" >>"$GS/log"; echo "svc incus" >"$GS/state/groups"'
+gs_stub gpasswd 'echo "gpasswd $*" >>"$GS/log"; echo svc >"$GS/state/groups"'
+gs_stub systemctl 'exit 0'
+gs_stub pgrep 'exit 1'
+gs_stub chown 'exit 0'
+gs_stub timeout 'shift; exec "$@"'
+gs_stub runuser 'while [ "$1" != -- ]; do shift; done; shift; exec "$@"'
+gs_stub incus 'st="$GS/state"; log() { echo "incus $*" >>"$GS/log"; }
+p=""; if [ "$1" = --project ]; then p="$2"; shift 2; fi
+case "$*" in
+  "network show boxnet") exit 0 ;;
+  "project show user-1500"|"project list") exit 0 ;;
+  "info") echo "api_extensions:"; [ -n "${GS_NO_EXT:-}" ] || echo "- projects_limits_disk_pool"; echo "- other" ;;
+  "profile device get default eth0 type") exit 1 ;;
+  "profile show box-profile") exit 0 ;;
+  "profile edit box-profile") cat >/dev/null; log "--project $p $*" ;;
+  "profile device set box-profile root pool "*) log "--project $p $*" ;;
+  "storage list --format csv -c n") echo default; for f in "$st"/pool-*; do [ -e "$f" ] && basename "$f" | sed s/^pool-//; done ;;
+  "storage show "*) [ -e "$st/pool-$3" ] || exit 1; echo "driver: $(cat "$st/pool-$3")" ;;
+  "storage get "*) cat "$st/pool-$3.$4" 2>/dev/null; exit 0 ;;
+  "storage create "*) [ -z "${GS_CREATE_FAIL:-}" ] || { echo "Error: no space"; exit 1; }
+    echo btrfs >"$st/pool-$3"; echo "${5#size=}" >"$st/pool-$3.size"; log "$*" ;;
+  "storage set "*) echo "$5" >"$st/pool-$3.$4"; log "$*" ;;
+  "project get user-1500 "*) cat "$st/proj.$4" 2>/dev/null; exit 0 ;;
+  "project set user-1500 limits.memory 1GiB") echo "Error: uses more than that" >&2; exit 1 ;;
+  "project set "*) echo "$5" >"$st/proj.$4"; log "$*" ;;
+  "project unset "*) rm -f "$st/proj.$4"; log "$*" ;;
+  *) echo "STUB: unexpected incus ${p:+--project $p }$*" >&2; exit 3 ;;
+esac'
+}
+gs_reset() { rm -rf "$GS/state" "$GS/log"; mkdir -p "$GS/state"; : >"$GS/log"; }
+gs_grant() { env PATH="$GS/bin:$PATH" GS="$GS" bash "$ROOT/host/grant-user.sh" "$@"; }
+gs_log() { cat "$GS/log"; }
+
+gs_reset
+check "grant --pool: creates the btrfs pool, marks it, confines and roots the project" 0 "pool: created gig (200GiB btrfs loop file) for svc" \
+  gs_grant --service --pool gig --pool-size 200GiB svc
+check "grant --pool: the pool is created at the asked size" 0 "storage create gig btrfs size=200GiB" gs_log
+check "grant --pool: the pool is marked as this user's" 0 "storage set gig user.box.grant svc" gs_log
+check "grant --pool: every other pool is limited to 0" 0 "project set user-1500 limits.disk.pool.default 0" gs_log
+check "grant --pool: its own pool is never limited" 1 "" grep -q "limits.disk.pool.gig 0" "$GS/log"
+check "grant --pool: limits.disk is the pool size — Incus enforces per-pool limits only under it" 0 "project set user-1500 limits.disk 200GiB" gs_log
+check "grant --pool: the project carries the pool marker" 0 "project set user-1500 user.box.pool gig" gs_log
+check "grant --pool: box-profile roots on the grant pool" 0 "--project user-1500 profile device set box-profile root pool gig" gs_log
+: >"$GS/log"
+check "grant: a re-run without --pool keeps the profile's root on the grant pool" 0 "rooted on gig" gs_grant --service svc
+check "grant: the re-run re-points the refreshed profile" 0 "profile device set box-profile root pool gig" gs_log
+check "grant: the re-run creates no pool" 1 "" grep -q "storage create" "$GS/log"
+check "grant: a plain re-run re-applies the zero limits to every other pool (#282 T2)" 0 "project set user-1500 limits.disk.pool.default 0" gs_log
+
+: >"$GS/log"
+check "grant --pool: re-run adopts the user's own pool" 0 "pool: gig already exists (200GiB, btrfs, svc's)" \
+  gs_grant --service --pool gig --pool-size 100GiB svc
+check "grant --pool: an undersized pool is refused" 1 "smaller than 300GiB" gs_grant --service --pool gig --pool-size 300GiB svc
+echo zfs >"$GS/state/pool-gig"
+check "grant --pool: a non-btrfs pool is refused" 1 "is zfs, not btrfs" gs_grant --service --pool gig --pool-size 100GiB svc
+echo btrfs >"$GS/state/pool-gig"; echo other >"$GS/state/pool-gig.user.box.grant"
+check "grant --pool: someone else's pool is refused" 1 "is not svc's grant pool (user.box.grant=other)" gs_grant --service --pool gig --pool-size 100GiB svc
+gs_reset; echo btrfs >"$GS/state/pool-shared"; echo 1TiB >"$GS/state/pool-shared.size"
+check "grant --pool: a pool box did not make is refused" 1 "user.box.grant=unset" gs_grant --service --pool shared --pool-size 100GiB svc
+gs_reset
+check "grant --pool: refused without the disk-pool limits extension" 1 "projects_limits_disk_pool" \
+  env GS_NO_EXT=1 PATH="$GS/bin:$PATH" GS="$GS" bash "$ROOT/host/grant-user.sh" --service --pool gig --pool-size 1GiB svc
+check "grant --pool: no pool is made without the extension" 1 "" grep -q "storage create" "$GS/log"
+gs_reset
+check "grant --pool: a failed create says why" 1 "could not create pool 'gig': Error: no space" \
+  env GS_CREATE_FAIL=1 PATH="$GS/bin:$PATH" GS="$GS" bash "$ROOT/host/grant-user.sh" --service --pool gig --pool-size 1GiB svc
+check "grant --pool without --pool-size is a usage error" 2 "--pool and --pool-size go together" gs_grant --pool gig svc
+check "grant --pool default is refused" 2 "the host's shared pool" gs_grant --pool default --pool-size 1GiB svc
+check "grant --pool with a bad name is refused" 2 "lower-case name" gs_grant --pool 'Gig;x' --pool-size 1GiB svc
+check "grant --pool-size must be a size" 2 "a size like 200GiB" gs_grant --pool gig --pool-size lots svc
+check "grant --pool needs a value" 2 "--pool needs a value" gs_grant --pool --pool-size 1GiB svc
+gs_reset
+check "grant caps: sets limits.memory, limits.cpu, limits.instances" 0 "caps: limits.instances=6" \
+  gs_grant --service --memory 16GiB --cpu 6 --instances 6 svc
+check "grant caps: memory" 0 "project set user-1500 limits.memory 16GiB" gs_log
+check "grant caps: cpu" 0 "project set user-1500 limits.cpu 6" gs_log
+: >"$GS/log"
+check "grant caps: none unsets" 0 "caps: limits.cpu unset" gs_grant --service --cpu none svc
+check "grant caps: none is an unset, not a set" 0 "project unset user-1500 limits.cpu" gs_log
+check "grant caps: a cap below use is refused with the reason" 1 "Incus refuses a cap below what the project already uses" \
+  gs_grant --service --memory 1GiB svc
+check "grant caps: --cpu must be a whole number" 2 "--cpu must be a whole number" gs_grant --cpu 2.5 svc
+check "grant caps: --instances must be a whole number" 2 "--instances must be a whole number" gs_grant --instances 0 svc
+check "grant caps: --memory must be a size" 2 "--memory must be a size" gs_grant --memory 16G svc
+# --share / --unshare (#287): sudoers drop-in validated before it lands, the
+# world-readable share record, the warning, and the refusals.
+mkdir -p "$GS/sudoers.d" "$GS/shares"; : >"$GS/box"; chmod +x "$GS/box"
+# shellcheck disable=SC2016  # the $-strings expand in the child shell or stub, by design
+gs_stub visudo '[ -z "${GS_VISUDO_FAIL:-}" ] || exit 1; grep -q "^%[a-z_][a-z0-9_-]* ALL=([a-z_][a-z0-9_-]*) NOPASSWD: /" "$2"'
+# shellcheck disable=SC2016  # the $-strings expand in the child shell or stub, by design
+gs_stub tee 'cat >"$1"'
+# shellcheck disable=SC2016  # the $-strings expand in the child shell or stub, by design
+gs_stub getent 'case "$1 $2" in "passwd svc"|"group staging") exit 0 ;; *) exit 2 ;; esac'
+gs_share() { env BOX_SHARE_BIN="$GS/box" BOX_SHARE_DIR="$GS/shares" BOX_SUDOERS_D="$GS/sudoers.d" PATH="$GS/bin:$PATH" GS="$GS" GS_VISUDO_FAIL="${GS_VISUDO_FAIL:-}" bash "$ROOT/host/grant-user.sh" "$@"; }
+gs_reset
+check "grant --share: lets the group act as the service" 0 "share: 'staging' may act as svc" gs_share --service --share staging svc
+check "grant --share: the sudoers rule allows box only, as the service, for the group" 0 "%staging ALL=(svc) NOPASSWD: $GS/box" cat "$GS/sudoers.d/box-share-svc"
+check "grant --share: the rule is 0440" 0 "440" stat -c %a "$GS/sudoers.d/box-share-svc"
+check "grant --share: the share record names the group" 0 "staging" cat "$GS/shares/svc"
+check "grant --share: no temp rule is left behind" 1 "" test -e "$GS/sudoers.d/.box-share-svc.tmp"
+check "grant --share: SHOUTS the credential blast radius" 0 "holds EVERYTHING put inside svc's boxes" gs_share --service --share staging svc
+# shellcheck disable=SC2016  # the $-strings expand in the child shell or stub, by design
+check "grant: a re-run without --share keeps the share" 0 "" bash -c 'env BOX_SHARE_BIN="'"$GS"'/box" BOX_SHARE_DIR="'"$GS"'/shares" BOX_SUDOERS_D="'"$GS"'/sudoers.d" PATH="'"$GS"'/bin:$PATH" GS="'"$GS"'" bash "'"$ROOT"'/host/grant-user.sh" --service svc >/dev/null 2>&1; test -e "'"$GS"'/sudoers.d/box-share-svc"'
+check "grant --unshare removes the rule and the record" 0 "no longer shared" gs_share --service --unshare svc
+check "grant --unshare: the rule is gone" 1 "" test -e "$GS/sudoers.d/box-share-svc"
+check "grant --share: a missing group is refused" 1 "no such group: nobodies" gs_share --service --share nobodies svc
+check "grant --share: refused when visudo rejects the rule, writing nothing" 1 "did not validate" env GS_VISUDO_FAIL=1 bash -c "$(declare -f gs_share); GS='$GS' ROOT='$ROOT'; gs_share --service --share staging svc"
+# shellcheck disable=SC2016  # the $-strings expand in the child shell or stub, by design
+check "grant --share: ...and no rule file exists after the refusal" 1 "" bash -c 'test -e "$1" || test -e "$2"' _ "$GS/sudoers.d/box-share-svc" "$GS/sudoers.d/.box-share-svc.tmp"
+check "grant --share without --service is refused" 2 "for service grants" gs_share --share staging svc
+check "grant --share with --unshare is refused" 2 "together make no sense" gs_share --service --share staging --unshare svc
+check "grant --share: refused without a global install" 1 "needs box installed globally" \
+  env BOX_SHARE_BIN="$GS/nope" BOX_SHARE_DIR="$GS/shares" BOX_SUDOERS_D="$GS/sudoers.d" PATH="$GS/bin:$PATH" GS="$GS" bash "$ROOT/host/grant-user.sh" --service --share staging svc
+
+# box --as NAME (#287): the re-exec through sudo, never a prompt, and the two
+# refusals — a share the caller is not in (naming the group), and no share.
+AS="$(mktemp -d)"; mkdir -p "$AS/bin" "$AS/shares"
+# shellcheck disable=SC2016  # stub body expands when it runs
+printf '#!/usr/bin/env bash\necho "sudo $*" >>"%s/log"\ncase "$*" in *" -l "*) [ -n "${AS_ALLOWED:-}" ] ;; *) exit 0 ;; esac\n' "$AS" >"$AS/bin/sudo"
+chmod +x "$AS/bin/sudo"
+asbox() { env PATH="$AS/bin:$PATH" BOX_SHARE_BIN=/usr/local/bin/box BOX_SHARE_DIR="$AS/shares" "$BOX" "$@"; }
+: >"$AS/log"
+check "box --as: a member re-runs the command as the tenant" 0 "" env AS_ALLOWED=1 bash -c "$(declare -f asbox); AS='$AS' BOX='$BOX'; asbox --as stage list"
+check "box --as: ...through sudo -n, as the tenant, with its home, running box only" 0 "sudo -n -u stage -H -- /usr/local/bin/box list" cat "$AS/log"
+echo staging >"$AS/shares/stage"
+check "box --as: a non-member is refused (exit 2), told which group to join" 2 "shared with the group 'staging'" asbox --as stage list
+check "box --as: no share at all says so" 2 "is not a shared tenant on this host" asbox --as other list
+check "box --as: a bad tenant name is a usage error" 2 "--as needs a tenant name" asbox --as 'Bad;x' list
+check "box --as: never prompts (sudo is always -n)" 1 "" grep -vq -- "sudo -n " "$AS/log"
+rm -rf "$AS"
+# No writable home (#281, #287): a private, unpredictable INCUS_CONF for the
+# run — never a fixed per-uid name a local user could squat or share — and it
+# is gone afterwards.
+# shellcheck disable=SC2016  # a literal in the target file
+check "box: with no writable home, INCUS_CONF is a per-run mktemp dir" 0 "" \
+  grep -qF 'mktemp -d "${TMPDIR:-/tmp}/box-incus.XXXXXXXX"' "$BOX"
+# shellcheck disable=SC2016  # the $-strings expand in the child shell, by design
+check "box: ...and the run leaves nothing behind" 0 "[]" \
+  env HOME=/nonexistent TMPDIR="$(mktemp -d)" bash -c '"$1" help >/dev/null; printf "[%s]" "$(ls -A "$TMPDIR")"' _ "$BOX"
+# Acting AS a shared tenant (#287, review round): a member reached this through
+# sudo, so only the box surface runs — never the incus escape hatch (an editor
+# is a host shell as the tenant; file push/pull reads its files), export/import
+# or the host verbs.
+SA="$(mktemp -d)"; : >"$SA/$(id -un)"
+sabox() { env SUDO_USER=boxmember BOX_SHARE_DIR="$SA" "$BOX" "$@"; }
+check "--as: a member cannot reach 'box incus' (an editor is a host shell)" 2 "not available to a shared tenant's members" \
+  sabox incus work -- config edit {}
+check "--as: ...nor export to a host path as the tenant" 2 "not available" sabox export work /tmp/x.tar.gz
+check "--as: ...nor import from one" 2 "not available" sabox import /tmp/x.tar.gz
+check "--as: ...nor the host verbs" 2 "not available" sabox grant someone
+check "--as: the box surface itself still runs (help)" 0 "USAGE" sabox help
+check "--as: an ordinary sudo user who is not a shared tenant is untouched" 0 "USAGE" \
+  env SUDO_USER=boxmember BOX_SHARE_DIR="$(mktemp -d)" "$BOX" help
+rm -rf "$SA"
+# The CLI layer (#282, #283): 'box grant'/'box revoke' hand every argument to
+# their script verbatim. box's own --memory/--cpu/--force must not be parsed
+# out first — the rehearsal on real Incus found 'box grant --memory 3GiB'
+# landing with no cap, because box had eaten the flag.
+PT="$(mktemp -d)"; mkdir -p "$PT/bin" "$PT/host"; cp "$ROOT/bin/box" "$PT/bin/box"; cp "$ROOT/VERSION" "$PT/VERSION"
+printf '#!/usr/bin/env bash\necho "SCRIPT-ARGS: $*"\n' >"$PT/host/grant-user.sh"
+printf '#!/usr/bin/env bash\necho "SCRIPT-ARGS: $*"\n' >"$PT/host/revoke-user.sh"
+check "box grant passes --memory/--cpu/--instances through verbatim (#283)" 0 \
+  "SCRIPT-ARGS: --service gig --memory 16GiB --cpu 6 --instances 6 --name x gig" \
+  bash "$PT/bin/box" grant --service gig --memory 16GiB --cpu 6 --instances 6 --name x gig
+check "box revoke passes --force through verbatim (#285)" 0 "SCRIPT-ARGS: gig --force" \
+  bash "$PT/bin/box" revoke gig --force
+check "box grant --help is still box's help" 0 "--pool NAME --pool-size SIZE gives the grant" \
+  bash "$PT/bin/box" grant --help
+rm -rf "$PT"
+# check_grant_caps (#283, ruled 2026-11-22: fail loudly): a plain 'box new'
+# whose defaults exceed the grant's caps refuses BEFORE minting and names the
+# sizes that fit; a resource the caller chose is never second-guessed.
+CLFN="$(mktemp)"
+awk '/^size_bytes\(\) \{/,/^\}/; /^check_grant_caps\(\) \{/,/^\}/' "$BOX" > "$CLFN"
+# shellcheck disable=SC2016  # $-strings expand in the child shell, by design
+capcheck() { env "$@" bash -c '
+  . "$0"
+  usage_error() { echo "box: $*" >&2; exit 2; }
+  box_tier() { echo restricted; }
+  id() { echo 1500; }
+  incus() { case "$*" in
+      "project get user-1500 limits.cpu") echo "${CAP_CPU:-}" ;;
+      "project get user-1500 limits.memory") echo "${CAP_MEM:-}" ;;
+      "project get user-1500 limits.disk") echo "${CAP_DISK:-}" ;;
+    esac; }
+  T_CPU=2 T_MEMORY=2GiB T_DISK=20GiB name=web
+  check_grant_caps
+  printf "MINT CPU=%s MEM=%s DISK=%s\n" "$T_CPU" "$T_MEMORY" "$T_DISK"' "$CLFN"; }
+check "caps: defaults above the caps refuse (exit 2), naming every one" 2 "your grant caps cpu 1 (default 2), memory 1GiB (default 2GiB), disk 3GiB in total (default root 20GiB)" \
+  capcheck CAP_CPU=1 CAP_MEM=1GiB CAP_DISK=3GiB cpu= memory= disk= size=
+check "caps: ...and print the line that fits, leaving disk room for images" 2 "box new --name web --cpu 1 --memory 1GiB --disk <less than 3GiB>" \
+  capcheck CAP_CPU=1 CAP_MEM=1GiB CAP_DISK=3GiB cpu= memory= disk= size=
+check "caps: a disk budget EQUAL to the default root refuses too (images count)" 2 "disk 20GiB in total" \
+  capcheck CAP_DISK=20GiB cpu= memory= disk= size=
+caps_never_mint() { ! capcheck CAP_CPU=1 cpu= memory= disk= size= 2>&1 | grep -q MINT; }
+check "caps: ...and never mint anything adjusted" 0 "" caps_never_mint
+check "caps: caps above the defaults pass untouched" 0 "MINT CPU=2 MEM=2GiB DISK=20GiB" \
+  capcheck CAP_CPU=8 CAP_MEM=16GiB CAP_DISK=200GiB cpu= memory= disk= size=
+check "caps: sizes the caller chose are left for Incus to judge" 0 "MINT CPU=2 MEM=2GiB DISK=20GiB" \
+  capcheck CAP_CPU=1 CAP_MEM=1GiB CAP_DISK=3GiB cpu=2 memory=2GiB disk=20GiB size=
+check "caps: no caps, no refusal" 0 "MINT CPU=2" capcheck cpu= memory= disk= size=
+check "caps: clamping is gone — nothing adjusts a size behind the caller's back" 1 "" grep -q 'clamp_to_grant_caps' "$BOX"
+# shellcheck disable=SC2016  # $-strings expand in the child shell, by design
+check "new: cmd_new checks the caps after load_seed" 0 "" bash -c '
+  awk "/^cmd_new\(\) \{/,/^\}/" "$1" | grep -A1 "^    load_seed$" | grep -q "check_grant_caps"' _ "$BOX"
+rm -f "$CLFN"
+check "help grant documents --pool and the caps" 0 "--pool NAME --pool-size SIZE gives the grant a storage pool" "$BOX" help grant
+# shellcheck disable=SC2016  # the $-strings are literals in the target file
+check "new: a pooled grant sizes a container's root too (#282)" 0 "" bash -c '
+  awk "/^cmd_new\(\) \{/,/^\}/" "'"$ROOT"'/bin/box" | grep -q "box_grant_pool)\" \]; then extra+=(--device \"root,size=\$T_DISK\")"'
+rm -rf "$GS"
+
+# --- revoke of a SERVICE grant, driven (#285) --------------------------------
+RS="$(mktemp -d)"; mkdir -p "$RS/bin" "$RS/state"
+rs_stub() { printf '#!/usr/bin/env bash\n%s\n' "$2" >"$RS/bin/$1"; chmod +x "$RS/bin/$1"; }
+# shellcheck disable=SC2016  # stub bodies expand when they run
+{
+rs_stub id 'case "$*" in "-u") echo 0 ;; "-u svc") echo 1500 ;; "-nG svc") echo "svc incus" ;; *) exit 2 ;; esac'
+rs_stub getent '[ "$2" = svc ]'
+rs_stub gpasswd 'echo "gpasswd $*" >>"$RS/log"'
+rs_stub pgrep 'exit 1'
+rs_stub ps 'cat "$RS/state/units" 2>/dev/null; exit 0'
+rs_stub incus 'st="$RS/state"; log() { echo "incus $*" >>"$RS/log"; }
+p=""; if [ "$1" = --project ]; then p="$2"; shift 2; fi
+case "$*" in
+  "project show user-1500") [ ! -e "$st/project-gone" ] ;;
+  "project get user-1500 user.box.service") cat "$st/service" 2>/dev/null; exit 0 ;;
+  "project get user-1500 user.box.pool") cat "$st/pool" 2>/dev/null; exit 0 ;;
+  "storage get gig user.box.grant") cat "$st/pool-owner" 2>/dev/null; exit 0 ;;
+  "storage get default user.box.grant") exit 0 ;;
+  "storage list --format csv -c n") printf "default\ngig\n" ;;
+  "storage show gig") printf "name: gig\nused_by:\n- /1.0/instances/r1?project=user-1500\n%s\nstatus: Created\n" "$(cat "$st/foreign" 2>/dev/null)" ;;
+  "storage delete gig") log "$*" ;;
+  "list --format csv --columns n") echo r1 ;;
+  "delete -f r1") log "--project $p $*" ;;
+  "image list --format csv --columns f") : ;;
+  "profile list --format csv --columns n") printf "default\nbox-profile\ngig-untrusted\n" ;;
+  "profile delete "*) log "--project $p $*" ;;
+  "storage list --format csv --columns n") printf "default\ngig\n" ;;
+  "storage volume list gig --format csv --columns tn") printf "custom,cache\ncontainer,r1\n" ;;
+  "storage volume list default --format csv --columns tn") : ;;
+  "storage volume delete "*) log "--project $p $*" ;;
+  "project delete user-1500") log "$*"; : >"$st/project-gone" ;;
+  "network delete "*|"network show "*) exit 1 ;;
+  "config trust list --format csv --columns nf") : ;;
+  *) echo "STUB: unexpected incus ${p:+--project $p }$*" >&2; exit 3 ;;
+esac'
+}
+rs_reset() { rm -rf "$RS/state" "$RS/log"; mkdir -p "$RS/state"; : >"$RS/log"; echo true >"$RS/state/service"; echo gig >"$RS/state/pool"; echo svc >"$RS/state/pool-owner"; }
+rs_revoke() { env PATH="$RS/bin:$PATH" RS="$RS" BOX_YES=1 bash "$ROOT/host/revoke-user.sh" "$@"; }
+rs_log() { cat "$RS/log"; }
+
+rs_reset; printf 'garm.service\nuser@1500.service\n' >"$RS/state/units"
+check "revoke: refuses a service whose unit still runs, naming it" 1 "garm.service" rs_revoke svc
+check "revoke: the refusal says to stop it first" 1 "stop them first, so it drains" rs_revoke svc
+# shellcheck disable=SC2016  # the $-strings expand in the child shell, by design
+check "revoke: the user's own systemd manager is not the service" 1 "" bash -c 'env PATH="'"$RS"'/bin:$PATH" RS="'"$RS"'" bash "'"$ROOT"'/host/revoke-user.sh" svc 2>&1 | grep -q "  user@"'
+check "revoke: the running-unit refusal comes first, even with --purge --purge-pool" 1 "garm.service" rs_revoke svc --purge --purge-pool
+check "revoke: --force revokes anyway, loudly" 0 "WARNING: --force" rs_revoke svc --force
+rs_reset
+check "revoke --purge on a service: every tool profile and custom volume goes, then the project" 0 "kept: grant pool gig" rs_revoke svc --purge
+check "revoke --purge: a tool's profile is deleted" 0 "profile delete gig-untrusted" rs_log
+check "revoke --purge: a custom volume is deleted" 0 "--project user-1500 storage volume delete gig cache" rs_log
+check "revoke --purge: an instance's own volume is not deleted by hand" 1 "" grep -q "volume delete gig r1" "$RS/log"
+check "revoke --purge: 'default' is never deleted" 1 "" grep -q "profile delete default" "$RS/log"
+check "revoke --purge: the pool survives a plain purge" 1 "" grep -q "storage delete gig" "$RS/log"
+rs_reset
+check "revoke --purge --purge-pool deletes the grant pool" 0 "purge: grant pool gig removed" rs_revoke svc --purge --purge-pool
+rs_reset; printf -- '- /1.0/images/abc123\n- /1.0/images/abc123?project=user-1002\n' >"$RS/state/foreign"
+check "revoke --purge-pool: image caches on the pool are not 'foreign' (rehearsal finding)" 0 "purge: grant pool gig removed" \
+  rs_revoke svc --purge --purge-pool
+check "revoke --purge-pool: ...the image cache volume is dropped before the pool" 0 "storage volume delete gig image/abc123" rs_log
+rs_reset; echo "- /1.0/instances/other?project=user-1600" >"$RS/state/foreign"
+check "revoke --purge-pool: refused while the pool is shared, before anything is purged" 1 "used outside user-1500" rs_revoke svc --purge --purge-pool
+check "revoke --purge-pool: the refusal deleted nothing" 1 "" grep -q "delete" "$RS/log"
+rs_reset; echo other >"$RS/state/pool-owner"
+check "revoke --purge-pool: someone else's pool is never deleted" 1 "is not svc's grant pool" rs_revoke svc --purge --purge-pool
+# A PERSON's grant can own a pool too (#282): --purge-pool works for it (#285).
+rs_reset; : >"$RS/state/service"
+check "revoke --purge-pool works for a person's pooled grant too" 0 "purge: grant pool gig removed" rs_revoke svc --purge --purge-pool
+# The pool is found by its own marker, so a purge that lost the project and
+# then failed on the pool can be finished by a re-run.
+rs_reset; : >"$RS/state/project-gone"; : >"$RS/state/pool"
+check "revoke: a re-run after the project is gone still finds and removes the grant pool" 0 "purge: grant pool gig removed" rs_revoke svc --purge --purge-pool
+check "revoke: --purge-pool without --purge is a usage error" 2 "--purge-pool goes with --purge" rs_revoke svc --purge-pool
+rs_reset; mkdir -p "$RS/sudoers.d" "$RS/shares"; echo rule >"$RS/sudoers.d/box-share-svc"; echo staging >"$RS/shares/svc"
+check "revoke: a shared tenant's sudoers rule and record go with the revoke (#287)" 0 "share: removed" \
+  env BOX_SUDOERS_D="$RS/sudoers.d" BOX_SHARE_DIR="$RS/shares" PATH="$RS/bin:$PATH" RS="$RS" bash "$ROOT/host/revoke-user.sh" svc
+check "revoke: ...the rule file is gone" 1 "" test -e "$RS/sudoers.d/box-share-svc"
+rs_reset; : >"$RS/state/service"; : >"$RS/state/pool"
+check "revoke: --force on a person's grant is refused" 2 "for service grants" rs_revoke svc --force
+printf 'something.service\n' >"$RS/state/units"
+check "revoke: a person's grant ignores running units (unchanged)" 0 "revoked: svc no longer has the restricted tier" rs_revoke svc
+rm -rf "$RS"
 check "revoke: group removal is the lockout" 0 "" \
   grep -qF 'gpasswd -d' "$ROOT/host/revoke-user.sh"
 # Group membership is read at login: purge must terminate live sessions (a
 # stale-group process could recreate the project unhardened AFTER the purge),
 # and a bare revoke must say the socket survives in held sessions.
+check "revoke --purge: restarts incus-user after removing a uid's state (it caches it; rehearsal finding)" 0 "" \
+  grep -qF 'systemctl stop incus-user.service' "$ROOT/host/revoke-user.sh"
+check "revoke --purge: ...the service, never the socket" 1 "" grep -qF 'stop incus-user.socket' "$ROOT/host/revoke-user.sh"
 check "revoke: purge terminates live sessions first" 0 "" \
   grep -qF 'loginctl terminate-user' "$ROOT/host/revoke-user.sh"
 check "revoke: purge refuses under unkillable sessions" 0 "" \
@@ -2418,7 +2787,7 @@ check "revoke: the purge asserts the certificate's absence too" 0 "" \
 # A failed grant must not leave a half-granted user: if THIS run added the
 # group, the exit path takes it back (and the trap disarms only on success).
 check "grant: backs out its own group-add on failure" 0 "" \
-  grep -qF 'trap backout EXIT' "$ROOT/host/grant-user.sh"
+  grep -qE "^trap '([a-z_]+( \|\| true)?; )*backout' EXIT" "$ROOT/host/grant-user.sh"
 check "grant: the back-out disarms on success" 0 "" \
   grep -qF 'trap - EXIT' "$ROOT/host/grant-user.sh"
 # The backout must VERIFY the removal and scream when it cannot — an
@@ -2649,6 +3018,16 @@ check "setup-host: the restricted gate precedes the sudo resolution" 0 "" bash -
   gate="$(grep -n "restricted tier" "'"$ROOT"'/host/setup-host.sh" | head -1 | cut -d: -f1)"
   sudo="$(grep -n "^elif command -v sudo" "'"$ROOT"'/host/setup-host.sh" | head -1 | cut -d: -f1)"
   [ -n "$gate" ] && [ -n "$sudo" ] && [ "$gate" -lt "$sudo" ]'
+# dnsmasq-base (#280): installed where apt is the manager, skipped once there,
+# and BEFORE the bridge is created (Incus needs it to serve boxnet).
+check "setup-host: installs dnsmasq-base when it is missing" 0 "" \
+  grep -qF 'apt_get install -y dnsmasq-base' "$ROOT/host/setup-host.sh"
+check "setup-host: ...only when /usr/sbin/dnsmasq is absent and apt exists" 0 "" \
+  grep -qF 'if [ ! -x /usr/sbin/dnsmasq ] && command -v apt-get >/dev/null 2>&1; then' "$ROOT/host/setup-host.sh"
+# shellcheck disable=SC2016  # the $-strings expand in the child shell, by design
+check "setup-host: ...before boxnet is created" 0 "" bash -c '
+  f="'"$ROOT"'/host/setup-host.sh"
+  [ "$(grep -n "install -y dnsmasq-base" "$f" | cut -d: -f1)" -lt "$(grep -n "incus network create boxnet" "$f" | head -1 | cut -d: -f1)" ]'
 check "setup-host: enables incus-user.socket for the tier" 0 "" \
   grep -qF 'incus-user.socket' "$ROOT/host/setup-host.sh"
 check "doctor: honors BOX_TIER" 0 "" \
@@ -2682,12 +3061,21 @@ cat > "$CSHIM/incus" <<'SHIM'
 # one probe resolve_box makes so a box called 'work' exists and is ours.
 [ -n "${FAKE_INCUS_LOG:-}" ] && printf 'incus %s\n' "$*" >> "$FAKE_INCUS_LOG"
 case "$*" in
-  "config get work user.box") echo 1 ;;
+  "config get work user.box"|"config get --expanded work user.box") echo 1 ;;
   "exec work -- bash -l")
     if [ "${FAKE_ROOT_STOPPED:-0}" = 1 ]; then
       echo "Error: Instance is not running" >&2
       exit 1
     fi ;;
+  # The guest's passwd for the entry model (#291): FAKE_GUEST_USERS is a
+  # space-separated list of regular users the box "has".
+  "exec work -- getent passwd")
+    uid=1000; for u in ${FAKE_GUEST_USERS:-}; do echo "$u:x:$uid:$uid::/home/$u:/bin/bash"; uid=$((uid+1)); done
+    echo "root:x:0:0:root:/root:/bin/bash" ;;
+  "exec work -- getent passwd "*)
+    [ -z "${FAKE_EXEC_DOWN:-}" ] || { echo "Error: Instance is not running" >&2; exit 1; }
+    want="${*: -1}"; for u in ${FAKE_GUEST_USERS:-}; do [ "$u" = "$want" ] && { echo "$u:x:1000:1000::/home/$u:/bin/bash"; exit 0; }; done; exit 2 ;;
+  "config get work user.box.user") echo "${FAKE_LEGACY_STAMP:-}" ;;
   "config get "*)             exit 1 ;;
 esac
 exit 0
@@ -2721,13 +3109,63 @@ check "root: a nonexistent box fails through the shared box guard" 1 "no such bo
 root_stopped() { FAKE_ROOT_STOPPED=1 runbox "$CWORK/root-stopped.log" root work; }
 check "root: a stopped box preserves Incus's failure" 1 "Instance is not running" \
   root_stopped
-# shellcheck disable=SC2016  # $inst and the command substitution are literal bin/box source.
-check "root: shell implementation remains the tenant-user contract" 0 "" \
-  grep -qFx 'cmd_shell() { incus exec "$inst" -- sudo -u "$(box_user "$inst")" -i; }' "$BOX"
-check "root: live rehearsal removes the tenant sudoers entry" 0 "" \
+# The entry model (#291, amended 2026-11-22): root by default, --user opt-in
+# and refusing, never a fallback; a hint when exactly one regular user exists.
+SHLOG="$CWORK/shell.log"
+check "shell: enters as root by default (#291)" 0 "" runbox "$SHLOG" shell work
+check "shell: ...as a root login shell, no sudo" 0 "" grep -qFx 'incus exec work -- bash -l' "$SHLOG"
+check "shell: ...and no guest sudo at all" 1 "" grep -q 'sudo' "$SHLOG"
+shell_one_user() { FAKE_GUEST_USERS=claude runbox "$SHLOG" shell work; }
+check "shell: with exactly one regular user, a hint names it — never a switch" 0 \
+  "entering as root; this box has user claude (--user claude)" shell_one_user
+check "shell: ...and it still entered as root" 0 "" grep -qFx 'incus exec work -- bash -l' "$SHLOG"
+shell_two_users_no_hint() { ! FAKE_GUEST_USERS="claude ops" runbox "$SHLOG" shell work | grep -q "entering as root"; }
+check "shell: two regular users, no hint" 0 "" shell_two_users_no_hint
+shell_as_claude() { FAKE_GUEST_USERS=claude runbox "$SHLOG" shell --user claude work; }
+check "shell --user claude enters as claude" 0 "" shell_as_claude
+check "shell --user: ...through a login shell as that user, via runuser (no guest sudo needed)" 0 "" grep -qFx 'incus exec work -- runuser -l claude' "$SHLOG"
+shell_as_ghost() { FAKE_GUEST_USERS="claude ops" runbox "$SHLOG" shell --user ghost work; }
+check "shell --user ghost refuses (exit 2), naming who exists" 2 "no user 'ghost' in work — it has: claude ops" shell_as_ghost
+check "shell --user ghost: ...and never fell back to root" 1 "" grep -q 'bash -l' "$SHLOG"
+shell_as_ghost_empty() { runbox "$SHLOG" shell --user ghost work; }
+check "shell --user on a root-only box says box creates no users" 2 "it has no users but root" shell_as_ghost_empty
+exec_as_ghost() { runbox "$SHLOG" exec --user ghost work -- id -u; }
+check "exec --user ghost refuses too, never running as root" 2 "no user 'ghost' in work" exec_as_ghost
+check "exec --user ghost: ...nothing ran" 1 "" grep -q 'bash -lc' "$SHLOG"
+exec_root() { runbox "$SHLOG" exec work -- id -u; }
+check "exec runs as root by default (#291)" 0 "" exec_root
+check "exec: ...with no sudo in the way" 0 "" grep -qF 'incus exec work -- bash -lc cd ~ && exec "$@" _ id -u' "$SHLOG"
+shell_zero_users_no_hint() { ! runbox "$SHLOG" shell work | grep -q "entering as root"; }
+check "shell: a root-only box prints no hint" 0 "" shell_zero_users_no_hint
+legacy_box() { FAKE_LEGACY_STAMP=claude FAKE_GUEST_USERS=claude runbox "$SHLOG" shell work; }
+check "shell: a pre-0.11 box stamped user.box.user=claude enters as ROOT by default (#291)" 0 "" legacy_box
+check "shell: ...the stamp was not even read to choose" 1 "" grep -q 'config get work user.box.user' "$SHLOG"
+legacy_box_as_claude() { FAKE_LEGACY_STAMP=claude FAKE_GUEST_USERS=claude runbox "$SHLOG" shell --user claude work; }
+check "shell: ...and --user claude enters as claude" 0 "" legacy_box_as_claude
+check "shell: ...via runuser -l claude" 0 "" grep -qFx 'incus exec work -- runuser -l claude' "$SHLOG"
+user_down() { FAKE_EXEC_DOWN=1 runbox "$SHLOG" shell --user claude work; }
+# The real require_guest_user's passwd parse: shell field, empty field, nologin.
+RGFN="$(mktemp)"; awk '/^require_guest_user\(\) \{/,/^\}/; /^box_regular_users\(\) \{/,/^\}/' "$BOX" > "$RGFN"
+# shellcheck disable=SC2016  # expands in the child shell
+rgshell() { PWLINE="$1" bash -c '. "$0"; usage_error(){ exit 2; }; incus(){ echo "client warning: x:y" >&2; printf "%s\n" "$PWLINE"; }; require_guest_user i b u; echo "SH=$guest_shell"' "$RGFN"; }
+check "--user: the login shell comes from the passwd line, not from stderr noise" 0 "SH=/bin/zsh" rgshell "u:x:1000:1000::/home/u:/bin/zsh"
+check "--user: an empty shell field becomes /bin/sh" 0 "SH=/bin/sh" rgshell "u:x:1000:1000::/home/u:"
+check "--user: a nologin shell becomes /bin/sh, never \$SHELL=nologin" 0 "SH=/bin/sh" rgshell "u:x:1000:1000::/home/u:/usr/sbin/nologin"
+rm -f "$RGFN"
+check "shell --user on a box whose agent is down says so (exit 1), not 'no such user'" 1 "could not look up user 'claude' in work (is it running?)" user_down
+check "--user with an empty value is refused, never a root entry (#291 review)" 2 "--user needs a value" "$BOX" exec --user "" work -- id -u
+check "box root --user is refused, pointing at box shell --user" 2 "box shell --user claude <box>" "$BOX" root --user claude work
+check "--user on another verb is refused, not ignored" 2 "--user is for 'box shell' and 'box exec'" "$BOX" info --user claude work
+check "--autostart on a verb other than new is refused" 2 "are 'box new' flags" "$BOX" import --autostart x.tar.gz
+# shellcheck disable=SC2016  # $-strings expand in the child shell, by design
+check "box help lists no removed verb (tmux, templates) (#289, #288)" 1 "" bash -c '"$1" help | grep -qE "^  (tmux|templates) "' _ "$BOX"
+check "box help tmux still explains the removal" 0 "Removed in 0.11.0" "$BOX" help tmux
+check "box_user() is gone — nothing reads user.box.user to pick an entry (#291)" 1 "" \
+  grep -qE '^box_user\(\)' "$BOX"
+check "root: live rehearsal proves the tenant holds no sudoers entry" 0 "" \
   grep -qF 'box root precondition:' "$ROOT/drill/multiuser.sh"
-check "root: live rehearsal measures tenant and root entry identities" 0 "" \
-  grep -qF 'entry identities after removing' "$ROOT/drill/multiuser.sh"
+check "root: live rehearsal measures the root default, --user and root entries (#291)" 0 "" \
+  grep -qF 'entry identities (#291)' "$ROOT/drill/multiuser.sh"
 check "root: live rehearsal refuses a foreign root shell" 0 "" \
   grep -qF 'cannot box root' "$ROOT/drill/multiuser.sh"
 
@@ -3026,10 +3464,16 @@ case "$*" in
   # Both 'config get <i> <key>' and its --expanded form (#171 reads what the
   # instance will RUN with, profiles included) — the key is the last word
   # either way, so one arm answers both.
+  # FAKE_CFG_EXPANDED, when set, adds keys only the --expanded view carries —
+  # a profile's user.box (#284).
   "config get "*)
     [ -n "${FAKE_CFG:-}" ] || exit 0
     key="$*"; key="${key##* }"
-    awk -v k="$key" '$1 == k { $1 = ""; sub(/^ /, ""); print }' "$FAKE_CFG" ;;
+    hit="$(awk -v k="$key" '$1 == k { $1 = ""; sub(/^ /, ""); print }' "$FAKE_CFG")"
+    if [ -z "$hit" ] && [ -n "${FAKE_CFG_EXPANDED:-}" ] && [[ "$*" == *--expanded* ]]; then
+      hit="$(awk -v k="$key" '$1 == k { $1 = ""; sub(/^ /, ""); print }' "$FAKE_CFG_EXPANDED")"
+    fi
+    [ -z "$hit" ] || printf '%s\n' "$hit" ;;
   "snapshot list "*)     printf '%s' "${FAKE_SNAPS-}" ;;
   "config device get "*) printf '%s\n' "${FAKE_ROOT_SIZE-}" ;;
   "config show "*)       printf '%s\n' "${FAKE_SHOW-}"; exit "${FAKE_SHOW_RC:-0}" ;;
@@ -3085,7 +3529,7 @@ restamp_has() { grep -F 'config set' "$1" | grep -qE "$2"; }
 # --- the write half: a fresh mint ------------------------------------------
 MLOG="$MWORK/mint.log"
 check "mint: a shimmed 'box new' runs to completion" 0 "ready" \
-  mintbox "$MLOG" new --name w1 --user claude --container
+  mintbox "$MLOG" new --name w1 --container
 # shellcheck disable=SC2016  # $1 expands in the child shell, by design.
 check "mint: a fresh mint creates exactly one snapshot (#213)" 0 "1" \
   bash -c 'grep -c "^incus snapshot create " "$1"' _ "$MLOG"
@@ -3160,10 +3604,10 @@ check "mint: the default path takes the small cpu row (#159)" 0 "" \
   launch_has "$MLOG" 'limits\.cpu=2'
 check "mint: the default path takes the small memory row (#159)" 0 "" \
   launch_has "$MLOG" 'limits\.memory=2GiB'
-check "mint: --user reaches cloud-init (#159, #214)" 0 "" \
-  launch_has "$MLOG" 'name: "claude"'
-check "mint: --user reaches the stamp (#159, #214)" 0 "" \
-  launch_has "$MLOG" 'user\.box\.user=claude'
+check "mint: cloud-init creates no user (#291)" 1 "" \
+  launch_has "$MLOG" 'name: "'
+check "mint: no user is stamped (#291)" 1 "" \
+  launch_has "$MLOG" 'user\.box\.user='
 # THE OFFLINE PROOF, at the mint rather than at the renderer (#214). A mint of
 # a pin-bearing seed used to make a HEAD request and DIE if it failed; the shim
 # curl fails every call, so a surviving probe would both log a line and take
@@ -3191,19 +3635,20 @@ for k in schema version image mode created origin; do
     launch_has "$MLOG" "user\.box\.$k="
 done
 
-# The one surviving dedicated template must keep the values load_template
-# read from its seed. Runtime role/user variables are empty on this path, so
-# this drive catches any later assignment that erases staging's identity and
-# silently skips convergence (#159 review round 1).
+# The staging box WITHOUT its template (#288): the flags reproduce what
+# staging-box's box.env carried — VM only, autostart, medium — through the
+# same mint path every box takes.
+RVLOG="$MWORK/require-vm-container.log"
+check "mint: --require-vm --container is refused when driven (#68, #288)" 2 "--require-vm refuses container mode" \
+  mintbox "$RVLOG" new --name rv --require-vm --container
+check "mint: ...and nothing was launched" 1 "" grep -q 'incus launch' "$RVLOG"
 STAGINGLOG="$MWORK/staging-template.log"
-mintbox "$STAGINGLOG" new --name staging --template staging-box --vm >/dev/null 2>&1
-check "mint staging: keeps the seed user stamp (#159)" 0 "" \
-  launch_has "$STAGINGLOG" 'user\.box\.user=ops'
-check "mint staging: keeps the server autostart demand (#68, #159)" 0 "" \
+mintbox "$STAGINGLOG" new --name staging --size medium --autostart --require-vm >/dev/null 2>&1
+check "mint staging: --autostart stamps the server autostart demand (#68, #288)" 0 "" \
   launch_has "$STAGINGLOG" 'boot\.autostart=true'
-check "mint staging: launches as a VM (#68, #159)" 0 "" \
+check "mint staging: --require-vm launches as a VM (#68, #288)" 0 "" \
   launch_has "$STAGINGLOG" ' --vm '
-check "mint staging: keeps its 60GiB VM root device (#68, #159)" 0 "" \
+check "mint staging: --size medium keeps its 60GiB VM root device (#68, #288)" 0 "" \
   launch_has "$STAGINGLOG" 'root,size=60GiB'
 check "mint staging: disables VM secure boot (#159)" 0 "" \
   launch_has "$STAGINGLOG" 'security\.secureboot=false'
@@ -3213,8 +3658,6 @@ check "mint staging: execs no converger of its own (#214)" 1 "" \
   grep -qE '^incus exec staging .* bootstrap' "$STAGINGLOG"
 check "mint staging: renders no installer line into its seed (#214)" 1 "" \
   launch_has "$STAGINGLOG" 'install\.sh'
-check "mint staging: keeps the ops sudo line in the rendered seed (#214)" 0 "" \
-  launch_has "$STAGINGLOG" 'NOPASSWD:ALL'
 # The retired keys are absent HERE too: staging-box was the one seed that
 # actually declared BOX_BOOTSTRAP_ROLE, so it is the one whose stamp would
 # still carry a role if the cut had been made only on the tenant path.
@@ -3253,16 +3696,11 @@ BOX_CPU=1 mintbox "$ENVBEATS" new --name envbeats \
 check "mint size: BOX_CPU beats --size medium (#159)" 0 "" \
   launch_has "$ENVBEATS" 'limits\.cpu=1'
 
-# --user rides the ordinary mint on its own (#214 D2): the tenant user was
-# never the role's to derive, so removing the role removes nothing from it.
+# box creates no users since 0.11.0 (#291): --user on new refuses before any
+# daemon call, so nothing is launched.
 USERLOG="$MWORK/user-override.log"
 mintbox "$USERLOG" new --name ada --user ada --container >/dev/null 2>&1
-check "mint: --user reaches the instance stamp with no role at all (#214)" 0 "" \
-  launch_has "$USERLOG" 'user\.box\.user=ada'
-check "mint: --user reaches cloud-init with no role at all (#214)" 0 "" \
-  launch_has "$USERLOG" 'name: "ada"'
-check "mint: an unnamed user still defaults to dev (#214)" 0 "" \
-  launch_has "$MEDIUMLOG" 'user\.box\.user=dev'
+check "mint: --user launches nothing — it is refused (#291)" 1 "" grep -q 'incus launch' "$USERLOG"
 # The pin environment is INERT at the mint, not merely at the renderer: box
 # reads neither variable, so neither reaches the seed, the stamp or the network.
 PINENVLOG="$MWORK/pin-env.log"
@@ -3301,7 +3739,7 @@ check "mint: ...and box_id() never asks the box for it (#181)" 0 "" \
 # An id every box shares is not an identity. Two mints, two ids.
 MLOG2="$MWORK/mint2.log"
 check "mint: a second mint runs to completion" 0 "ready" \
-  mintbox "$MLOG2" new --name w1b --user claude --container
+  mintbox "$MLOG2" new --name w1b --container
 stamped_id() { launchline "$1" | grep -oE 'user\.box\.id=[0-9a-f-]+' | head -1 | cut -d= -f2; }
 mint_ids_differ() {
   local a b; a="$(stamped_id "$1")"; b="$(stamped_id "$2")"
@@ -3330,10 +3768,12 @@ check "mint: stamps the mint time as UTC ISO 8601 (#103)" 0 "" \
 # does not rewrite it, and box_user()/the login hint read two of them.
 check "mint: the pre-existing boundary tag still rides the same line" \
   0 "user.box=1" launchline "$MLOG"
-check "mint: stamps the internal tenant seed every mint renders (#159, #214)" \
-  0 "user.box.template=tenant" launchline "$MLOG"
-check "mint: the pre-existing user stamp is untouched" \
-  0 "user.box.user=claude" launchline "$MLOG"
+check "mint: no longer stamps a template — there is none (#288)" \
+  1 "" launch_has "$MLOG" 'user\.box\.template='
+check "mint: ...while the launch line itself was read (the absence is real)" \
+  0 "user.box=1" launchline "$MLOG"
+check "mint: the user stamp is gone (#291)" \
+  1 "" launch_has "$MLOG" 'user\.box\.user='
 # Deliberately NOT stamped. limits.* already hold cpu/memory and a duplicate
 # drifts the first time someone edits a limit by hand; a container's disk does
 # not exist (its root rides the pool); and the tier is a fact about whoever is
@@ -4198,6 +4638,19 @@ infobox() {  # infobox <cfg-file> — 'box info work' against a canned config
   env FAKE_INCUS_LOG=/dev/null FAKE_CFG="$1" FAKE_ROW='work,RUNNING,VIRTUAL-MACHINE,0' \
     PATH="$MSHIM:$PATH" "$BOX" info work </dev/null 2>&1
 }
+# A tool's instance, tagged by its profile and never stamped (#284): it
+# resolves as a box, and info says where it came from instead of calling it old.
+PROFILE_ONLY="$(mktemp)"; : >"$PROFILE_ONLY"
+PROFILE_TAG="$(mktemp)"; echo "user.box 1" >"$PROFILE_TAG"
+# shellcheck disable=SC2016  # the $-strings expand in the child shell, by design
+check "info: an instance tagged only by profile resolves as a box (#284)" \
+  0 "minted outside box new" env FAKE_CFG_EXPANDED="$PROFILE_TAG" bash -c 'infobox_x() { env FAKE_INCUS_LOG=/dev/null FAKE_CFG="$1" FAKE_ROW="work,RUNNING,VIRTUAL-MACHINE,0" PATH="'"$MSHIM"':$PATH" "'"$BOX"'" info work </dev/null 2>&1; }; infobox_x "'"$PROFILE_ONLY"'"'
+check "info: an instance with no user.box on either level is not a box (#284)" \
+  1 "no such box: work" infobox "$PROFILE_ONLY"
+rm -f "$PROFILE_ONLY" "$PROFILE_TAG"
+# shellcheck disable=SC2016  # the $-strings expand in the child shell, by design
+check "resolve_box: reads user.box from the expanded config (#284)" 0 "" bash -c '
+  awk "/^resolve_box\(\) \{/,/^\}/" "'"$ROOT"'/bin/box" | grep -q "incus config get --expanded \"\$i\" user.box "'
 check "info: surfaces the mint time and the box that minted it (#103)" \
   0 "MINTED     2026-07-19T14:22:07Z by box 0.8.0" infobox "$STAMPED"
 check "info: surfaces the image alias AND what it resolved to (#103)" \
@@ -7058,7 +7511,7 @@ runfw() { # runfw <ufw|noufw> [VAR=val ...] — the real box-firewall, under shi
   # fwlog_ready below show what the run actually said. Overwritten per call by
   # design: every fwlog_ready sits immediately after its own runfw, so "the
   # last run" is always the run being diagnosed.
-  env PATH="$p" "$@" bash "$ROOT/host/box-firewall.sh" 2>"$WFW/last-run.err" || rc=$?
+  env PATH="$p" BOX_FIREWALL_D="${FW_DROPINS:-$WFW/no-dropins}" "$@" bash "$ROOT/host/box-firewall.sh" 2>"$WFW/last-run.err" || rc=$?
   cat "$WFW/last-run.err" >&2
   return "$rc"
 }
@@ -7192,6 +7645,88 @@ check "box-firewall: the nft path survives the boot window too" 0 "" \
 check "box-firewall: ...with the same interface-scoped carve-out" 0 "" \
   grep -qF 'add rule inet box input iifname boxnet udp dport { 53, 67 } accept' "$WFW/nftboot.log"
 
+
+# --- Drop-ins in /etc/box/firewall.d (#279) ----------------------------------
+FWD="$WFW/dropins"; mkdir -p "$FWD"
+runfw_d() { FW_DROPINS="$FWD" runfw "$@"; }
+printf 'tcp 9997\n# a comment\n\n  udp   5353   # trailing comment\ntcp 9997\n' >"$FWD/a-gig.conf"
+printf 'tcp 8080\n' >"$FWD/b-mirror.conf"
+check "box-firewall: drop-ins apply on a no-UFW host" 0 "" \
+  runfw_d noufw FAKE_IP4_BOXNET="$BX89" FAKE_NFT_LOG="$WFW/drop.log"
+check "box-firewall: ...a drop-in port is accepted to the GATEWAY only" 0 "" \
+  grep -qF 'add rule inet box input iifname boxnet ip daddr 10.89.0.1 tcp dport 9997 accept' "$WFW/drop.log"
+check "box-firewall: ...udp, with whitespace and a trailing comment" 0 "" \
+  grep -qF 'ip daddr 10.89.0.1 udp dport 5353 accept' "$WFW/drop.log"
+# shellcheck disable=SC2016  # $1 expands in the child shell, by design
+check "box-firewall: ...a port listed twice is one rule" 0 "" \
+  bash -c '[ "$(grep -c "tcp dport 9997 accept" "$1")" -eq 1 ]' _ "$WFW/drop.log"
+# shellcheck disable=SC2016  # $1 expands in the child shell, by design
+check "box-firewall: ...every drop-in lands BEFORE the final drop, in file order" 0 "" bash -c '
+  a="$(grep -n "dport 9997 accept" "$1" | cut -d: -f1)"; b="$(grep -n "dport 8080 accept" "$1" | cut -d: -f1)"
+  d="$(grep -n "iifname boxnet drop" "$1" | cut -d: -f1)"
+  [ -n "$a" ] && [ -n "$b" ] && [ -n "$d" ] && [ "$a" -lt "$b" ] && [ "$b" -lt "$d" ]' _ "$WFW/drop.log"
+printf 'tcp 7000\ntcp 99999\n' >"$FWD/c-bad.conf"
+check "box-firewall: a malformed line is reported as file:line" 0 "c-bad.conf:2: not 'tcp PORT' or 'udp PORT'" \
+  runfw_d noufw FAKE_IP4_BOXNET="$BX89" FAKE_NFT_LOG="$WFW/bad.log"
+check "box-firewall: ...its file contributes NOTHING (fails closed)" 1 "" grep -qF 'dport 7000' "$WFW/bad.log"
+check "box-firewall: ...the other files still apply" 0 "" grep -qF 'tcp dport 8080 accept' "$WFW/bad.log"
+rm -f "$FWD/c-bad.conf"
+for badline in 'tcp 0' 'tcp 08080' 'sctp 80' 'tcp 80 81' 'tcp' 'tcp -1' 'tcp 65536'; do
+  printf '%s\n' "$badline" >"$FWD/z.conf"
+  check "box-firewall --list-dropins: '$badline' is refused" 0 "z.conf:1:" \
+    env BOX_FIREWALL_D="$FWD" bash "$ROOT/host/box-firewall.sh" --list-dropins
+done
+rm -f "$FWD/z.conf"
+check "box-firewall: drop-ins are left CLOSED in the boot window (no gateway)" 0 "drop-in ports left closed" \
+  runfw_d noufw FAKE_IP4_BOXNET= FAKE_NFT_LOG="$WFW/dropboot.log"
+check "box-firewall: ...no drop-in rule in that window" 1 "" grep -qF 'dport 9997' "$WFW/dropboot.log"
+# No directory: the generated rules are byte-identical to the script before
+# drop-ins existed. The baseline is today's nft sequence as the pre-#279 script
+# (839888e) emitted it under these same shims, recorded here rather than read
+# from git, so a shallow checkout cannot skip the comparison.
+cat >"$WFW/before.log" <<'NFT'
+nft add table inet box
+nft add chain inet box input { type filter hook input priority -5 ; }
+nft flush chain inet box input
+nft add rule inet box input iifname boxnet ct state established,related accept
+nft add rule inet box input iifname boxnet udp dport { 53, 67 } accept
+nft add rule inet box input iifname boxnet tcp dport 53 accept
+nft add rule inet box input iifname boxnet drop
+nft list table bridge box
+nft add table bridge box
+nft add chain bridge box forward { type filter hook forward priority -200 ; policy accept ; }
+nft add rule bridge box forward meta ibrname boxnet meta obrname boxnet drop
+nft add table inet box
+nft add chain inet box expose-snat { type nat hook postrouting priority 110 ; }
+nft flush chain inet box expose-snat
+nft add rule inet box expose-snat oifname boxnet ip saddr 127.0.0.0/8 masquerade
+NFT
+check "box-firewall: with no firewall.d the run is clean" 0 "" \
+  runfw noufw FAKE_IP4_BOXNET="$BX89" FAKE_NFT_LOG="$WFW/after.log"
+check "box-firewall: ...and its nft rules are byte-identical to before #279" 0 "" \
+  diff "$WFW/before.log" "$WFW/after.log"
+# UFW: the same ports, tagged, above the deny; tagged rules no longer listed go.
+check "box-firewall: drop-ins on a UFW host" 0 "" \
+  runfw_d ufw FAKE_IP4_BOXNET="$BX88" FAKE_UFW_STATUS="$U_FRESH" FAKE_UFW_LOG="$WFW/ufwdrop.log"
+check "box-firewall: ...each port is a tagged gateway-only allow" 0 "" \
+  grep -qF "ufw insert 1 allow in on boxnet to 10.88.0.1 port 9997 proto tcp comment box-firewall.d" "$WFW/ufwdrop.log"
+# shellcheck disable=SC2016  # $1 expands in the child shell, by design
+check "box-firewall: ...inserted after the deny, so they sit above it" 0 "" bash -c '
+  d="$(grep -n "insert 1 deny in on boxnet" "$1" | cut -d: -f1)"; a="$(grep -n "port 9997 proto tcp comment" "$1" | cut -d: -f1)"
+  [ -n "$d" ] && [ -n "$a" ] && [ "$d" -lt "$a" ]' _ "$WFW/ufwdrop.log"
+U_STALE="$(printf 'Status: active\n\n[ 1] 10.88.0.1 53/tcp on boxnet ALLOW IN Anywhere\n[ 2] 10.88.0.1 4444/tcp on boxnet ALLOW IN Anywhere # box-firewall.d\n[ 3] 10.88.0.1 9997/tcp on boxnet ALLOW IN Anywhere # box-firewall.d\n[ 4] 10.77.0.1 8080/tcp on boxnet ALLOW IN Anywhere # box-firewall.d\n[ 5] 10.88.0.1 3000/tcp on boxnet ALLOW IN Anywhere\n')"
+check "box-firewall: stale tagged drop-in rules converge away" 0 "" \
+  runfw_d ufw FAKE_IP4_BOXNET="$BX88" FAKE_UFW_STATUS="$U_STALE" FAKE_UFW_LOG="$WFW/ufwstale.log"
+# shellcheck disable=SC2016  # the $-strings expand in the child shell, by design
+check "box-firewall: ...a port no longer listed is deleted, highest number first" 0 "" bash -c '
+  grep -q "ufw --force delete 4" "$1" && grep -q "ufw --force delete 2" "$1" &&
+  [ "$(grep -n "delete 4" "$1" | cut -d: -f1)" -lt "$(grep -n "delete 2" "$1" | cut -d: -f1)" ]' _ "$WFW/ufwstale.log"
+check "box-firewall: ...a listed port at the live gateway is kept" 1 "" grep -q "ufw --force delete 3" "$WFW/ufwstale.log"
+check "box-firewall: ...an operator's untagged rule is never touched" 1 "" grep -q "ufw --force delete 5" "$WFW/ufwstale.log"
+check "box-firewall --supports dropins answers yes" 0 "dropins" bash "$ROOT/host/box-firewall.sh" --supports dropins
+check "box-firewall --supports something-else answers no" 1 "" bash "$ROOT/host/box-firewall.sh" --supports frob
+check "box-firewall --list-dropins prints the effective ports" 0 "tcp 8080" env BOX_FIREWALL_D="$FWD" bash "$ROOT/host/box-firewall.sh" --list-dropins
+check "box-firewall: an unknown flag is a usage error" 2 "usage: box-firewall" bash "$ROOT/host/box-firewall.sh" --frob
 # ---------------------------------------------------------------------------
 # The doctor's UFW blind spot (#86 review item 1, second half): the ACL
 # check alone gave a remapped UFW host a clean bill while the stale UFW
@@ -7254,14 +7789,14 @@ check "probe ledger: the extracted block is valid bash" 0 "" bash -n "$LEDGERFN"
 # script around it, so the harness supplies it, exactly as the drill does.
 led() { bash -c "set -u; findings=(); . '$LEDGERFN'; $1"; }
 # A complete run: every phase emits what it declared.
-FULL='PHASE_RAN=([I]=1 [A]=8 [B]=45 [C]=9 [E]=7 [D]=0 [T]=1)'
+FULL='PHASE_RAN=([I]=1 [A]=8 [B]=47 [G]=16 [C]=9 [E]=7 [D]=0 [T]=1)'
 
 # shellcheck disable=SC2016  # the snippet is evaluated by led(), not here
-check "probe ledger: the declared total is 71" 0 "[71]" led 'printf "[%s]" "$(ledger_declared)"'
+check "probe ledger: the declared total is 89" 0 "[89]" led 'printf "[%s]" "$(ledger_declared)"'
 # The number CONTRIBUTING and drills/README.md have quoted all along with
 # nothing checking it. If a phase gains probes, both move together or this reds.
 check "probe ledger: ...which is the contract CONTRIBUTING states" 0 "" \
-  grep -qF '71-probe' "$ROOT/CONTRIBUTING.md"
+  grep -qF '89-probe' "$ROOT/CONTRIBUTING.md"
 # The README quotes the total too, and it was the ONE copy nothing checked —
 # so it sat at "84 checks, 84 passing" through a cut that moved every other
 # copy to 81. Driven off ledger_declared() like the rest, rather than a
@@ -7308,33 +7843,33 @@ check "probe ledger: ...and the total the README advertises (#214)" 0 "" \
 # The guard's own test, on the axis the round moved it: the denominator is
 # pinned and the numerator is free, so a run that HAD a failure is reportable.
 RQPROBE="$(mktemp)"
-printf 'currently **71 checks, 70 passing**\n' > "$RQPROBE"
-check "probe ledger: ...and a run with a failure is still quotable, 70/71" 0 "" \
+printf 'currently **89 checks, 88 passing**\n' > "$RQPROBE"
+check "probe ledger: ...and a run with a failure is still quotable, 88/89" 0 "" \
   readme_quotes_the_total "$RQPROBE"
 printf 'currently **84 checks, 84 passing**\n' > "$RQPROBE"
 check "probe ledger: ...while the drift that started this, 84/84, reds" 1 "advertises 84" \
   readme_quotes_the_total "$RQPROBE"
-printf 'currently **71 checks, 99 passing**\n' > "$RQPROBE"
+printf 'currently **89 checks, 99 passing**\n' > "$RQPROBE"
 check "probe ledger: ...and so does passing more probes than exist" 1 "more probes than exist" \
   readme_quotes_the_total "$RQPROBE"
 # The second copy, which 'head -1' would have read straight past: the first
 # total is correct here and the guard must still red.
-printf 'currently **71 checks, 70 passing**\nand elsewhere **84 checks, 84 passing**\n' > "$RQPROBE"
+printf 'currently **89 checks, 88 passing**\nand elsewhere **84 checks, 84 passing**\n' > "$RQPROBE"
 check "probe ledger: ...and a second total nothing would have read reds too" 1 "quotes 2 totals" \
   readme_quotes_the_total "$RQPROBE"
 rm -f "$RQPROBE"
 
 check "probe ledger: a complete run is short in nothing" 0 "[]" \
   led "$FULL; printf '[%s]' \"\$(ledger_short)\""
-check "probe ledger: a complete run's floor is the declared total" 0 "[71]" \
+check "probe ledger: a complete run's floor is the declared total" 0 "[89]" \
   led "$FULL; printf '[%s]' \"\$(ledger_expected)\""
 
 # THE regression. A phase that never executed used to be invisible: the pass
 # count simply ended lower and exit 0 vouched for it.
 check "probe ledger: a phase that never ran is named, not silently dropped" 0 "C(0/9)" \
   led "$FULL; PHASE_RAN[C]=0; printf '[%s]' \"\$(ledger_short)\""
-check "probe ledger: ...and one missing probe inside a phase is named too" 0 "B(44/45)" \
-  led "$FULL; PHASE_RAN[B]=44; printf '[%s]' \"\$(ledger_short)\""
+check "probe ledger: ...and one missing probe inside a phase is named too" 0 "B(46/47)" \
+  led "$FULL; PHASE_RAN[B]=46; printf '[%s]' \"\$(ledger_short)\""
 
 # A floor, not an equality: adding a probe must not red the commit that adds it.
 check "probe ledger: overshooting a phase is not a shortfall" 0 "[]" \
@@ -7342,7 +7877,7 @@ check "probe ledger: overshooting a phase is not a shortfall" 0 "[]" \
 
 # A declared skip is honest — it lowers the expectation by exactly its probes
 # and says so. The whole point is that the floor is never tuned down silently.
-check "probe ledger: a declared skip lowers the floor by its probes" 0 "[62]" \
+check "probe ledger: a declared skip lowers the floor by its probes" 0 "[80]" \
   led "$FULL; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; printf '[%s]' \"\$(ledger_expected)\""
 check "probe ledger: ...so a declared skip is not a shortfall" 0 "[]" \
   led "$FULL; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; printf '[%s]' \"\$(ledger_short)\""
@@ -7355,8 +7890,8 @@ check "probe ledger: an undeclared skip of the same phase still reds" 0 "C(0/9)"
   led "$FULL; PHASE_RAN[C]=0; printf '[%s]' \"\$(ledger_short)\""
 
 # DRILL_EXPECT raises the floor for an operator who knows the table is behind.
-check "probe ledger: DRILL_EXPECT overrides the total floor" 0 "[90]" \
-  led "DRILL_EXPECT=90; $FULL; printf '[%s]' \"\$(ledger_expected)\""
+check "probe ledger: DRILL_EXPECT overrides the total floor" 0 "[100]" \
+  led "DRILL_EXPECT=100; $FULL; printf '[%s]' \"\$(ledger_expected)\""
 
 # ok/no must keep returning 0 — the file's SC2015 disable at the top rests on it.
 check "probe ledger: tally returns 0 so ok/no still do" 0 "[0][0]" \
@@ -7364,7 +7899,7 @@ check "probe ledger: tally returns 0 so ok/no still do" 0 "[0][0]" \
 # A verdict emitted outside any ledgered phase means the table has drifted.
 check "probe ledger: an unattributed verdict is surfaced, not swallowed" 0 "unattributed" \
   led "PHASE=-; tally; ledger_line"
-check "probe ledger: the per-phase line is what a single total cannot say" 0 "B 45/45" \
+check "probe ledger: the per-phase line is what a single total cannot say" 0 "B 47/47" \
   led "$FULL; ledger_line"
 
 # The wiring, so the ledger cannot be left correct-but-unused.
@@ -7470,39 +8005,39 @@ summary_lacks() {   # 0 when the composed run does NOT say $1
   local needle="$1"; shift
   ! run_summary "$1" 2>&1 | grep -qF -e "$needle"
 }
-COMPLETE="$FULL; pass=71; fail=0"
+COMPLETE="$FULL; pass=89; fail=0"
 
-check "drill summary: a complete run reports 71/71 and EXITS 0" 0 "71/71 passed, 0 failed" \
+check "drill summary: a complete run reports 89/89 and EXITS 0" 0 "89/89 passed, 0 failed" \
   run_summary "$COMPLETE"
 
 # THE regression, end to end. Phase C never executed: 62 verdicts, none of them
 # failing, and the drill used to leave here 0 with "62 passed, 0 failed" on the
 # line an operator transcribes into drills/<version>.md as proof.
 check "drill summary: a phase that never ran EXITS NON-ZERO" 1 "the drill ran SHORT:" \
-  run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=62"
+  run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
 check "drill summary: ...naming the short phase, against the full denominator" 1 \
-  "short in: C(0/9)" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=62"
-check "drill summary: ...and the record carries 62/71, not a clean 62" 1 \
-  "62/71 passed, 1 failed" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=62"
+  "short in: C(0/9)" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
+check "drill summary: ...and the record carries 80/89, not a clean 80" 1 \
+  "80/89 passed, 1 failed" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
 # The verdict names both roads to a short phase, not just the commoner one.
 check "drill summary: ...and does not diagnose 'never ran' as the only cause" 1 \
-  "or failed before emitting the rest" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=62"
+  "or failed before emitting the rest" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
 
 # A DECLARED skip is the line between honest and tuned-down: same 62 verdicts,
 # but the run said which nine it was not going to emit, and why.
 check "drill summary: a declared skip lowers the floor and EXITS 0" 0 \
-  "62/62 passed, 0 failed" \
-  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=62"
+  "80/80 passed, 0 failed" \
+  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=80"
 check "drill summary: ...and the SKIP survives into the findings block" 0 \
   "SKIP: no isolation stack" \
-  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=62"
+  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=80"
 
 # The other road to non-zero: nothing short, one thing genuinely failed. Both
 # roads have to work, and the second must not be reported as the first.
 check "drill summary: a complete run with one real FAIL EXITS NON-ZERO" 1 \
-  "70/71 passed, 1 failed" run_summary "$COMPLETE; pass=70; fail=1"
+  "88/89 passed, 1 failed" run_summary "$COMPLETE; pass=88; fail=1"
 check "drill summary: ...and is not mislabelled as a short run" 0 "" \
-  summary_lacks "the drill ran SHORT:" "$COMPLETE; pass=86; fail=1"
+  summary_lacks "the drill ran SHORT:" "$COMPLETE; pass=88; fail=1"
 
 # ---------------------------------------------------------------------------
 # The record emitter (#152). drills/README.md asks a record for six things and
@@ -7795,10 +8330,16 @@ check "drill record: a set pin in the environment is not collected (#214)" 0 "[]
 # why the per-role mints left, which is the history the next reader needs.
 check "drill record: drill_stamp is gone from drill.sh's code (#214)" 1 "" \
   sf_names "$ROOT/drill/drill.sh" 'drill_stamp'
+# Phase G (#292) names the retired stamp and --role on exactly two lines, to
+# prove them ABSENT on a real daemon (#253 C1's #215 row); those lines carry the
+# marker "absence probe (#292)" and are the only ones the two checks skip.
+sf_names_unmarked() { strongform "$1" | grep -v 'absence probe (#292)' | grep -q -- "$2"; }
 check "drill record: drill.sh reads no retired stamp at all (#214)" 1 "" \
-  sf_names "$ROOT/drill/drill.sh" 'user\.box\.\(role\|rig\)'
+  sf_names_unmarked "$ROOT/drill/drill.sh" 'user\.box\.\(role\|rig\)'
 check "drill record: drill.sh passes no --role (#214)" 1 "" \
-  sf_names "$ROOT/drill/drill.sh" '--role'
+  sf_names_unmarked "$ROOT/drill/drill.sh" '--role'
+check "drill record: ...and exactly two lines carry the absence-probe marker" 0 "2" \
+  grep -c 'absence probe (#292)$' "$ROOT/drill/drill.sh"
 # The invocation still has to reproduce the run, so the flags and DRILL_EXPECT
 # stay; what leaves is the pin, because a prefix naming a variable box does not
 # read would claim a dependency box does not have.
@@ -7898,7 +8439,7 @@ check "drill record: a tree dirtied AFTER the install records the clean ref" 0 \
 # --- the record itself ------------------------------------------------------
 # A finished drill, pinned so every field is assertable. record_collect fills
 # only what is not already set, which is what lets a test pin the world away.
-RECSTATE="PHASE_RAN=([I]=1 [A]=8 [B]=45 [C]=9 [E]=7 [D]=0 [M]=10 [T]=1)
+RECSTATE="PHASE_RAN=([I]=1 [A]=8 [B]=47 [G]=16 [C]=9 [E]=7 [D]=0 [M]=10 [T]=1)
 REC_VERSION=9.9.9; REC_DATE=2026-07-21; REC_HOST='bare Debian 13, Incus 6.0.2'
 REC_RUN_ID=drill-9.9.9-20260721-01; REC_TREE_SHA=abc1234
 REC_TREE_REF=release/9.9.9; REC_TREE_REPO=heavy-duty/box
@@ -7908,7 +8449,7 @@ emit() {   # emit <state> → the record that state produces, on stdout
   rec "$RECSTATE; $1; record_write '$RECOUT'" >/dev/null 2>&1
   cat "$RECOUT" 2>/dev/null
 }
-CLEAN='pass=71; fail=0'
+CLEAN='pass=89; fail=0'
 
 # drills/README.md:34-42 asks for six things. One check each, because a record
 # missing one of them is the hand-transcription this replaces, reintroduced.
@@ -7944,16 +8485,16 @@ record_invocation_names_a_tree() { emit "$1" | grep -qE '^`.*--(repo|ref) '; }
 check "drill record: ...and names no repo or ref in it, there being none to get wrong" \
   1 "" record_invocation_names_a_tree "$CLEAN"
 check "drill record: gives the numbers and the wall clock" 0 \
-  "**71/71 passed, 0 failed.** 41 minutes wall clock." emit "$CLEAN"
+  "**89/89 passed, 0 failed.** 41 minutes wall clock." emit "$CLEAN"
 check "drill record: carries the per-phase ledger a single total cannot say" 0 \
-  "B 45/45" emit "$CLEAN"
+  "B 47/47" emit "$CLEAN"
 check "drill record: states the floor and the table's total as two facts" 0 \
-  "Probe floor: 71 expected this run; the table declares 71." emit "$CLEAN"
+  "Probe floor: 89 expected this run; the table declares 89." emit "$CLEAN"
 # DRILL_EXPECT can raise the floor above the table, and the record must not read
 # that as an error — the operator is deliberately demanding more than the table.
 check "drill record: ...which stays readable when DRILL_EXPECT raises the floor" 0 \
-  "Probe floor: 90 expected this run; the table declares 71." \
-  emit "DRILL_EXPECT=90; $CLEAN"
+  "Probe floor: 100 expected this run; the table declares 89." \
+  emit "DRILL_EXPECT=100; $CLEAN"
 # The record is pasted into a file and read months later. Escape codes in it are
 # the peculiar thing this issue found: every script emitted ANSI unconditionally.
 # Emitted here rather than read from the check above, so the assertion owns the
@@ -7975,19 +8516,19 @@ check "drill record: ...and says the judgement is the operator's to write" 0 \
 # 62 of 71 and failed none is not "62/62 passed" — and the record is precisely
 # where that fraction used to get written down as proof a release was drilled.
 check "drill record: a short run's denominator is the FLOOR, not what ran" 0 \
-  "**62/71 passed" emit "pass=62; fail=0; PHASE_RAN[C]=0"
+  "**80/89 passed" emit "pass=80; fail=0; PHASE_RAN[C]=0"
 check "drill record: ...and the short phase is named in it" 0 "C 0/9" \
-  emit "pass=62; fail=0; PHASE_RAN[C]=0"
+  emit "pass=80; fail=0; PHASE_RAN[C]=0"
 # A DECLARED skip is the honest half: the floor moves, and the record says which
 # probes were not expected and why — recorded as skipped, never as passing.
 check "drill record: a declared skip lowers the record's denominator" 0 \
-  "**62/62 passed" emit "pass=62; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
+  "**80/80 passed" emit "pass=80; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
 check "drill record: ...and the skip is recorded AS a skip, beside the failures" 0 \
   "- SKIP: no isolation stack" \
-  emit "pass=62; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
+  emit "pass=80; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
 check "drill record: ...and the waived probes are visible in the ledger line" 0 \
   "9 waived by declared skips" \
-  emit "pass=62; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
+  emit "pass=80; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
 check "drill record: failures land in it verbatim, uncoloured" 0 "- FAIL: the boundary held open" \
   emit "pass=86; fail=1; no 'the boundary held open' >/dev/null"
 check "drill record: a clean run says so rather than leaving a bare heading" 0 \
@@ -8028,7 +8569,7 @@ run_emit() {   # run_emit <state> — EXIT STATUS is the drill's own
 }
 check "drill emit: a clean run writes the record and still EXITS 0" 0 \
   "record written:" run_emit "$CLEAN"
-check "drill emit: ...and the file on disk is the record" 0 "**71/71 passed, 0 failed.**" \
+check "drill emit: ...and the file on disk is the record" 0 "**89/89 passed, 0 failed.**" \
   cat "$RECOUT"
 check "drill emit: ...pinned to the run ID the drill announced at install time" 0 \
   "drill-9.9.9-20260721-01" cat "$RECOUT"
@@ -8046,15 +8587,15 @@ check "drill: ...and no phase header sends the operator to the closed audit" 1 "
 # before that `no` fires would put a clean sweep in the record on a short run,
 # which is the defect #153 closed.
 check "drill emit: a short run EXITS NON-ZERO with a record written" 1 \
-  "record written:" run_emit "pass=62; fail=0; PHASE_RAN[C]=0"
+  "record written:" run_emit "pass=80; fail=0; PHASE_RAN[C]=0"
 check "drill emit: ...and the record it wrote carries the shortfall, not a sweep" 0 \
   "FAIL: the drill ran SHORT:" cat "$RECOUT"
-check "drill emit: ...against the full denominator, 62/71" 0 "**62/71 passed" cat "$RECOUT"
+check "drill emit: ...against the full denominator, 80/89" 0 "**80/89 passed" cat "$RECOUT"
 check "drill emit: a short run has no unattributed summary probe" 1 "" \
   grep -q 'unattributed' "$RECOUT"
 short_ledgers_agree() {
   local out terminal emitted
-  out="$(run_emit 'pass=62; fail=0; PHASE_RAN[C]=0')"
+  out="$(run_emit 'pass=80; fail=0; PHASE_RAN[C]=0')"
   terminal="$(printf '%s\n' "$out" | grep '^  probes')"
   # shellcheck disable=SC2016
   emitted="$(sed -n '/^```$/,/^```$/p' "$RECOUT" | grep '^  probes')"
@@ -9873,9 +10414,11 @@ case "${1:-}" in
     exit 0 ;;
   config)
     # resolve_box()'s boundary read, for the single-box path.
+    # Read --expanded since #284; the flag is skipped so both spellings answer.
     if [ "${2:-}" = get ]; then
+      shift 2; [ "${1:-}" != --expanded ] || shift
       for b in ${FAKE_BOXES:-}; do
-        if [ "$b" = "${3:-}" ] && [ "${4:-}" = user.box ]; then echo 1; exit 0; fi
+        if [ "$b" = "${1:-}" ] && [ "${2:-}" = user.box ]; then echo 1; exit 0; fi
       done
     fi
     exit 0 ;;
@@ -10891,8 +11434,8 @@ check "scope: bin/box still lands scope:cli" 0 "" \
   scope_of_is "$LABELER" bin/box scope:cli
 check "scope: drill/ — the rehearsal machinery — still lands scope:drill" 0 "" \
   scope_of_is "$LABELER" drill/doctor.sh scope:drill
-check "scope: templates/ still lands scope:templates" 0 "" \
-  scope_of_is "$LABELER" templates/box-init.sh scope:templates
+check "scope: seed/ lands scope:templates (#288)" 0 "" \
+  scope_of_is "$LABELER" seed/user-data.yaml scope:templates
 check "scope: install.sh still lands scope:installer" 0 "" \
   scope_of_is "$LABELER" install.sh scope:installer
 check "scope: host/ still lands scope:host" 0 "" \

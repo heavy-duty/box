@@ -33,11 +33,95 @@ set -euo pipefail
 self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 here="$(dirname "$(dirname "$self")")"
 
-usage() { echo "usage: box grant <user>" >&2; exit 2; }
+usage() {
+  echo "usage: box grant [--service [--share GROUP | --unshare]] [--pool NAME --pool-size SIZE] [--memory SIZE|none] [--cpu N|none] [--instances N|none] <user>" >&2
+  exit 2
+}
 
-[ $# -eq 1 ] || usage
-user="$1"
-case "$user" in -*) usage ;; esac
+# --service (#281): the user is a SERVICE, not a person — a no-login system
+# account a daemon runs as (gig or crew, heavy-duty/handbook proposal 0011).
+# Three things differ, each bought by how a person's grant would break it:
+#   · no usable home: the user-side incus calls get a throwaway HOME and
+#     INCUS_CONF, because the CLI wants ~/.config/incus before it connects and
+#     a --system account has none (the old '|| true' then blamed incus-user);
+#   · no host paths: incus-user's default lets a user attach disks under its
+#     home, which for a service means its own secrets mounted into an untrusted
+#     instance — the project is pinned to restricted.devices.disk=managed;
+#   · grant-then-start: a systemd service reads its groups once, at start, and
+#     a service that touches incus-user before the grant creates an unhardened
+#     project — the grant says so, and warns if the user already runs.
+service=0
+user=""
+# --pool/--pool-size (#282) and the caps (#283) converge only when given: a
+# re-run without them leaves what an earlier grant set (the pool is read back
+# from the project's user.box.pool marker for the profile's root, below).
+pool=""; pool_size=""; cap_memory=""; cap_cpu=""; cap_instances=""
+# --share GROUP / --unshare (#287): a shared tenant is a service grant a group
+# operates through 'box --as'. Converged only when given, like the pool.
+share_group=""; unshare=0
+need_val() {
+  if [ "$#" -lt 2 ] || [ -z "$2" ] || [ "${2#-}" != "$2" ]; then echo "box grant: $1 needs a value" >&2; usage; fi
+}
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --service) service=1 ;;
+    --pool)        need_val "$@"; pool="$2"; shift ;;
+    --pool-size)   need_val "$@"; pool_size="$2"; shift ;;
+    --memory)      need_val "$@"; cap_memory="$2"; shift ;;
+    --cpu)         need_val "$@"; cap_cpu="$2"; shift ;;
+    --instances)   need_val "$@"; cap_instances="$2"; shift ;;
+    --share)       need_val "$@"; share_group="$2"; shift ;;
+    --unshare)     unshare=1 ;;
+    -*) usage ;;
+    *) [ -z "$user" ] || usage; user="$1" ;;
+  esac
+  shift
+done
+[ -n "$user" ] || usage
+
+if [ -n "$share_group" ] || [ "$unshare" -eq 1 ]; then
+  [ "$service" -eq 1 ] || { echo "box grant: --share and --unshare are for service grants (--service): a person's project is theirs alone" >&2; exit 2; }
+  if [ -n "$share_group" ] && [ "$unshare" -eq 1 ]; then echo "box grant: --share and --unshare together make no sense" >&2; exit 2; fi
+fi
+if [ -n "$share_group" ]; then
+  [[ "$share_group" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "box grant: --share needs a group name, got '$share_group'" >&2; exit 2; }
+  # The tenant's name lands in a sudoers.d file name and in 'box --as', both of
+  # which take this charset only (sudo's includedir skips a name with a dot).
+  [[ "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "box grant --share: '$user' is not a name sudoers.d and 'box --as' can carry (lowercase letters, digits, _ and -)" >&2; exit 2; }
+fi
+share_bin="${BOX_SHARE_BIN:-/usr/local/bin/box}"
+share_dir="${BOX_SHARE_DIR:-/etc/box/shares}"
+sudoers_d="${BOX_SUDOERS_D:-/etc/sudoers.d}"
+
+# Sizes are Incus's own spelling (bytes, or N with kB/MB/GB/TB or KiB/MiB/GiB/
+# TiB); to_bytes is the one reader, so a check and a comparison never disagree.
+size_re='^[0-9]+(B|kB|KB|MB|GB|TB|KiB|MiB|GiB|TiB)?$'
+to_bytes() {
+  local v="$1" n u
+  n="${v%%[!0-9]*}"; u="${v#"$n"}"
+  case "$u" in
+    ""|B) echo "$n" ;;
+    kB|KB) echo $((n*1000)) ;;      MB) echo $((n*1000**2)) ;;
+    GB) echo $((n*1000**3)) ;;      TB) echo $((n*1000**4)) ;;
+    KiB) echo $((n*1024)) ;;        MiB) echo $((n*1024**2)) ;;
+    GiB) echo $((n*1024**3)) ;;     TiB) echo $((n*1024**4)) ;;
+    *) return 1 ;;
+  esac
+}
+if [ -n "$pool" ] || [ -n "$pool_size" ]; then
+  if [ -z "$pool" ] || [ -z "$pool_size" ]; then echo "box grant: --pool and --pool-size go together" >&2; exit 2; fi
+  [[ "$pool" =~ ^[a-z][a-z0-9-]{0,62}$ ]] || { echo "box grant: --pool must be a lower-case name (letters, digits, '-'), got '$pool'" >&2; exit 2; }
+  [ "$pool" != default ] || { echo "box grant: --pool default is the host's shared pool — a grant pool is its own" >&2; exit 2; }
+  if ! [[ "$pool_size" =~ $size_re ]] || [ "${#pool_size}" -gt 12 ]; then
+    echo "box grant: --pool-size must be a size like 200GiB, got '$pool_size'" >&2; exit 2
+  fi
+fi
+[ -z "$cap_memory" ] || [ "$cap_memory" = none ] || { [[ "$cap_memory" =~ $size_re ]] && [ "${#cap_memory}" -le 12 ]; } \
+  || { echo "box grant: --memory must be a size like 16GiB, or none — got '$cap_memory'" >&2; exit 2; }
+for c in "cpu:$cap_cpu" "instances:$cap_instances"; do
+  v="${c#*:}"; [ -z "$v" ] || [ "$v" = none ] || [[ "$v" =~ ^[1-9][0-9]{0,4}$ ]] \
+    || { echo "box grant: --${c%%:*} must be a whole number, or none — got '$v'" >&2; exit 2; }
+done
 
 # Root, or sudo — same decision, same reasons as setup-host.sh: granting
 # needs usermod and a run-as-the-user touch, both root's to give.
@@ -55,8 +139,12 @@ fi
 # exist there), sudo -u otherwise. -H so incus's client state lands in THEIR
 # home, not the admin's. stdin pinned: an incus client with a terminal on
 # stdin can go interactive and wedge a script that will never answer it.
+# The throwaway home a service's user-side incus calls run with (#281): made
+# below, once the user is known, and removed on every exit path.
+svc_home=""
 run_as() {
   local u="$1"; shift
+  if [ -n "$svc_home" ]; then set -- env HOME="$svc_home" INCUS_CONF="$svc_home/incus" "$@"; fi
   if [ -n "$SUDO" ]; then $SUDO -u "$u" -H -- "$@" </dev/null
   else runuser -u "$u" -- "$@" </dev/null
   fi
@@ -94,6 +182,18 @@ uid="$(id -u "$user")"
 admin_member=0
 if id -nG "$user" | tr ' ' '\n' | grep -qx incus-admin; then
   admin_member=1
+fi
+# A service in incus-admin is not fenced by anything this grant converges: the
+# admin socket wins (see the caveat at the end). The whole point of a service
+# grant is the fence, so refuse rather than hand out a project that binds
+# nothing (#281).
+if [ "$service" -eq 1 ] && [ "$admin_member" -eq 1 ]; then
+  echo "box grant --service: $user is in 'incus-admin', which no grant can fence; remove it first:  gpasswd -d $user incus-admin" >&2
+  exit 1
+fi
+if [ "$service" -eq 1 ] && pgrep -u "$user" >/dev/null 2>&1; then
+  echo "box grant --service: WARNING — processes owned by $user are running; they hold the groups they" >&2
+  echo "           started with. Restart the service after this grant (a service reads its groups at start)." >&2
 fi
 
 # The stack the tier converges ONTO must exist first. Checked via the daemon,
@@ -171,7 +271,24 @@ backout() {
     fi
   fi
 }
-trap backout EXIT
+# A service's throwaway home, owned by it (the CLI writes its config there).
+# Under /tmp explicitly: root's own $TMPDIR may be a 0700 per-user dir
+# (libpam-tmpdir's /tmp/user/0) the service could never enter. Every step is
+# $SUDO's: a non-root admin runs this script too. The trap is set FIRST, and
+# a failed cleanup can never skip the group backout.
+cleanup_svc_home() { [ -z "$svc_home" ] || $SUDO rm -rf -- "$svc_home" || true; }
+# A share this run wrote, backed out with the rest when the grant fails (#287).
+share_written=0
+backout_share() {
+  [ "$share_written" -eq 1 ] || return 0
+  $SUDO rm -f -- "$sudoers_d/box-share-$user" "$sudoers_d/.box-share-$user.tmp" "$share_dir/$user" || true
+  echo "box grant: FAILED — the share this run wrote was removed again" >&2
+}
+trap 'cleanup_svc_home || true; backout_share || true; backout' EXIT
+if [ "$service" -eq 1 ]; then
+  svc_home="$($SUDO mktemp -d /tmp/box-grant.XXXXXX)"
+  $SUDO chown "$user" "$svc_home"
+fi
 
 if id -nG "$user" | tr ' ' '\n' | grep -qx incus; then
   was_member=1
@@ -233,13 +350,38 @@ run_as_incus() {
 # 2. The project is created LAZILY, on the user's first contact with
 # incus-user — an admin cannot pre-create it (incus-user would fight over
 # it), so make that first contact happen now, as the user.
+preexisting=0
 if ! incus project show "$project" >/dev/null 2>&1 </dev/null; then
   echo "project: touching incus-user as $user to create $project..."
-  run_as_incus timeout 60 incus project list >/dev/null 2>&1 || true
-  incus project show "$project" >/dev/null 2>&1 </dev/null \
-    || { echo "box grant: incus-user did not create $project — is incus-user.socket healthy? (journalctl -u incus-user)" >&2; exit 1; }
+  # The touch's own stderr is kept (#281): swallowed, a client that failed
+  # before it ever connected (no home for its config) read as incus-user's fault.
+  # Up to three attempts, 2s apart: right after a purge removed this uid's
+  # incus-user state, the first contact can meet a reset socket (measured in
+  # the rehearsal: "read: connection reset by peer") and succeed a moment
+  # later. A timeout (124) is not retried — that is a wedge, not a blip.
+  touch_rc=0
+  for attempt in 1 2 3; do
+    touch_rc=0
+    touch_err="$(run_as_incus timeout 60 incus project list 2>&1 >/dev/null)" || touch_rc=$?
+    if [ "$touch_rc" -eq 0 ] || [ "$touch_rc" -eq 124 ]; then break; fi
+    if incus project show "$project" >/dev/null 2>&1 </dev/null; then break; fi
+    [ "$attempt" -eq 3 ] || sleep 2
+  done
+  if ! incus project show "$project" >/dev/null 2>&1 </dev/null; then
+    echo "box grant: incus-user did not create $project — is incus-user.socket healthy? (journalctl -u incus-user)" >&2
+    if [ "$touch_rc" -eq 124 ]; then
+      echo "  the touch as $user timed out after 60s" >&2
+    elif [ -n "$touch_err" ]; then
+      echo "  the touch as $user said: $touch_err" >&2
+      case "$touch_err" in *"connection reset by peer"*)
+        echo "  incus-user may still cache this uid's purged state — restart it, then re-run:  systemctl stop incus-user.service" >&2 ;;
+      esac
+    fi
+    exit 1
+  fi
   echo "project: $project created"
 else
+  preexisting=1
   echo "project: $project already exists"
 fi
 
@@ -288,13 +430,152 @@ echo "snapshots: allowed"
 incus project set "$project" restricted.backups allow </dev/null
 echo "backups: allowed ('box export' rides them, #70)"
 
+# 6b. A pool of the grant's own (#282). A full tenant pool then fails that
+# tenant and never 'default', which carries every other guest. Created as a
+# btrfs loop file of the given size, or adopted when an earlier grant of THIS
+# user made it (the user.box.grant marker); anything else is refused and never
+# resized or deleted here. Confinement is limits.disk.pool.<other>=0 for every
+# other pool, which needs the projects_limits_disk_pool API extension.
+if [ -n "$pool" ]; then
+  # Captured, never piped into grep -q: under pipefail an early-exiting grep
+  # SIGPIPEs the much longer 'incus info' and the check reads as a refusal.
+  server_info="$(incus info </dev/null 2>/dev/null || true)"
+  grep -Eq '^[[:space:]]*-[[:space:]]+projects_limits_disk_pool[[:space:]]*$' <<<"$server_info" \
+    || { echo "box grant --pool: this Incus lacks the projects_limits_disk_pool extension (Incus 6.0 LTS has it) — cannot confine $project to one pool" >&2; exit 1; }
+  if incus storage show "$pool" >/dev/null 2>&1 </dev/null; then
+    driver="$(incus storage show "$pool" </dev/null | awk '/^driver:/{print $2}')"
+    owner="$(incus storage get "$pool" user.box.grant </dev/null 2>/dev/null || true)"
+    have="$(incus storage get "$pool" size </dev/null 2>/dev/null || true)"
+    [ "$owner" = "$user" ] || { echo "box grant --pool: pool '$pool' exists and is not $user's grant pool (user.box.grant=${owner:-unset}) — choose another name" >&2; exit 1; }
+    [ "$driver" = btrfs ] || { echo "box grant --pool: pool '$pool' is $driver, not btrfs" >&2; exit 1; }
+    if [ -z "$have" ] || [ "$(to_bytes "$have" 2>/dev/null || echo 0)" -lt "$(to_bytes "$pool_size")" ]; then
+      echo "box grant --pool: pool '$pool' is ${have:-of unknown size}, smaller than $pool_size — box never resizes a pool; grow it by hand or pick a smaller --pool-size" >&2; exit 1
+    fi
+    echo "pool: $pool already exists ($have, btrfs, $user's)"
+  else
+    if ! err="$(incus storage create "$pool" btrfs size="$pool_size" </dev/null 2>&1)"; then
+      echo "box grant --pool: could not create pool '$pool': $err" >&2; exit 1
+    fi
+    incus storage set "$pool" user.box.grant "$user" </dev/null
+    echo "pool: created $pool ($pool_size btrfs loop file) for $user"
+  fi
+  # Incus enforces per-pool limits ONLY when the project also sets limits.disk
+  # (AllowVolumeCreation returns early without it — measured in the
+  # rehearsal, and read in internal/server/project/permissions.go). So the
+  # pool's size is the project's total disk budget too; without it the zero
+  # limits above would bind nothing.
+  if ! err="$(incus project set "$project" limits.disk "$pool_size" </dev/null 2>&1)"; then
+    echo "box grant --pool: could not set limits.disk=$pool_size on $project: $err" >&2; exit 1
+  fi
+  incus project set "$project" user.box.pool "$pool" </dev/null
+fi
+# The confinement itself runs on EVERY grant of a pooled project — given
+# --pool or read back from the marker — so a pool added to the host since is
+# zeroed by a plain re-run, exactly as the help promises.
+confine_pool="${pool:-$(incus project get "$project" user.box.pool </dev/null 2>/dev/null || true)}"
+if [ -n "$confine_pool" ]; then
+  incus project unset "$project" "limits.disk.pool.$confine_pool" </dev/null 2>/dev/null || true
+  while read -r other; do
+    if [ -z "$other" ] || [ "$other" = "$confine_pool" ]; then continue; fi
+    if ! err="$(incus project set "$project" "limits.disk.pool.$other" 0 </dev/null 2>&1)"; then
+      echo "box grant: could not confine $project away from pool '$other': $err" >&2
+      echo "  (something of $project's already lives on '$other' — move or delete it, then re-run)" >&2
+      exit 1
+    fi
+  done < <(incus storage list --format csv -c n </dev/null)
+  echo "pool: $project confined to $confine_pool (every other pool's limit is 0)"
+fi
+
+# 6c. Caps (#283): the project's own limits.* — 'none' unsets. Incus then
+# refuses any instance that does not set limits.cpu/limits.memory itself or
+# by profile; 'box new' always stamps both, and so must a tool's profiles.
+for c in "memory:$cap_memory" "cpu:$cap_cpu" "instances:$cap_instances"; do
+  k="limits.${c%%:*}"; v="${c#*:}"
+  [ -n "$v" ] || continue
+  if [ "$v" = none ]; then
+    incus project unset "$project" "$k" </dev/null 2>/dev/null || true
+    echo "caps: $k unset"
+  elif ! err="$(incus project set "$project" "$k" "$v" </dev/null 2>&1)"; then
+    echo "box grant: could not set $k=$v on $project: $err" >&2
+    echo "  (Incus refuses a cap below what the project already uses — see: incus project info $project)" >&2
+    exit 1
+  else
+    echo "caps: $k=$v"
+  fi
+done
+
+if [ "$service" -eq 1 ]; then
+  # No host paths for a service (#281): managed volumes only. An instance that
+  # already carries a host-path disk blocks this — say which way out.
+  if ! err="$(incus project set "$project" restricted.devices.disk managed 2>&1 </dev/null)"; then
+    echo "box grant --service: could not limit $project to managed disks:" >&2
+    echo "  $err" >&2
+    echo "  (an instance with a host-path disk blocks this — remove the device or the instance, then re-run)" >&2
+    exit 1
+  fi
+  echo "disks: managed volumes only (a service never mounts host paths)"
+  # The marker that tells a service grant from a person's (revoke reads it
+  # with #285; tools such as gig check it before they act).
+  incus project set "$project" user.box.service true </dev/null
+  echo "service: $project marked as a service grant"
+  if [ "$preexisting" -eq 1 ]; then
+    echo "service: $project existed before this grant — every step above re-hardened it"
+  fi
+fi
+
+# 6d. Sharing (#287). The group may run box — only box, the global install's
+# stable path — as this service, and nothing else: no shell, no other command.
+# The sudoers drop-in is validated by visudo before it is moved into place, so
+# a bad write can never break sudo for the host. The share record beside it is
+# world-readable on purpose: 'box --as' reads it to tell a refused user which
+# group to join, and sudoers itself is root's to read.
+if [ -n "$share_group" ]; then
+  getent group "$share_group" >/dev/null || { echo "box grant --share: no such group: $share_group (box never creates host groups; groupadd it first)" >&2; exit 1; }
+  [ -x "$share_bin" ] || { echo "box grant --share: $share_bin is not there — sharing needs box installed globally (sudo install.sh), so every member runs the same path" >&2; exit 1; }
+  # The record FIRST: revoke and doctor key on it, so a rule can never be live
+  # without one. Both are removed again if this grant fails after writing them.
+  $SUDO install -d -m 0755 "$share_dir"
+  printf '%s\n' "$share_group" | $SUDO tee "$share_dir/$user" >/dev/null
+  $SUDO chmod 0644 "$share_dir/$user"
+  share_written=1
+  tmp_rule="$sudoers_d/.box-share-$user.tmp"
+  printf '# Written by box grant --share (#287); removed by --unshare and revoke.\n%%%s ALL=(%s) NOPASSWD: %s\n' "$share_group" "$user" "$share_bin" \
+    | $SUDO tee "$tmp_rule" >/dev/null
+  $SUDO chmod 0440 "$tmp_rule"
+  if ! $SUDO visudo -cf "$tmp_rule" >/dev/null 2>&1; then
+    $SUDO rm -f -- "$tmp_rule"
+    echo "box grant --share: the sudoers rule did not validate (visudo -cf) — nothing written" >&2; exit 1
+  fi
+  $SUDO mv -f -- "$tmp_rule" "$sudoers_d/box-share-$user"
+  echo "share: '$share_group' may act as $user through 'box --as $user …' (box only, never a shell)"
+  {
+    echo "box: ============================== WARNING =============================="
+    echo "box: everyone in '$share_group' holds EVERYTHING put inside $user's boxes:"
+    echo "box: agent logins, git credentials, SSH keys, shell history — whatever"
+    echo "box: anyone left there. A shared box is shared all the way down."
+    echo "box: share only what that whole group may hold."
+    echo "box: ====================================================================="
+  } >&2
+elif [ "$unshare" -eq 1 ]; then
+  $SUDO rm -f -- "$sudoers_d/box-share-$user" "$share_dir/$user"
+  echo "share: $user is no longer shared ('box --as $user' now refuses everyone)"
+fi
+
 # 7. The placement contract itself, installed into their project. Created if
 # missing, refreshed unconditionally — same convergence discipline as
 # setup-host's own profile handling, so a box upgrade propagates by re-run.
 incus --project "$project" profile show box-profile >/dev/null 2>&1 </dev/null \
   || incus --project "$project" profile create box-profile >/dev/null </dev/null
 incus --project "$project" profile edit box-profile < "$here/profiles/box-profile.yaml"
-echo "profile: box-profile installed in $project"
+# The shipped profile roots on 'default'; a grant pool (#282) re-points it, read
+# back from the project's marker so a re-run WITHOUT --pool keeps it.
+grant_pool="$(incus project get "$project" user.box.pool </dev/null 2>/dev/null || true)"
+if [ -n "$grant_pool" ]; then
+  incus --project "$project" profile device set box-profile root pool "$grant_pool" </dev/null
+  echo "profile: box-profile installed in $project, rooted on $grant_pool"
+else
+  echo "profile: box-profile installed in $project"
+fi
 
 # Prove the grant from the USER's side of the socket — the only side that
 # matters. This catches the failure the steps above cannot see one at a time:
@@ -312,6 +593,14 @@ else
 fi
 
 trap - EXIT   # converged and verified: the grant stands
+cleanup_svc_home || true
+if [ "$service" -eq 1 ]; then
+  echo "granted: service $user has its own project $project (boxnet-only, managed disks, box-profile)."
+  echo "         It reaches it through incus-user's socket (unix.socket.user) with project=$project;"
+  echo "         a Go client needs no config directory."
+  echo "         NOW start (or restart) the service: a service reads its groups when it starts."
+  exit 0
+fi
 if [ "$admin_member" -eq 1 ]; then
   # The honest version of what the old refusal was gesturing at. The project
   # is real, converged and theirs — that is what they were missing and what

@@ -54,7 +54,9 @@
 #      anything else here touches it (#64).                                 [1]
 #   A. Incus semantics — the assumptions box is built on, probed directly.
 #      These were only ever verified against a stub.                        [8]
-#   B. The box surface — the whole CLI, end to end, including the boundary. [45]
+#   B. The box surface — the whole CLI, end to end, including the boundary. [47]
+#   G. Guest interiors — what a fresh box holds, measured from inside (#292).
+#      chrony, skew, no tenant, root entry, /tmp, no swap, drop-ins.        [16]
 #   C. Isolation baseline — does the trust boundary actually hold?
 #      (#15 section A)                                                      [9]
 #   E. box expose — a deliberate loopback door, opened and shut (#55).      [7]
@@ -275,15 +277,20 @@ aud()  { audit+=("$*"); }                       # a measurement, for the record
 # emits no verdicts at all (install, host setup, the summary itself). A verdict
 # emitted under '-' lands in the '?' bucket and is reported, because an
 # unattributed probe means this table has drifted from the script.
-PHASE_ORDER=(I A B C E D T)
+PHASE_ORDER=(I A B G C E D T)
 declare -A PHASE_EXPECT=(
   [I]=1     # install.sh left a complete host stack (#64)
   [A]=8     # A1–A6, A8, A9 — Incus semantics (A7 prints, it does not judge)
-  [B]=45    # the box surface: dedicated seed/version 5 + blank 10 + #171 clone 3
+  [B]=47    # the box surface: seed/version 5 + blank 12 + #171 clone 3
             # + the drill box, its clone and the CLI contract 27. It was 51 until
             # #214 took the role axis out: the two per-role mints proved a payload
             # box no longer installs (6 probes), and the drill box's own two agent
             # probes became two seed-payload probes, which is a swap and not a cut.
+            # 0.11.0 (#291) added two to the blank mint: no tenant, and --user refusing.
+  [G]=16    # guest interiors (#292): chrony 1 + skew 2 (all three skipped in
+            # a container) + no tenant + box root + checkup seed + /tmp cap +
+            # ENOSPC + no swap + no converger + no stamp + role refused +
+            # --autostart + restart + drop-in 2
   [C]=9     # C1–C7, plus archive-is-up and the peer clone
   [E]=7     # box expose: add, list, info, the door, per-port, remove, shut
   [D]=0     # D states the settled contract; it judges only a failed baseline
@@ -1663,11 +1670,11 @@ fi
 
 # A9 — 'incus copy' preserves user.* keys (#15 B2). #17's whole metadata design:
 # a clone must still know what it is without consulting the template.
-incus config set cbprobe user.box.user claude 2>/dev/null
+incus config set cbprobe user.box.origin mint 2>/dev/null
 incus stop -f cbprobe >/dev/null 2>&1
 incus copy cbprobe cbcopy >/dev/null 2>&1
-c="$(incus config get cbcopy user.box.user 2>/dev/null)"
-if [ "$c" = claude ]; then
+c="$(incus config get cbcopy user.box.origin 2>/dev/null)"
+if [ "$c" = mint ]; then
   ok "incus copy preserves user.* keys (a clone knows what it is)"
   aud "B2 copy preserves user.*: YES — #17's metadata-stamp design holds"
 else
@@ -1699,22 +1706,32 @@ else
     && ok "empty host: 'no boxes yet', exit 0" || no "empty-host message wrong"
 fi
 
-# --- templates: the mint surface is itself a surface to test ----------------
-tpl_missing=""
-box templates 2>/dev/null | grep -q '^  staging-box' || tpl_missing=" staging-box"
-[ -z "$tpl_missing" ] && ok "templates: lists the dedicated staging-box seed" \
-                      || no "templates listing is missing:$tpl_missing"
-box new --name tpl --template nosuch 2>&1 | grep -q 'no such template' \
-  && ok "unknown template refused, points at 'box templates'" || no "an unknown template was not refused"
-# The one rule that keeps templates honest: no key can name a network. Plant a
-# bad template in the installed tree (the drill owns this host), expect the
-# parser to reject it BY NAME, remove it.
-badt="$BOX_SHARE/current/templates/cbdrill-bad"
-mkdir -p "$badt" && printf 'BOX_IMAGE="x"\nBOX_USER="y"\nBOX_NETWORK="lan"\n' >"$badt/box.env" && : >"$badt/user-data.yaml"
-box new --name tpl --template cbdrill-bad 2>&1 | grep -q "unknown key 'BOX_NETWORK'" \
-  && ok "a template cannot name a network — BOX_NETWORK rejected by name" \
-  || no "a box.env key outside the allowlist was ACCEPTED — a template could weaken isolation"
-rm -rf "$badt"
+# --- the template axis is gone (#288): its spellings refuse, teaching -------
+box templates 2>&1 | grep -q 'box has no templates since 0.11.0' \
+  && ok "box templates refuses, saying box has no templates (#288)" || no "'box templates' did not refuse with the removal"
+box new --name tpl --template staging-box 2>&1 | grep -q -- '--autostart --require-vm' \
+  && ok "--template staging-box refuses, teaching the --autostart --require-vm line (#288)" \
+  || no "--template staging-box did not teach its replacement"
+# The one rule that keeps the seed honest: no key can name a network. Plant a
+# bad key in the INSTALLED seed (the drill owns this host), expect the parser to
+# reject it BY NAME, restore the file.
+seedenv="$BOX_SHARE/current/seed/box.env"
+# What the drill plants on the host comes back out on ANY exit — an aborted
+# run must not leave a seed that kills every 'box new', or an open gateway port.
+drill_restore() {
+  [ ! -f /tmp/cbdrill-seed.env ] || { cp /tmp/cbdrill-seed.env "$seedenv" && rm -f /tmp/cbdrill-seed.env; }
+  if [ -e /etc/box/firewall.d/cbdrill.conf ]; then
+    sudo rm -f /etc/box/firewall.d/cbdrill.conf
+    sudo systemctl restart box-firewall.service >/dev/null 2>&1 || sudo /usr/local/sbin/box-firewall >/dev/null 2>&1
+  fi
+  [ -z "${DROPIN_PID:-}" ] || kill "$DROPIN_PID" 2>/dev/null || true
+}
+trap drill_restore EXIT
+cp "$seedenv" /tmp/cbdrill-seed.env && printf 'BOX_NETWORK="lan"\n' >>"$seedenv"
+box new --name tpl 2>&1 | grep -q "unknown key 'BOX_NETWORK'" \
+  && ok "the seed cannot name a network — BOX_NETWORK rejected by name" \
+  || no "a box.env key outside the allowlist was ACCEPTED — the seed could weaken isolation"
+cp /tmp/cbdrill-seed.env "$seedenv" && rm -f /tmp/cbdrill-seed.env
 
 # Inline resource flags: honored on a mint, and — since #171 — on a clone too.
 # The mint proof rides the blank box below, and because this drill exports
@@ -1734,21 +1751,29 @@ rm -rf "$badt"
 printf '\n  minting a blank box (the generic seed, no role auto-run)…\n'
 t0=$SECONDS
 if mint_box /tmp/mint-tpl.log --name tpl --cpu 1 --memory 1GiB; then
-  ok "box new --name tpl, no --template  ($((SECONDS - t0))s)"
+  ok "box new --name tpl, the one seed  ($((SECONDS - t0))s)"
   tt="$(incus config get tpl user.box.template 2>/dev/null)"
-  [ "$tt" = tenant ] && ok "the default path uses the generic seed (user.box.template=tenant)" \
-                     || no "default seed is '${tt:-<unset>}' — expected tenant"
+  [ -z "$tt" ] && ok "a new mint stamps no template — there is none (#288)" \
+               || no "a new mint stamped user.box.template='$tt'"
   rc="$(incus config get tpl limits.cpu 2>/dev/null)/$(incus config get tpl limits.memory 2>/dev/null)"
   [ "$rc" = "1/1GiB" ] && ok "inline --cpu/--memory landed (limits = $rc, beating BOX_* env)" \
                        || no "inline resource flags did not land — limits are $rc, expected 1/1GiB"
-  [ "$(incus config get tpl user.box.user 2>/dev/null)" = dev ] \
-    && ok "template user stamped on the instance (user.box.user=dev)" || no "user.box.user not stamped"
+  [ -z "$(incus config get tpl user.box.user 2>/dev/null)" ] \
+    && ok "no user stamped — box creates none since 0.11.0 (#291)" || no "a 0.11.0 mint stamped user.box.user"
   incus config show tpl 2>/dev/null | grep -q '^- box-profile' \
     && ok "blank box launched with the box-profile profile — same placement contract" \
     || no "blank box is NOT on box-profile — a template picked its own placement?!"
-  u="$(timeout -k 5 30 box exec tpl -- whoami </dev/null 2>/dev/null | tr -d '[:space:]')"
-  [ "$u" = dev ] && ok "exec lands in the template's user ($u) — nothing hardcodes claude" \
-                 || no "exec landed in '${u:-<nothing>}', expected dev"
+  u="$(timeout -k 5 30 box exec tpl -- id -u </dev/null 2>/dev/null | tr -d '[:space:]')"
+  [ "$u" = 0 ] && ok "exec enters as root by default (uid $u) — the entry model of #291" \
+               || no "exec landed as uid '${u:-<nothing>}', expected root (0)"
+  tpw="$(timeout -k 5 30 box exec tpl -- getent passwd </dev/null 2>/dev/null)"
+  people="$(awk -F: '$3>=1000 && $3<60000' <<<"$tpw" | wc -l)"
+  if ! grep -q '^root:' <<<"$tpw"; then no "could not read the blank box's passwd — the no-tenant probe proves nothing"
+  elif [ "$people" = 0 ]; then ok "a fresh mint carries no tenant — box creates no users (#291)"
+  else no "a fresh mint has $people regular user(s) — box should create none"; fi
+  timeout -k 5 30 box exec --user nobody-here tpl -- true </dev/null >/dev/null 2>&1; urc=$?
+  [ "$urc" = 2 ] && ok "exec --user with a missing user refuses (exit 2), never running as root" \
+                 || no "exec --user nobody-here exited $urc — expected a refusal (2)"
   timeout -k 5 30 box exec tpl -- sh -lc 'command -v claude' </dev/null >/dev/null 2>&1 \
     && no "the blank box has claude installed — 'blank' is not blank" \
     || ok "blank box has no claude — nobody home, as designed"
@@ -1818,8 +1843,8 @@ fi
 
 printf '\n  minting the drill box (cold)…\n'
 t0=$SECONDS
-if mint_box /tmp/mint-drill.log --name drill --size medium; then
-  ok "box new --name drill --size medium  ($((SECONDS - t0))s)"
+if mint_box /tmp/mint-drill.log --name drill --size medium --autostart; then
+  ok "box new --name drill --size medium --autostart  ($((SECONDS - t0))s)"
 else
   no "box new FAILED — tail: $(tail -3 /tmp/mint-drill.log | tr '\n' ' ')"
   timeout -k 5 60 incus delete -f drill >/dev/null 2>&1
@@ -1845,12 +1870,16 @@ box info drill | grep -q 'pristine' && ok "info lists the automatic pristine sna
 # that directly ("blank box has no claude — nobody home, as designed"). What
 # the tenant seed itself ships is the thin floor, so probe THAT instead: it is
 # box's own payload, and the one the seed can still be held to.
-box exec drill -- tmux -V >/dev/null 2>&1 \
-  && ok "tmux is installed in the box — 'box tmux' has something to run (#65)" \
-  || no "'tmux -V' failed inside the box — the seed's own payload did not land"
-box exec drill -- shellcheck --version >/dev/null 2>&1 \
-  && ok "the seed's unprivileged toolchain landed (shellcheck, #177 decision 3)" \
-  || no "'shellcheck --version' failed inside the box — the seed's toolchain did not land"
+case "$(box exec drill -- sh -c 'command -v tmux || echo ABSENT' 2>/dev/null)" in
+  ABSENT) ok "a fresh mint carries no tmux — 'box tmux' left with the package (#289)" ;;
+  "") no "could not ask the drill box for tmux — the probe proves nothing" ;;
+  *) no "tmux is still in a fresh mint — the seed should carry none since #289" ;;
+esac
+case "$(box exec drill -- sh -c 'command -v shellcheck || echo ABSENT' 2>/dev/null)" in
+  ABSENT) ok "a fresh mint carries no shellcheck — the toolchain is a role's (#290)" ;;
+  "") no "could not ask the drill box for shellcheck — the probe proves nothing" ;;
+  *) no "shellcheck is still in a fresh mint — the toolchain is convergence since #290" ;;
+esac
 
 # --- the snapshot → clone workflow, which is the whole point of the tool ---
 box snapshot drill authed 2>&1 | grep -q authed && ok "snapshot drill authed" || no "snapshot failed"
@@ -1896,6 +1925,103 @@ box rm clone --force 2>&1 | grep -q 'removed' && ok "rm --force removes the clon
 box lst 2>&1 | grep -q "did you mean 'list'" && ok "typo → did-you-mean, exit 2" || no "unknown command not suggested"
 box list archive 2>&1 | grep -q 'box info archive' && ok "'list <box>' points at info" || no "'list <box>' does not point at info"
 box snapshot archive --labl x 2>&1 | grep -q 'unknown option' && ok "typo'd flag rejected (not swallowed as a label)" || no "unknown flag was swallowed"
+
+# ===========================================================================
+phase G "G. Guest interiors — what a fresh box holds, measured from inside (#292)"
+# ===========================================================================
+# 0.10.0 shipped chrony, the /tmp cap and the rig-free box, and no probe here
+# witnessed any of them (#253 C1); 0.11.0 adds the no-tenant box, root entry,
+# the absent swapfile and the firewall drop-ins. Written against the seed as it
+# stands after #288–#291, on the drill box (renamed 'archive' by now).
+box start archive >/dev/null 2>&1; wait_box archive >/dev/null 2>&1
+gtyp="$(box list | awk '$1 == "archive" { print $3 }')"
+if [ "$gtyp" = VM ]; then
+  in_box archive chronyc tracking 2>/dev/null | grep -qE '^Reference ID +: [0-9A-F]{8} \(' \
+    && ok "chronyc tracking answers with a reference source (#174)" \
+    || no "chronyc tracking named no reference source — the clock posture did not land"
+  # Measured against the HOST's clock, never chrony's own estimate (which reads
+  # ~0 right after an outside 'date -s'). Each sign starts from a correct clock,
+  # and a failure puts the guest clock back so phase C's TLS probes are not
+  # poisoned by a box three hours adrift.
+  guest_skew() { local g h; g="$(in_box archive date +%s 2>/dev/null)"; h="$(date +%s)"; [ -n "$g" ] || { echo 99999; return; }; echo $(( g > h ? g - h : h - g )); }
+  for skew in +3 -3; do
+    in_box archive date -s "@$(date +%s)" >/dev/null 2>&1
+    in_box archive date -s "$skew hours" >/dev/null 2>&1
+    if [ "$(guest_skew)" -le 3600 ]; then no "the ${skew}h skew did not even land (date -s refused?) — nothing to converge"; continue; fi
+    conv=""; for _i in $(seq 1 60); do
+      if [ "$(guest_skew)" -lt 2 ]; then conv="$((_i * 2))s"; break; fi
+      sleep 2
+    done
+    if [ -n "$conv" ]; then ok "a ${skew}h skew converged unattended to within 2s of the host (in $conv, makestep -1)"
+    else no "a ${skew}h skew did NOT converge within 120s — chrony's makestep posture is missing"
+         in_box archive date -s "@$(date +%s)" >/dev/null 2>&1; fi
+  done
+else
+  skipped G 3 "the box is a container: it shares the host clock and runs no chronyd, so tracking and skew have no guest verdict"
+fi
+pw="$(in_box archive getent passwd)"
+people="$(awk -F: '$3>=1000 && $3<60000' <<<"$pw" | wc -l)"
+if ! grep -q '^root:' <<<"$pw"; then no "could not read the guest's passwd — the no-tenant probe proves nothing"
+elif [ "$people" = 0 ]; then ok "a fresh mint holds no tenant — root alone (#291)"
+else no "a fresh mint holds $people regular user(s) — box should create none"; fi
+# shellcheck disable=SC2016  # $(id -u) and $HOME expand inside the box, by design
+rh="$(printf 'echo "$(id -u):$HOME"\nexit\n' | timeout -k 5 30 box root archive 2>/dev/null | tr -d '\r' | grep -E '^[0-9]+:' | tail -1)"
+[ "$rh" = "0:/root" ] && ok "box root reaches uid 0 with HOME=/root (#176)" \
+                      || no "box root landed as '${rh:-<nothing>}', expected 0:/root"
+ck="$(box checkup archive 2>&1)"
+printf '%s\n' "$ck" | grep -qE '^SEED +seed/3$' && ok "box checkup runs and reports the seed/3 generation (#258, #290)" \
+                                            || no "box checkup did not report seed/3: $(printf '%s' "$ck" | head -2 | tr '\n' ' ')"
+printf '%s\n' "$ck" | grep -qE '^TMP +tmpfs at 1\.0 GiB' && ok "/tmp is the fixed 1.0 GiB tmpfs, read through box checkup (#178)" \
+                                                     || no "/tmp is not the 1.0 GiB cap: $(printf '%s' "$ck" | grep '^TMP')"
+in_box archive sh -c 'dd if=/dev/zero of=/tmp/fill bs=1M count=1100 2>&1; rm -f /tmp/fill' | grep -q 'No space left on device' \
+  && ok "a write past the /tmp cap gives ENOSPC (#178)" || no "a 1.1 GiB write into /tmp did not hit the cap"
+if [ "$gtyp" = VM ]; then
+  if ! sw="$(in_box archive swapon --show 2>/dev/null)"; then no "could not run swapon in the guest — the no-swap probe proves nothing"
+  elif [ -z "$sw" ]; then ok "an unconverged VM has NO swap — box lays none since 0.11.0 (#290, D9's cost)"
+  else no "an unconverged VM has swap — the seed still lays a swapfile"; fi
+else
+  skipped G 1 "the box is a container: swap is the host's, so 'no swapfile' has no guest verdict"
+fi
+case "$(in_box archive sh -c 'command -v rig || echo ABSENT')" in
+  ABSENT) ok "a fresh mint has no converger on PATH (#214)" ;;
+  "") no "could not ask the guest for a converger — the probe proves nothing" ;;
+  *) no "a fresh mint has a converger on PATH — box installs none (#214)" ;;
+esac
+# The two probes below NAME what #214 retired in order to prove it ABSENT; the
+# strong-form guard in test/cli.sh skips lines marked "absence probe (#292)".
+if incus config show archive 2>/dev/null | grep -qE '^ *user\.box\.(role|rig\.)'; then  # absence probe (#292)
+  no "the instance carries a role or converger stamp (#214)"
+else
+  ok "no retired role or converger stamp on the instance (#214)"
+fi
+rout="$(box new --name cbrole --role claude-box </dev/null 2>&1)"; rrc=$?; rgone="$(printf '%s' "$rout" | grep -c -- '--role is gone')"  # absence probe (#292)
+if [ "$rrc" = 2 ] && [ "$rgone" -ge 1 ] && ! incus info cbrole >/dev/null 2>&1; then
+  ok "the retired role flag is refused on a real daemon, creating nothing (#214)"
+else
+  no "the retired role flag was not refused cleanly (rc=$rrc)"
+fi
+[ "$(incus config get archive boot.autostart 2>/dev/null)" = true ] \
+  && ok "--autostart stamped boot.autostart on a real mint (#288)" || no "the drill box minted with --autostart carries no boot.autostart"
+box restart archive >/dev/null 2>&1 && wait_box archive \
+  && ok "box restart brings the box back (#179)" || no "box restart did not bring the box back"
+# Firewall drop-ins (#279): a port listed in /etc/box/firewall.d is reachable
+# from boxnet on the GATEWAY only, every other gateway port stays dropped.
+GWD="$(boxnet_gw)"; DP=9917
+printf 'tcp %s\n' "$DP" | sudo tee /etc/box/firewall.d/cbdrill.conf >/dev/null
+sudo systemctl restart box-firewall.service >/dev/null 2>&1 || sudo /usr/local/sbin/box-firewall >/dev/null 2>&1
+dsrv="$(mktemp -d)"; echo drill-dropin >"$dsrv/index.html"
+( cd "$dsrv" && setsid python3 -m http.server "$DP" --bind "$GWD" >/dev/null 2>&1 & echo $! >"$dsrv/pid" )
+DROPIN_PID="$(cat "$dsrv/pid" 2>/dev/null || true)"
+sleep 1
+[ "$(box_probe archive "http://$GWD:$DP")" = reachable ] \
+  && ok "a drop-in port is reachable from a box on the gateway (#279)" \
+  || no "the drop-in port $DP on $GWD was not reachable from the box"
+[ "$(box_probe archive "http://$GWD:$((DP + 1))")" = dropped ] \
+  && ok "every other gateway port stays DROPPED beside a drop-in (#279)" \
+  || no "gateway port $((DP + 1)) answered — the drop-in widened more than its port"
+kill "$DROPIN_PID" 2>/dev/null; DROPIN_PID=""; rm -rf "$dsrv"
+sudo rm -f /etc/box/firewall.d/cbdrill.conf
+sudo systemctl restart box-firewall.service >/dev/null 2>&1 || sudo /usr/local/sbin/box-firewall >/dev/null 2>&1
 
 # ===========================================================================
 phase C "C. Isolation baseline — does the boundary actually hold? (#15 section A)"

@@ -38,6 +38,10 @@
 #      other user's RUNNING, an admin's stops the admin's own box in 'default'
 #      and reaches into no user-<uid> project, and 'all' is refused as a box
 #      name (#179)
+#   q. a SERVICE grant (#281): a --system user with no home and no shell is
+#      granted, its project is marked a service with managed disks only, a
+#      host-path disk is refused from its side, it mints on boxnet, and
+#      --service refuses an incus-admin member
 #
 # ok/no/note return 0 by design — the 'A && ok || no' idiom below is the
 # same one drill.sh is built on (and the reason for the SC2015 disable).
@@ -101,9 +105,9 @@ as_u() { local u="$1"; shift; runuser -u "$u" -- "$@" </dev/null; }
 # Feed one command to an interactive box entry path without granting it a
 # terminal. Both `sudo -i` (box shell) and `bash -l` (box root) read the pipe;
 # pinning `exit` keeps a changed shell startup from waiting on runner stdin.
-entry_uid_as_u() { # entry_uid_as_u <user> <shell|root> <box>
-  local u="$1" verb="$2" b="$3"
-  printf 'id -u\nexit\n' | runuser -u "$u" -- box "$verb" "$b" 2>/dev/null \
+entry_uid_as_u() { # entry_uid_as_u <user> <shell|root> <box> [box flags…]
+  local u="$1" verb="$2" b="$3"; shift 3
+  printf 'id -u\nexit\n' | runuser -u "$u" -- box "$verb" "$@" "$b" 2>/dev/null \
     | tr -d '\r' | grep -E '^[0-9]+$' | tail -1
 }
 
@@ -175,7 +179,12 @@ cleanup() {
   # when the drill dies before it gets there.
   box rm "$ADMINBOX" --force >/dev/null 2>&1 \
     && echo "  removed the admin's $ADMINBOX (criterion p)"
-  for u in "$U1" "$U2" boxdrill3 boxdrill4 boxdrill5; do
+  systemctl stop boxdrill-svc >/dev/null 2>&1 || true
+  incus project delete boxdrill-shared >/dev/null 2>&1 || true
+  for u in boxdrillm boxdrillo; do id "$u" >/dev/null 2>&1 && userdel -r "$u" >/dev/null 2>&1; done
+  groupdel boxdrillgrp >/dev/null 2>&1 || true
+  rm -f /etc/sudoers.d/box-share-boxdrillsvc /etc/box/shares/boxdrillsvc
+  for u in "$U1" "$U2" boxdrill3 boxdrill4 boxdrill5 boxdrillsvc; do
     id "$u" >/dev/null 2>&1 || continue
     # A half-failed purge followed by userdel leaves a project owned by
     # nobody — and doctor's leftover check keys on the USER existing. Keep
@@ -187,6 +196,8 @@ cleanup() {
       echo "  WARNING: purge FAILED for $u — kept the account so 'box doctor' can name it; project user-$(id -u "$u") may survive"
     fi
   done
+  # (r)'s grant pool, if the drill died before (r) purged it.
+  incus storage delete boxdrillpool >/dev/null 2>&1 && echo "  removed the grant pool boxdrillpool (criterion r)"
 }
 trap cleanup EXIT
 
@@ -261,18 +272,25 @@ rm -f "$mintlog"
 as_u "$U1" box list 2>/dev/null | grep -q '^mine ' && ok "(b) box list shows mine" || no "(b) box list does not show mine"
 as_u "$U1" box exec mine -- true >/dev/null 2>&1 && ok "(b) box exec mine -- true" || no "(b) box exec failed"
 
-# #169: compare the new explicit login-user boundary with sudo -i while the
-# latter is still safe (one fixed `env` argv), then exercise the exact
-# silent-success multiline shape that sudo -i used to corrupt.
-target_user="$(as_u "$U1" incus config get mine user.box.user)"
+# box creates no users since 0.11.0 (#291): a fresh box holds root alone, so
+# the default entry is root. Make a tenant the way convergence would — as root,
+# inside the box, with no sudo — then measure both entry contracts through the
+# restricted user's CLI and certificate.
+target_user=tenant
+as_u "$U1" box exec mine -- useradd -m -s /bin/bash "$target_user" >/dev/null 2>&1 \
+  && ok "(b) a tenant is created inside the box as root (the converger's job since #291)" \
+  || no "(b) could not create a tenant inside the box as root"
+# #169: compare the explicit login-user boundary with sudo -i while the latter
+# is still safe (one fixed `env` argv), then exercise the exact silent-success
+# multiline shape that sudo -i used to corrupt.
 legacy_env="$(as_u "$U1" incus exec mine -- sudo -u "$target_user" -i env \
   | grep -E '^(USER|LOGNAME|SHELL|HOME|PWD|PATH)=' | sort)"
-exec_env="$(as_u "$U1" box exec mine -- env \
+exec_env="$(as_u "$U1" box exec --user "$target_user" mine -- env \
   | grep -E '^(USER|LOGNAME|SHELL|HOME|PWD|PATH)=' | sort)"
-[ "$exec_env" = "$legacy_env" ] \
-  && ok "(b) box exec preserves cross-user login environment (USER/LOGNAME/SHELL/HOME/PWD/PATH)" \
+[ -n "$exec_env" ] && [ "$exec_env" = "$legacy_env" ] \
+  && ok "(b) box exec --user preserves the cross-user login environment (USER/LOGNAME/SHELL/HOME/PWD/PATH)" \
   || {
-    no "(b) box exec changed the cross-user login environment (#169)"
+    no "(b) box exec --user changed the cross-user login environment (#169)"
     diff -u <(printf '%s\n' "$legacy_env") <(printf '%s\n' "$exec_env") | sed 's/^/        /' || true
   }
 as_u "$U1" box exec mine -- bash -lc '
@@ -285,18 +303,8 @@ as_u "$U1" box exec mine -- bash -lc '
   && ok "(b) box exec preserves multiline commands, including the silent-success set shape" \
   || no "(b) box exec corrupted a multiline command (#169)"
 
-# #176: the named root path exists specifically so operator access never
-# depends on a privilege the tenant holds inside the guest. Remove that
-# privilege for real, then measure both entry contracts through the restricted
-# user's CLI and certificate: shell remains the tenant; root remains UID 0.
-# shellcheck disable=SC2016 # $1/$u expand in the guest sh, not this rehearsal.
-as_u "$U1" incus exec mine -- sh -c '
-  u="$1"
-  for f in /etc/sudoers /etc/sudoers.d/*; do
-    [ -f "$f" ] || continue
-    sed -i "/^${u}[[:space:]]/d" "$f"
-  done
-' sh "$target_user" >/dev/null 2>&1
+# #176: operator access never depends on a privilege the tenant holds inside
+# the guest. The tenant was made without sudo; prove it holds none.
 # shellcheck disable=SC2016 # $1/$u expand in the guest sh, not this rehearsal.
 if as_u "$U1" incus exec mine -- sh -c '
   u="$1"
@@ -304,18 +312,30 @@ if as_u "$U1" incus exec mine -- sh -c '
 ' sh "$target_user"; then
   ok "(b) box root precondition: $target_user has no sudoers entry"
 else
-  no "(b) box root precondition FAILED: $target_user still has a sudoers entry"
+  no "(b) box root precondition FAILED: $target_user has a sudoers entry"
 fi
 tenant_uid="$(as_u "$U1" incus exec mine -- id -u "$target_user" 2>/dev/null)"
 shell_uid="$(entry_uid_as_u "$U1" shell mine)"
-[ -n "$tenant_uid" ] && [ "$shell_uid" = "$tenant_uid" ] && [ "$shell_uid" -ne 0 ] \
-  && ok "(b) box shell still enters as $target_user (uid $shell_uid) without tenant sudo" \
-  || no "(b) box shell identity changed without tenant sudo (want uid ${tenant_uid:-?}, got ${shell_uid:-?})"
+[ "$shell_uid" = 0 ] \
+  && ok "(b) box shell enters as root by default (uid 0) — #291's entry model" \
+  || no "(b) box shell did not enter as root by default (got ${shell_uid:-?})"
+user_uid="$(entry_uid_as_u "$U1" shell mine --user "$target_user")"
+[ -n "$tenant_uid" ] && [ "$user_uid" = "$tenant_uid" ] && [ "$user_uid" -ne 0 ] \
+  && ok "(b) box shell --user $target_user enters as $target_user (uid $user_uid) without tenant sudo" \
+  || no "(b) box shell --user $target_user identity wrong (want uid ${tenant_uid:-?}, got ${user_uid:-?})"
+hint="$(printf 'exit\n' | runuser -u "$U1" -- box shell mine 2>&1 >/dev/null)"
+printf '%s' "$hint" | grep -q "this box has user $target_user (--user $target_user)" \
+  && ok "(b) with one regular user, box shell's root entry names it in a hint" \
+  || no "(b) box shell gave no one-user hint (stderr: '${hint:-<empty>}')"
+as_u "$U1" box shell --user ghost mine >/dev/null 2>&1; grc=$?
+[ "$grc" = 2 ] \
+  && ok "(b) box shell --user ghost refuses (exit 2), never a root fallback" \
+  || no "(b) box shell --user ghost exited $grc — expected a refusal (2)"
 root_uid="$(entry_uid_as_u "$U1" root mine)"
 [ "$root_uid" = 0 ] \
   && ok "(b) box root enters as uid 0 without tenant sudo" \
   || no "(b) box root did not enter as uid 0 without tenant sudo (got ${root_uid:-?})"
-aud "b. entry identities after removing $target_user sudoers: shell=${shell_uid:-?}, root=${root_uid:-?}"
+aud "b. entry identities (#291): shell=${shell_uid:-?} (root default), shell --user $target_user=${user_uid:-?}, root=${root_uid:-?}"
 
 as_u "$U1" box info mine 2>/dev/null | grep -qF "$(boxnet_pfx)" \
   && ok "(g) box info shows a boxnet ($(boxnet_pfx)x) address — placed on the hardened network" \
@@ -545,7 +565,13 @@ phase "m. a raw attach to boxnet — the scoped guarantee, measured"
 # has no DHCP client, so its raw instance holds NO lease — and against a
 # dead NIC every negative probe below "passes" vacuously while the contract
 # goes unmeasured. Caught on this criterion's first run (MU-5).
-rawout="$(as_u "$U1" incus launch images:debian/13/cloud esc2 --network boxnet 2>&1)"; rawrc=$?
+# In container mode the raw instance gets security.nesting=true, as every box
+# container does: Debian 13's systemd stalls without it in an unprivileged
+# container (no D-Bus, networkd stuck 'activating', so no DHCP) — measured on
+# the CI runner. The probe is about NETWORK-level controls, not nesting.
+# The raw launch is ALWAYS a container (no --vm), whatever MODE box uses.
+rawextra=(-c security.nesting=true)
+rawout="$(as_u "$U1" incus launch images:debian/13/cloud esc2 --network boxnet "${rawextra[@]}" 2>&1)"; rawrc=$?
 if [ "$rawrc" -ne 0 ]; then
   # Version fork, measured: 6.0.4 permits a restricted cert a raw --network
   # reference to an allowed network; 6.0.0 refuses it at the permission
@@ -564,7 +590,9 @@ if [ "$rawrc" -ne 0 ]; then
 else
   ok "(m) raw attach to boxnet launches (expected: the network must be usable for the profile to work)"
   ip_raw=""
-  for _ in $(seq 1 45); do
+  # 180s, not 90: a raw instance runs cloud-init with no seed of box's, and on
+  # the CI runner it was still 'running' at 90s with no lease yet.
+  for _ in $(seq 1 90); do
     ip_raw="$(incus --project "$p1" list esc2 --format csv --columns 4 2>/dev/null | tr -d '"' | sed 's/ (.*//' | grep . | head -n1)"
     [ -n "$ip_raw" ] && as_u "$U1" timeout -k 5 15 incus exec esc2 -- true >/dev/null 2>&1 && break
     sleep 2
@@ -574,6 +602,13 @@ else
     # Without an address the negative probes below would all pass vacuously
     # — a dead NIC drops everything, including the truth.
     no "(m) the raw instance never got a boxnet lease — the scoped guarantee went UNMEASURED"
+    # Hand over the evidence instead of making the next reader re-derive it:
+    # what the guest sees, what cloud-init did, and the NIC Incus gave it.
+    inf "evidence (esc2):"
+    { timeout -k 5 60 incus --project "$p1" exec esc2 -- sh -c 'ip -o addr 2>&1; echo ---; cloud-init status --long 2>&1 | head -8; echo ---; ls /etc/systemd/network /etc/netplan 2>&1; echo ---; timeout 10 networkctl status eth0 --no-pager 2>&1 | head -12; echo ---; systemctl is-active systemd-networkd 2>&1; echo ---; journalctl -b --no-pager 2>/dev/null | grep -iE "dhcp|networkd|eth0|lease" | tail -8' 2>&1
+      echo ---; incus --project "$p1" config show esc2 --expanded 2>&1 | sed -n '/^devices:/,/^[a-z]/p'
+      echo ---; incus network list-leases boxnet 2>&1 | tail -6; } </dev/null | head -60 | sed 's/^/          /'
+
   else
     r="$(probe_up "$U1" esc2 https://1.1.1.1)"
     [ "$r" = reachable ] && ok "(m) raw NIC: public egress works ($r)" || no "(m) raw NIC: egress broken: $r"
@@ -766,6 +801,219 @@ else
   no "(o) after dropping incus-admin they see: '$(printf '%s' "$projects5" | tr '\n' ' ')' — grant's no-re-grant promise is false"
 fi
 aud "o. incus-admin-only grant: in-'incus'=$(id -nG "$U5" 2>/dev/null | tr ' ' '\n' | grep -cx incus), project '$p5' access='$acc5', post-drop projects='$(printf '%s' "$projects5" | tr '\n' ' ')'"
+
+phase "q. a service grant — no home, managed disks, fenced like a person (#281)"
+# A real service account: --system, no home, no login shell. A person's grant
+# died on it (the CLI wants ~/.config/incus before it connects, and the
+# swallowed touch blamed incus-user); --service gives the touch a throwaway
+# HOME and pins what a service must never do.
+US=boxdrillsvc
+useradd --system --no-create-home --shell /usr/bin/false "$US" 2>/dev/null
+uids="$(id -u "$US")"; ps_="user-$uids"
+[ ! -d "$(getent passwd "$US" | cut -d: -f6)" ] \
+  && ok "(q) $US has no home directory (the precondition this phase is for)" \
+  || note "(q) $US has a home after all — the no-home path is not exercised"
+out="$(box grant --service "$US" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "(q) box grant --service converges a homeless --system user (rc=0)"
+else
+  no "(q) box grant --service FAILED (rc=$rc):"
+  printf '%s\n' "$out" | tail -4 | sed 's/^/        /'
+fi
+printf '%s' "$out" | grep -q "NOW start (or restart) the service" \
+  && ok "(q) the grant states the grant-then-start contract" \
+  || no "(q) the grant never told the operator to start the service after it"
+[ "$(incus project get "$ps_" user.box.service 2>/dev/null)" = true ] \
+  && ok "(q) $ps_ is marked user.box.service=true" \
+  || no "(q) $ps_ carries no service marker"
+[ "$(incus project get "$ps_" restricted.devices.disk 2>/dev/null)" = managed ] \
+  && ok "(q) $ps_ allows managed disks only" \
+  || no "(q) $ps_ restricted.devices.disk = '$(incus project get "$ps_" restricted.devices.disk 2>/dev/null)'"
+[ "$(incus project get "$ps_" restricted.networks.access 2>/dev/null)" = boxnet ] \
+  && ok "(q) $ps_ is narrowed to boxnet like any granted project" \
+  || no "(q) $ps_ is not boxnet-only"
+# From the service's own side of the socket, the way a daemon would reach it.
+svch="$(mktemp -d)"; chown "$US" "$svch"
+# No INCUS_SOCKET pin: a pinned socket asks about 'default' unless --project
+# is given (box itself passes none). Unpinned, the client falls back to
+# incus-user's socket and its own project — exactly what a real daemon does.
+as_svc() { runuser -u "$US" -- env HOME="$svch" INCUS_CONF="$svch/incus" "$@" </dev/null; }
+as_svc incus --project "$ps_" profile show box-profile >/dev/null 2>&1 \
+  && ok "(q) the service reads its own box-profile over unix.socket.user" \
+  || no "(q) the service cannot reach $ps_ over unix.socket.user"
+# The path incus-user's DEFAULT would allow (the user's recorded home), so only
+# restricted.devices.disk=managed refuses it — /etc would be refused anyway.
+svchome="$(getent passwd "$US" | cut -d: -f6)"
+mkdir -p "$svchome"
+if as_svc incus --project "$ps_" profile create drill-hostpath >/dev/null 2>&1; then
+  as_svc incus --project "$ps_" profile device add drill-hostpath leak disk source="$svchome" path=/mnt/home >/dev/null 2>&1 \
+    && no "(q) the service attached its HOME ($svchome) — managed-only is not enforced" \
+    || ok "(q) a host-path disk is refused from the service's side, even under its own home"
+  as_svc incus --project "$ps_" profile delete drill-hostpath >/dev/null 2>&1
+else
+  no "(q) the service could not create a profile in its own project — the host-path probe proves nothing"
+fi
+rmdir "$svchome" 2>/dev/null
+# Minting through box itself, as the service: the same 'box new' a person
+# runs, honoring this drill's container mode.
+if as_svc box new --name drill-svc "${MODE[@]}" >/dev/null 2>&1; then
+  ok "(q) the service mints a box on boxnet through its grant (box new)"
+  as_svc box rm drill-svc --force >/dev/null 2>&1
+else
+  no "(q) the service could not 'box new' in its granted project"
+fi
+rm -rf "$svch"
+# --service refuses an incus-admin member: nothing could fence it.
+usermod -aG incus-admin "$US"
+out="$(box grant --service "$US" 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "which no grant can fence" \
+  && ok "(q) --service refuses an incus-admin member, by name" \
+  || no "(q) --service granted an incus-admin member (rc=$rc) — a fence that binds nothing"
+gpasswd -d "$US" incus-admin >/dev/null 2>&1
+aud "q. service grant: project '$ps_' service=$(incus project get "$ps_" user.box.service 2>/dev/null) disk=$(incus project get "$ps_" restricted.devices.disk 2>/dev/null) access=$(incus project get "$ps_" restricted.networks.access 2>/dev/null)"
+
+phase "r. a grant's pool and caps, and revoking a service (#282, #283, #285)"
+POOL=boxdrillpool
+out="$(box grant --service "$US" --pool "$POOL" --pool-size 3GiB --memory 3GiB --cpu 2 --instances 3 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "(r) the grant converges a pool and caps (rc=0)"
+else
+  no "(r) box grant --pool/caps FAILED (rc=$rc):"; printf '%s\n' "$out" | tail -4 | sed 's/^/        /'
+fi
+[ "$(incus storage get "$POOL" user.box.grant 2>/dev/null)" = "$US" ] \
+  && ok "(r) $POOL exists and is marked $US's grant pool" \
+  || no "(r) $POOL carries no user.box.grant=$US"
+[ "$(incus project get "$ps_" limits.disk.pool.default 2>/dev/null)" = 0 ] \
+  && ok "(r) $ps_ cannot place anything on 'default' (limits.disk.pool.default=0)" \
+  || no "(r) $ps_ limits.disk.pool.default = '$(incus project get "$ps_" limits.disk.pool.default 2>/dev/null)'"
+for kv in "memory 3GiB" "cpu 2" "instances 3"; do
+  [ "$(incus project get "$ps_" "limits.${kv% *}" 2>/dev/null)" = "${kv#* }" ] \
+    && ok "(r) $ps_ limits.${kv% *} = ${kv#* }" \
+    || no "(r) $ps_ limits.${kv% *} = '$(incus project get "$ps_" "limits.${kv% *}" 2>/dev/null)', wanted ${kv#* }"
+done
+svch="$(mktemp -d)"; chown "$US" "$svch"
+as_svc incus --project "$ps_" storage volume create default drill-vol size=8MiB >/dev/null 2>&1 \
+  && no "(r) the service created a volume on 'default' — the pool confinement does not bind" \
+  || ok "(r) a volume on 'default' is refused from the service's side"
+as_svc incus --project "$ps_" storage volume create "$POOL" drill-vol size=8MiB >/dev/null 2>&1 \
+  && ok "(r) a volume on its own pool works" \
+  || no "(r) the service could not create a volume on its own pool $POOL"
+# #283 (ruled: fail loudly): a plain 'box new' whose defaults exceed the caps
+# refuses before minting, naming the sizes that fit; sized to fit, it mints.
+pout="$(as_svc box new --name drill-pool "${MODE[@]}" 2>&1)"; prc=$?
+if [ "$prc" -eq 2 ] && printf '%s' "$pout" | grep -q -- '--disk <less than'; then
+  ok "(r) a plain box new over the caps refuses before minting, naming the sizes that fit"
+else
+  no "(r) a plain box new over the caps did not refuse cleanly (rc=$prc):"; printf '%s\n' "$pout" | tail -3 | sed 's/^/        /'
+fi
+# A VM root needs more than the 3GiB budget can hold beside its image; the
+# pool mint is measured in container mode (CI's), skipped honestly otherwise.
+if [ "${MODE[*]:-}" != "--container" ]; then
+  note "(r) the fitting pool mint runs in container mode only (a VM image + root exceed the 3GiB test budget)"
+elif out="$(as_svc box new --name drill-pool "${MODE[@]}" --disk 1GiB 2>&1)"; then
+  rp="$(as_svc incus --project "$ps_" config device get drill-pool root pool 2>/dev/null \
+        || as_svc incus --project "$ps_" profile device get box-profile root pool 2>/dev/null)"
+  [ "$rp" = "$POOL" ] && ok "(r) box new as the service lands on $POOL" || no "(r) box new landed on '$rp', not $POOL"
+  as_svc box rm drill-pool --force >/dev/null 2>&1
+else
+  no "(r) box new as a capped, pooled service failed:"; printf '%s\n' "$out" | tail -5 | sed 's/^/        /'
+fi
+as_svc incus --project "$ps_" profile create drill-tool >/dev/null 2>&1
+# A unit running AS the service: revoke must refuse and name it.
+systemd-run --quiet --uid="$US" --unit=boxdrill-svc sleep 600 >/dev/null 2>&1
+out="$(BOX_YES=1 box revoke "$US" --purge --purge-pool 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "boxdrill-svc.service"; then
+  ok "(r) revoke refuses while boxdrill-svc.service runs as the service, by name"
+else
+  no "(r) revoke did not refuse under a running unit (rc=$rc):"; printf '%s\n' "$out" | tail -4 | sed 's/^/        /'
+fi
+systemctl stop boxdrill-svc >/dev/null 2>&1
+out="$(BOX_YES=1 box revoke "$US" --purge --purge-pool 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "(r) stopped, the service revokes with --purge --purge-pool (a tool profile and a custom volume inside)"
+else
+  no "(r) revoke --purge --purge-pool FAILED (rc=$rc):"; printf '%s\n' "$out" | tail -4 | sed 's/^/        /'
+fi
+incus project show "$ps_" >/dev/null 2>&1 && no "(r) $ps_ survived the purge" || ok "(r) $ps_ is gone"
+incus storage show "$POOL" >/dev/null 2>&1 && no "(r) $POOL survived --purge-pool" || ok "(r) $POOL is gone"
+rm -rf "$svch"
+aud "r. pool+caps: pool=$POOL, revoke under a unit rc refused, purge-pool leaves nothing"
+
+phase "s. can a granted user reach a SECOND project? (#253 member 2, measured)"
+# The whole price of a shared-project design turned on this, and it was read
+# from documentation. Measured here on the real daemon: a hand-made project
+# with a profile in it, read by a granted user over incus-user's socket.
+if out="$(box grant --service "$US" 2>&1)"; then
+  ok "(s) the service is re-granted after its purge (the precondition for this measurement)"
+else
+  no "(s) re-granting the service after its purge FAILED — the measurement below would be vacuous:"
+  printf '%s\n' "$out" | tail -4 | sed 's/^/        /'
+fi
+svch="$(mktemp -d)"; chown "$US" "$svch"
+incus project create boxdrill-shared >/dev/null 2>&1
+incus --project boxdrill-shared profile create drill-secret >/dev/null 2>&1
+sout="$(as_svc incus --project boxdrill-shared profile list --format csv 2>&1)"; src=$?
+if printf '%s' "$sout" | grep -q drill-secret; then
+  no "(s) a granted user READ another project's profile — incus-user does not confine projects"
+  second_project="readable"
+elif [ "$src" -ne 0 ]; then
+  ok "(s) a second project is HARD-REFUSED to a granted user (rc=$src: $(printf '%s' "$sout" | grep -v 'first time running Incus' | tail -1))"
+  second_project="hard-refused"
+else
+  ok "(s) a second project answers a granted user with its OWN project's view, never the other's"
+  second_project="silently-scoped"
+fi
+# The admins' own project too: a granted service must not see 'default'.
+dout="$(as_svc incus --project default list --format csv -c n 2>&1)"; drc=$?
+if [ "$drc" -ne 0 ] || [ -z "$dout" ]; then
+  ok "(s) the 'default' project is closed to a granted user too (rc=$drc)"
+else
+  no "(s) a granted user LISTED the default project: $(printf '%s' "$dout" | head -3 | tr '\n' ' ')"
+fi
+incus project delete boxdrill-shared >/dev/null 2>&1 || { incus --project boxdrill-shared profile delete drill-secret >/dev/null 2>&1; incus project delete boxdrill-shared >/dev/null 2>&1; }
+aud "s. second project to a granted user: $second_project (rc=$src) — docs/plans/multi-owner-boxes.md cites this"
+
+phase "t. a shared tenant — a group acts as a service through box --as (#287)"
+if [ ! -x /usr/local/bin/box ]; then
+  note "(t) box is not installed globally (/usr/local/bin/box) — sharing needs it; phase skipped"
+else
+  groupadd boxdrillgrp 2>/dev/null
+  useradd -m boxdrillm 2>/dev/null; useradd -m boxdrillo 2>/dev/null
+  usermod -aG boxdrillgrp boxdrillm
+  out="$(box grant --service "$US" --share boxdrillgrp 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "holds EVERYTHING"; then
+    ok "(t) --share converges and SHOUTS the credential blast radius"
+  else
+    no "(t) --share failed or never warned (rc=$rc):"; printf '%s\n' "$out" | tail -6 | sed 's/^/        /'
+  fi
+  visudo -cf "/etc/sudoers.d/box-share-$US" >/dev/null 2>&1 \
+    && ok "(t) the sudoers rule validates" || no "(t) the sudoers rule does not validate"
+  if out="$(runuser -u boxdrillm -- box --as "$US" list 2>&1)"; then
+    ok "(t) a group member acts as the tenant (box --as $US list)"
+  else
+    no "(t) a group member could not 'box --as $US list':"; printf '%s\n' "$out" | tail -5 | sed 's/^/        /'
+  fi
+  if out="$(runuser -u boxdrillm -- box --as "$US" new --name drill-shared "${MODE[@]}" --cpu 1 --memory 1GiB --disk 2GiB 2>&1)"; then
+    incus --project "$ps_" list --format csv -c n 2>/dev/null | grep -qx drill-shared \
+      && ok "(t) a member's box lands in the tenant's project $ps_" \
+      || no "(t) the member's box is not in $ps_"
+    runuser -u boxdrillm -- box --as "$US" rm drill-shared --force >/dev/null 2>&1
+  else
+    no "(t) a group member could not mint as the tenant:"; printf '%s\n' "$out" | tail -5 | sed 's/^/        /'
+  fi
+  out="$(runuser -u boxdrillo -- box --as "$US" list 2>&1)"; rc=$?
+  [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "boxdrillgrp" \
+    && ok "(t) an outsider is refused (exit 2), told the group to join" \
+    || no "(t) an outsider was not refused properly (rc=$rc)"
+  runuser -u boxdrillm -- sudo -n -u "$US" /bin/sh -c true >/dev/null 2>&1 \
+    && no "(t) a member got a SHELL as the tenant — the rule is wider than box" \
+    || ok "(t) a member gets box as the tenant, never a shell"
+  box grant --service "$US" --unshare >/dev/null 2>&1
+  [ ! -e "/etc/sudoers.d/box-share-$US" ] && ok "(t) --unshare removes the rule" || no "(t) --unshare left the rule"
+  userdel -r boxdrillm >/dev/null 2>&1; userdel -r boxdrillo >/dev/null 2>&1; groupdel boxdrillgrp >/dev/null 2>&1
+fi
+rm -rf "$svch"
+aud "t. shared tenant via box --as: $([ -x /usr/local/bin/box ] && echo measured || echo skipped-no-global-install)"
 
 echo
 echo "════════════════════════════════════════════"

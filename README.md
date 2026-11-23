@@ -229,9 +229,9 @@ bridge (sibling-name resolution off, resolver pinned to public upstreams —
 `BOX_DNS` overrides), the `box-isolate` ACL (drops all RFC1918/CGNAT/
 link-local egress), the `box-profile` profile (port-isolated NICs — boxes can't
 reach each other), and firewall rules blocking instance → host. All rules
-re-apply at boot via `box-firewall.service` — no post-reboot ritual. If
-the host lacks `dnsmasq-base` (Debian cloud images skip Recommends):
-`sudo apt-get install -y dnsmasq-base`.
+re-apply at boot via `box-firewall.service` — no post-reboot ritual.
+`setup-host` installs `dnsmasq-base` too, which boxnet's DHCP and DNS need and
+Debian cloud images skip as a Recommends (#280).
 
 The stack's subnet is `10.88.0.0/24` when free. setup-host **never builds on
 a subnet something else already claims** — most tellingly when this machine's
@@ -333,6 +333,73 @@ shipped profile is installed into their project. Re-run
 `box grant <user>` after upgrading box to refresh the profile, like
 `setup-host` for the stack.
 
+**Services get the same tier** (#281). `box grant --service gig` grants a
+no-login system account a daemon runs as: its project is fenced exactly like a
+person's, plus managed disks only (`restricted.devices.disk=managed`, so a
+service never mounts host paths into an instance) and the
+`user.box.service=true` marker. The grant needs no home for the account, and
+it refuses an `incus-admin` member, whom nothing could fence. The service
+reaches its project through incus-user's socket (`unix.socket.user`) with
+`project=user-<uid>`. **Grant first, then start the service:** a service reads
+its groups once at start, and one that reaches incus-user before the grant
+creates an unhardened project. This is how other tools mint instances under
+box's contract without admin rights (heavy-duty/handbook proposal 0011).
+
+**A grant's pool and caps** (#282, #283). `--pool NAME --pool-size SIZE`
+gives the grant a btrfs loop pool of its own and confines the project to it,
+so a full tenant pool fails that tenant and never `default`. `--memory`,
+`--cpu` and `--instances` set the project's own `limits.*`, so a tenant can
+never starve the host's other guests (`none` unsets one). Under a cap, Incus
+refuses an instance that sets no `limits.cpu`/`limits.memory`: `box new`
+always stamps both, and a tool's own profiles must set them too. When a
+default would exceed a cap, `box new` refuses before minting and names the
+sizes that fit; it never adjusts them for you. Revoking a service
+(#285) refuses while a unit still runs as it (stop it first, so it drains),
+purges every profile and custom volume with `--purge`, and keeps the pool
+unless `--purge-pool`.
+
+**A tool's instances can be boxes** (#284). A tool that mints through the
+Incus API inside its grant marks its instances with a profile carrying
+`user.box: "1"`, and box reads that key from the expanded config: `box list`,
+`box info` (which says *minted outside box new*) and `box rm`, run as that
+user, all see them. Setting it is a contract. The profile carries the
+`boxnet` NIC exactly as `box-profile` does (copy its `eth0`), adds no other
+NIC, and attaches no host-path disk. A service grant already refuses host
+paths.
+
+### Sharing boxes (#287)
+
+One box per owner is the default. Two ways to share, and which to pick:
+
+- **(a) incus-admin.** Put the staging users in `incus-admin` and they share
+  the `default` project with every admin. It works today, and it costs the
+  **full daemon socket**: `setup-host`, `teardown-host` and every project on
+  the host are within their reach. Right only when they are admins anyway.
+- **(b) A shared tenant (recommended).** A service grant that a host group
+  operates:
+
+  ```
+  sudo groupadd staging; sudo usermod -aG staging alice
+  sudo useradd --system --no-create-home --shell /usr/sbin/nologin stage
+  box grant --service stage --share staging
+  box --as stage new --name web      # alice, from her own shell
+  ```
+
+  `--share GROUP` writes a sudoers rule, validated by `visudo` before it
+  lands, that lets GROUP run **box itself, and nothing else,** as the
+  service. `box --as NAME …` re-runs the command that way and never prompts
+  for a password. Someone outside the group is refused and told which group to
+  join. The boxes live in the service's fenced project like any grant's
+  (boxnet only, managed disks). `--unshare`, or `box revoke stage`, takes the
+  rule away. Sharing needs box installed globally (`/usr/local/bin/box`).
+
+  **Everyone in the group holds everything inside every box in the tenant:**
+  agent logins, git credentials, SSH keys, shell history. The grant says so
+  every time it shares.
+
+Per-box co-ownership, with visibility, access and lifecycle as separate
+rights, is planned in `docs/plans/multi-owner-boxes.md` and not built.
+
 What a restricted user gets is the full contract: same ACL, same DNS
 isolation, same pinned resolver, same port isolation, same box↔box drop —
 and their boxes cannot reach another user's box, which is the same
@@ -348,14 +415,15 @@ VM boundary itself is proven on real hardware, like the rest of the drill).
 
 ```sh
 box new --name work --size medium   # a blank box, nothing converged
-box shell work                      # enter as the tenant user (default: dev)
+box shell work                      # a root shell: box creates no users (#291)
 ```
 
-**That box is blank, and blank is literal.** The seed carries a tenant user, a
-fixed 1GiB `/tmp`, swap, chrony, `tmux`, `curl`, `ca-certificates`,
-`python3-venv` and `shellcheck` — that list is the whole of it. There is no
-coding agent on it, and **no `gh`**; the tenant has no sudo, so it cannot
-`apt install` one either. Authenticating is therefore not the first thing you
+**That box is blank, and blank is literal.** The seed carries a fixed 1GiB
+`/tmp`, chrony, `curl` and `ca-certificates` — that list is the whole of it.
+**No users** (#291): a fresh box holds root alone, so `box shell` and
+`box exec` enter as root by default, and a tenant arrives with convergence.
+No swap, no `python3-venv`, no `shellcheck`: those come from convergence too
+(#290). There is no coding agent on it, and **no `gh`**. Authenticating is therefore not the first thing you
 do on a fresh box. Converging is.
 
 **Box mints; you converge.** Turning a box into a coding-agent box, a server,
@@ -368,13 +436,15 @@ box root work                            # root inside it, authorized by the hos
 # then, inside the box, as root:
 curl -fsSL https://raw.githubusercontent.com/heavy-duty/rig/<ref>/install.sh \
   | RIG_REPO=heavy-duty/rig RIG_REF=<ref> bash
-rig bootstrap claude-box --user dev
+rig bootstrap claude-box               # creates the role's tenant (claude) and converges
 ```
 
-Once your converger has put a toolchain on the box, authenticate inside it —
-box never handles the credential, before or after:
+Once your converger has put a toolchain and a tenant on the box, enter as that
+tenant and authenticate inside it — box never handles the credential, before or
+after:
 
 ```sh
+box shell --user claude work     # --user names who to enter as; it must exist
 gh auth login                    # or drop a PAT in — your git credentials, your call
 git clone https://github.com/you/project && cd project
 ```
@@ -390,10 +460,13 @@ Three details in that block are load-bearing:
 
 - **`--size medium` is not decoration.** A role never implied a size, and
   omitting it gives you 2/2/20 where an agent box used to get 4/8/60.
-- **`box root`, not `box shell` + `sudo`.** The tenant an ordinary mint
-  creates is unprivileged and has no sudoers entry (see below), and `box root`
-  authorizes through the host's Incus socket rather than through anything in
-  the guest ([#176](https://github.com/heavy-duty/box/issues/176)).
+- **Root by default, `--user` by choice** (#291). `box shell`/`box exec`
+  enter as root unless `--user NAME` names someone who exists in the box; a
+  missing NAME is refused, listing who does exist, and never falls back to
+  root. With exactly one regular user present, the root entry prints a hint
+  naming them. `box root` is the explicit spelling of the default, authorized
+  through the host's Incus socket rather than anything in the guest
+  ([#176](https://github.com/heavy-duty/box/issues/176)).
 - **`box root` is a login shell**, so `$HOME` is set and a converger that
   reads it needs no workaround.
 
@@ -403,33 +476,38 @@ There is no role axis and no `--role` flag. The public mint shapes are:
 
 | Mint shape | Meaning |
 |---|---|
-| `box new --name <box>` | The tenant seed: an unprivileged user, a thin toolchain, nobody home |
-| `box new --user <name>` | The same seed with a tenant user other than `dev` |
-| `--template staging-box` | Dedicated server seed: VM-only and autostarting |
+| `box new --name <box>` | The seed: root only, a fixed `/tmp`, chrony, curl — nobody home |
+| `--size medium --autostart --require-vm` | The old `staging-box` template as flags (#288): VM-only, back after a host reboot |
 
-**The seed is thin and it is the whole of what box installs.** It carries the
-tenant user, `tmux`, `curl`, `ca-certificates`, `chrony`, `python3-venv` and
-`shellcheck`, caps `/tmp` at a fixed 1GiB and lays a 4GiB swapfile in VM mode
-— and nothing that joins a tailnet or admits a credential. `curl` and
+**The seed is thin and it is the whole of what box installs.** It carries
+`curl`, `ca-certificates` and `chrony`, and caps `/tmp` at a fixed 1GiB — and nothing that joins a tailnet or admits a credential. **An
+unconverged box has no swap and no Python venv or shellcheck** (#290, #253
+D6/D9): the rig-templates agent roles install `python3-venv` and `shellcheck`
+(`APT_EXTRAS`) and lay swap (`SWAP_SIZE`), so a box you never converge
+degrades under a memory spike straight to an OOM kill. That is the stated cost
+of box not converging, not an oversight. `curl` and
 `ca-certificates` are there for **your** installer, not box's: the first line
 of the converge above is a `curl … | bash` inside the box, and a bare cloud
 image is not guaranteed to ship either.
 
-**The tenant is unprivileged inside its own box; the operator enters as root
-from the host** ([#177](https://github.com/heavy-duty/box/issues/177)). The
-seed creates the tenant user with no sudoers entry, so `sudo` inside a box
-fails — and `box root <box>` still lands as root, authorized by
-the host's Incus socket rather than by anything in the guest
+**A tenant is the converger's, and so is whether it holds sudo; the operator
+enters as root from the host** ([#177](https://github.com/heavy-duty/box/issues/177),
+[#291](https://github.com/heavy-duty/box/issues/291)). box creates no users,
+so the role that creates the tenant decides its privilege — rig-templates'
+agent roles create theirs with no sudoers entry, so `sudo` inside an agent box
+fails — and `box root <box>` still lands as root, authorized by the host's
+Incus socket rather than by anything in the guest
 ([#176](https://github.com/heavy-duty/box/issues/176)). Root was never what
 contained a coding agent; the VM is. What it cost was the ability to add any
 control *inside* a box later — an egress allowlist, a read-only mount, an
 audit trail — each of which is one `sudo` away from being switched off while
-the tenant holds it. The seed ships the toolchain instead, user-local installs
-still work unprivileged — `python3 -m venv`, `cargo`, `uv`, and
+the tenant holds it. The role ships the toolchain instead, and user-local
+installs still work unprivileged — `python3 -m venv`, `cargo`, `uv`, and
 `npm install --prefix <dir>` (a *global* `npm -g` writes to `/usr`, so point
 it somewhere the tenant owns once: `npm config set prefix ~/.local`) — and
-anything genuinely needing `apt` is one `box root` away. `staging-box` keeps
-sudo on purpose: it seeds a guest that converges *itself*, from the inside.
+anything genuinely needing `apt` is one `box root` away. A staging box's
+`ops` gets its passwordless sudo from rig-templates' `staging-box` role
+(`USER_SUDO`), not from box: box has no templates since 0.11.0 (#288).
 This is **mint-time only** — cloud-init runs once, so boxes minted before this
 change still have their sudoers entry.
 
@@ -456,14 +534,13 @@ the installer you run inside the box, which is where you pass them. A mint
 makes no network request of its own for a pin, so minting works offline.
 
 ```sh
-box templates                    # list dedicated non-agent templates
 box new --name scratch           # the DEFAULT: bare Debian + the thin seed,
                                  #   same isolation, nobody home
 ```
 
 A seed **cannot** name a network, a profile, or a `security.*` flag —
 there is no key for them. Every box launches with the shared `box-profile`
-profile (the isolated NIC + root disk), so every template gets the identical
+profile (the isolated NIC + root disk), so every box gets the identical
 trust boundary. `--size small|medium|large` selects a resource bundle (small
 is the default), overridable at mint time — inline
 (`--cpu 2 --memory 3GiB --disk 20GiB`) or via
@@ -477,13 +554,12 @@ form). Resolution is `--cpu/--memory/--disk` > `BOX_*` environment >
 | `medium` | 4 | 8GiB | 60GiB |
 | `large` | 8 | 16GiB | 120GiB |
 
-The default mint path defaults to `small`. The dedicated
-`staging-box` seed keeps its existing medium resources when no size is given.
-Named sizes apply to fresh mints; `--from` clones keep the explicit
+The default mint path defaults to `small`. Named sizes apply to fresh mints; `--from` clones keep the explicit
 `--cpu`/`--memory`/`--disk` override surface.
-The selected seed, its generation and the resolved user are stamped onto the
-instance, so `shell`, `exec` and `tmux` land in the right user — and a clone
-still knows, because `incus copy` carries the metadata. `box checkup <box>`
+The seed's generation (`seed/3` since 0.11.0) is stamped onto the instance,
+and a clone still knows it, because `incus copy` carries the metadata. No user
+is stamped any more (#291): `shell` and `exec` enter as root unless `--user`
+says otherwise, and an older box's `user.box.user` stamp is no longer read. `box checkup <box>`
 reports that generation; an older box with no marker says it is unknown rather
 than guessing from the guest's current contents.
 
@@ -512,8 +588,8 @@ snapshot labels and the `--from` line to clone one.
 Every fresh mint marks a snapshot called `pristine`
 ([#104](https://github.com/heavy-duty/box/issues/104)) at the one moment it
 is true: **after cloud-init, before anything converges the box.** At that
-instant the guest is pristine Debian plus box's thin seed — the tenant user,
-tmux, the toolchain — and nothing else. It exists for a few seconds on every
+instant the guest is pristine Debian plus box's thin seed — root, chrony, the
+`/tmp` cap — and nothing else. It exists for a few seconds on every
 mint, so box captures it rather than asking you to be quick.
 
 ```sh
@@ -603,14 +679,12 @@ the door is per-port, punched and removable at runtime.
 ## Commands
 
 ```
-box new --name <box> [--size small|medium|large] [--user <user>] [--from <src>[/<snap>]] [--cpu <n>] [--memory <size>] [--disk <size>] [--vm|--container]
-box templates                # list dedicated non-agent templates
+box new --name <box> [--size small|medium|large] [--autostart] [--require-vm] [--from <src>[/<snap>]] [--cpu <n>] [--memory <size>] [--disk <size>] [--vm|--container]
 box list                     # list your boxes
 box info <box>               # one box: state, IP, exposures, provenance, snapshots
-box shell <box>              # enter as the stamped tenant user
+box shell [--user <u>] <box> # root by default; --user enters as one who exists
 box root <box>               # enter as root through the host's Incus authorization
-box exec <box> -- <cmd...>   # run a command in the box
-box tmux <box> [session]     # attach/create a tmux session — survives disconnects
+box exec [--user <u>] <box> -- <cmd...>   # run a command in the box (root by default)
 box snapshot <box> [label]   # checkpoint (label defaults to manual-<epoch>)
 box restore <box> <snap> [--force]
                              # roll back to a snapshot — destructive, asks first
@@ -697,7 +771,6 @@ TYPE       VM
 IPV4       10.x.x.x
 
 MINTED     2026-07-19T14:22:07Z by box 0.8.1
-TEMPLATE   tenant (user dev)
 IMAGE      images:debian/13/cloud @ 8a2f1c9d4e5b…
 MODE       vm (asked: auto)
 ORIGIN     mint
@@ -842,17 +915,40 @@ The VM is the trust boundary: whatever runs inside — the coding agent, or
 anything a template ships — can run arbitrary code and touch nothing you care
 about.
 
+### Opening a port to the gateway: `/etc/box/firewall.d` (#279)
+
+Boxes reach nothing on the host but DNS and DHCP. A tool that runs a service
+boxes must call at bootstrap (a CI manager's callback, a pull-through mirror)
+opens it with a drop-in, one file per tool:
+
+```
+# /etc/box/firewall.d/gig.conf
+tcp 9997
+```
+
+Each non-comment line is `tcp PORT` or `udp PORT` (1–65535). Each port is
+accepted **from boxnet to the gateway address only**, before the final drop,
+so the host's other addresses on that port stay closed, and so does every
+other gateway port. On a UFW host the same rules are UFW allows tagged
+`box-firewall.d`, converged on every run. A malformed line is reported as
+`file:line` and **its whole file is skipped** (fail closed). The other files
+still apply. To apply an edit: `sudo systemctl restart box-firewall`. The
+files are re-read at every boot and every `setup-host` too. `box doctor` lists
+the active ports, and `teardown-host` leaves the directory alone, because the
+files belong to the tools that wrote them. To check that the installed
+firewall reads drop-ins: `box-firewall --supports dropins` (exit 0).
+
 ### Measured, not claimed
 
 Every clause above is probed live by an end-to-end drill, because the one time
 this contract was reasoned about instead of measured, the reasoning was wrong:
 box→box traffic was "covered" by an L3 drop that L2-switched frames never
 meet — a hole found by probing, not by reading the rules. On a bare host the
-drill installs the whole stack, mints both templates cold — `tenant` and
-`staging-box`, which since #214 is the whole set — snapshots and
+drill installs the whole stack, mints the seed cold (box has one since
+0.11.0, #288), snapshots and
 clones, probes every boundary from inside the boxes, opens and shuts the
 `expose` door (and checks the contract survives it), and removes what it
-minted — currently **71 checks, 71 passing**. [drill/RUNS.md](drill/RUNS.md) is the full
+minted — currently **89 checks, 71 passing** in the last record (0.10.0's, taken before 0.11.0 added the guest interiors and the drop-in probes, #292). [drill/RUNS.md](drill/RUNS.md) is the full
 history, including every trap that fooled a run into a wrong verdict.
 
 ### Run the drill yourself
@@ -904,8 +1000,9 @@ never remounts, provisions, deletes, writes a file or changes configuration.
 
 An empty readable kernel journal is reported explicitly as “no OOM kill
 logged”; an unreadable journal is reported as unknown, never clean. A legacy
-ordinary VM with no swap or a 50%-of-memory `/tmp` points to the current #178
-seed and reminting, not to a `--fix`: those findings can have different owners,
+ordinary VM with no swap or a 50%-of-memory `/tmp` points to the #178 seed and
+reminting, not to a `--fix`; a `seed/3` VM (0.11.0) with no swap gets a note,
+not a finding, because box lays none since #290: those findings can have different owners,
 and `checkup` does not guess which state it may change.
 
 `checkup` exits `0` when every check is clean and `1` when it reports a

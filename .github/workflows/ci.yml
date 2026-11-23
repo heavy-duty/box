@@ -246,7 +246,7 @@ jobs:
         run: |
           set -eux
           sudo box new --name keeper --container
-          sudo box exec keeper -- sh -c 'echo survives > /home/dev/proof'
+          sudo box exec keeper -- sh -c 'echo survives > /root/proof'
           sudo box snapshot keeper pre-export
           # The identity, on the real daemon (#181): the mocked drive proves
           # box asks for the key, only a live daemon proves it ACCEPTS it.
@@ -271,7 +271,7 @@ jobs:
           test "$id1" != "$id0"
           sudo box info keeper2 | grep -qE "^ID +$id1$"
           sudo incus exec keeper2 -- true
-          sudo box exec keeper2 -- cat /home/dev/proof | grep -qx survives
+          sudo box exec keeper2 -- cat /root/proof | grep -qx survives
           sudo incus snapshot list keeper2 --format csv | grep -q '^pre-export'
           # the collision boundary, live: the name is taken, import must refuse
           if sudo box import /tmp/keeper.tar.gz --name keeper2; then

@@ -3,51 +3,27 @@
 # split: every ordinary mint renders this file, and it carries ONE hygiene —
 # the agent-class one, because that is the shape the fleet measured. What the
 # box BECOMES is installed inside it afterwards, by its operator.
-# The tenant is UNPRIVILEGED, and the ABSENCE of a 'sudo:' line here is the
-# whole of it (#177, ruled by danmt on #176). Root was never a confidentiality
-# boundary — an agent already runs AS this user, so its credentials, the repo
-# and the egress are reachable without it, and the VM contains the rest. What
-# root cost is in-guest mitigation: an egress allowlist enforced in the guest,
-# a read-only mount, auditd, a required proxy are each one 'sudo' away from
-# being switched off, and a box whose tenant is root cannot produce
-# trustworthy evidence about its own contents, because root rewrites the logs
-# that would say otherwise. The operator's path is 'box root <box>', which
-# authorizes through the host's Incus socket and needs no sudoers entry in the
-# guest (#176). 'staging-box' keeps its sudo on purpose: a self-converging
-# fleet guest is the other trait, and it gets the other answer.
-# NOT a partial allowlist ('NOPASSWD: /usr/bin/apt-get' and friends, #177
-# decision 6): apt alone installs a package that owns the box, so it keeps
-# most of the risk while feeling safer. Either the tenant is unprivileged or
-# it is not.
-users:
-  - name: "@BOX_USER@"
-    shell: /bin/bash
-    lock_passwd: true
+# NO USERS (#291, #253 D8(ii), danmt: "box shouldn't know anything about users
+# directly, its up to the convergence step"). A fresh box holds root alone;
+# 'box shell' and 'box exec' enter as root by default, and a tenant arrives
+# with convergence (a role's USER=, created by the converger). The
+# unprivileged-tenant posture of #177 is the role's to keep now: a role that
+# wants a sudo-less agent creates it without sudo.
+# 'users: []' and not an absent key: with no 'users' at all, cloud-init falls
+# back to the distro's default user ('debian', with passwordless sudo) — the
+# rehearsal on real Incus found it. The empty list is what "no users" means.
+users: []
 package_update: true
-# tmux: 'box tmux' runs 'tmux new-session' INSIDE the box (#65).
 # curl + ca-certificates: they no longer carry box's installer — they carry
 # the OPERATOR's (#214). The first line of the by-hand converge is a
 # 'curl … | bash' run as root inside this box, so a seed that dropped them
 # would break the path this release replaced the mint hook with, on a bare
 # cloud image that is not guaranteed to ship either.
 # chrony: step resumed guests back to real UTC even after startup (#174).
-# The unprivileged toolchain (#177 decision 3). With no sudo, 'apt install' is
-# no longer the tenant's escape hatch, so what it reaches for ships here or is
-# reachable user-locally. Measured, not guessed: over three weeks of duty in a
-# live agent box, the tenant-initiated installs recorded in
-# /var/log/apt/history.log were shellcheck,
-# then a Chromium/Playwright dependency set, then chromium. The browser stack
-# stays OUT — task-specific, hundreds of megabytes on every mint, and 'box
-# root' is the path for it; a shell linter is small and generic, so it is in.
-# Everything else an agent used came from what the operator converges (git,
-# gh, ripgrep, jq, build-essential, node), which is where the toolchain
-# belongs; re-listing it here would only thicken the seed (#81).
-# python3-venv: Debian 13 ships no pip and marks the system environment
-# externally-managed, so 'python3 -m venv' — the user-local Python route the
-# ruling leans on — dies on a bare guest with "install the python3-venv
-# package". Measured in the same box. Without it, losing sudo means losing
-# every route to a Python package, which is the silently-crippled tenant this
-# change must not produce.
+# The unprivileged toolchain (python3-venv, shellcheck) and the swapfile are
+# NOT here since 0.11.0 (#290, #253 D6/D9): they are convergence, so a role
+# installs them (APT_EXTRAS, SWAP_SIZE). An unconverged box has neither, and
+# that is the stated cost, not an oversight.
 write_files:
   - path: /etc/chrony/conf.d/box-makestep.conf
     permissions: "0644"
@@ -106,12 +82,9 @@ write_files:
       q /tmp     1777 root root 1d
       q /var/tmp 1777 root root 30d
 packages:
-  - tmux
   - curl
   - ca-certificates
   - chrony
-  - python3-venv
-  - shellcheck
 runcmd:
   - systemctl enable chrony
   # Containers share the host clock; VM guests must start chrony (#174).
@@ -124,26 +97,3 @@ runcmd:
   # remount that means nothing there.
   - systemctl daemon-reload
   - test "$(findmnt -no FSTYPE /tmp)" != tmpfs || mount -o remount,size=1G /tmp
-  # 4GiB of swap on the selected disk, so a memory spike degrades instead of
-  # OOM-killing with no grace period and no warning — swap-in is observable,
-  # where a kill is a process that was there and then was not (#178).
-  # Container-guarded for chrony's reason one line up, not a different one: a
-  # container shares the host's swap and cannot swapon at all, so the file
-  # would be 4GiB of nothing and the fstab line a failure at every boot. The
-  # /swapfile test keeps a re-run idempotent, and the dd fallback is
-  # cloud-init's own (cc_mounts.create_swapfile): fallocate is refused on some
-  # filesystems and dd always works.
-  - |
-    if ! systemd-detect-virt --quiet --container && [ ! -e /swapfile ]; then
-      fallocate -l 4G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=4096
-      chmod 600 /swapfile
-      mkswap /swapfile
-      swapon /swapfile
-      # Close the line first if fstab has no trailing newline: appending onto
-      # a half-line would fuse the swap entry to the ROOT entry, and a box
-      # whose / is unparseable does not boot. The test reads the last byte —
-      # command substitution eats a trailing newline, so an empty result IS
-      # the newline and nothing is added.
-      [ -s /etc/fstab ] && [ -n "$(tail -c1 /etc/fstab)" ] && printf '\n' >> /etc/fstab
-      printf '%s\n' '/swapfile none swap sw 0 0' >> /etc/fstab
-    fi

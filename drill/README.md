@@ -66,11 +66,11 @@ drilled.
 
 ## What it checks
 
-The script prints **seven ledgered phases**, in this order, plus unkeyed
+The script prints **eight ledgered phases**, in this order, plus unkeyed
 sections (the install, the host setup, the summary, the audit answers) that
 emit no verdicts. Each phase declares how many verdicts a complete run of it
 emits; the table below is that declaration, and the summary grades the run
-against it as a floor. **71 probes** total.
+against it as a floor. **89 probes** total.
 
 **What a box drill proves is what box owns**: that a mint comes up, at the size
 it was asked for, on the shared placement contract and behind the real trust
@@ -85,7 +85,8 @@ else's contract.
 |---|---|---|
 | **I** | **The installer's contract.** `install.sh` runs the host setup itself (#64), so the drill asserts what it left — `boxnet`, the `box-isolate` ACL, the `box-profile` profile, the nft bridge drop — *before* anything else on the host mutates the stack. Skipped, declared, under `DRILL_OWNS_SETUP=1`. | 1 |
 | **A** | **Incus semantics.** The assumptions box is built on, probed directly: that `incus config get <inst> user.box` returns `1` (this is on the path of *every* box command — if it lies, everything fails closed); that the `user.box=1` list filter selects our instances and excludes an untagged one; that `--columns nstS` gives four clean CSV fields; that the state column reads `RUNNING`; that `incus rename` really does refuse a running instance; that snapshot-list's first CSV field is the label; that an **unset** config key reads as empty with exit 0 (#15 B4); and that `incus copy` **preserves `user.*` keys** (#15 B2 — the whole template-metadata design in #17 rests on it). | 8 |
-| **B** | **The box surface.** Version, the empty-host message, templates and the key allowlist that stops one naming a network, mint, list, info, snapshot, clone-from-a-snapshot-of-a-renamed-box, the `--from` clone honouring `--cpu`/`--memory`/`--disk` (#171), rename (running must refuse, stopped must work), the escape hatch and its isolation warning, the `rm` confirmation guard, and the CLI contract (typo'd command, typo'd flag, `list <box>`). **The boundary** gets its own treatment: the drill launches an instance box did *not* mint, aims `down`, `rm` and the escape hatch at it, and requires all three to refuse — and the instance to still be standing afterwards. | 45 |
+| **B** | **The box surface.** Version, the empty-host message, the removed template axis refusing with its replacement (#288) and the seed's key allowlist that stops it naming a network, mint (root entry, no tenant, `--user` refusing — #291), list, info, snapshot, clone-from-a-snapshot-of-a-renamed-box, the `--from` clone honouring `--cpu`/`--memory`/`--disk` (#171), rename (running must refuse, stopped must work), the escape hatch and its isolation warning, the `rm` confirmation guard, and the CLI contract (typo'd command, typo'd flag, `list <box>`). **The boundary** gets its own treatment: the drill launches an instance box did *not* mint, aims `down`, `rm` and the escape hatch at it, and requires all three to refuse — and the instance to still be standing afterwards. | 47 |
+| **G** | **Guest interiors (#292).** What a fresh box holds, measured from inside it: `chronyc tracking` names a reference source and a ±3h `date -s` skew converges unattended to within 2s of the host clock (VM only — a container shares the host clock and runs no chronyd, three declared skips); no regular user exists (#291); `box root` reaches uid 0 with `HOME=/root`; `box checkup` reports `seed/3` and the fixed 1.0 GiB `/tmp`, and a write past it gives ENOSPC; an unconverged VM has no swap (#290, a declared skip in a container); no converger on `PATH`, no retired stamp, `--role` refused creating nothing; `--autostart` stamped on a real mint (#288); `box restart` brings the box back; a `firewall.d` drop-in port is reachable on the gateway and the next port stays dropped (#279). | 16 |
 | **C** | **Isolation baseline (#15 section A).** From inside a real box: public egress works; the box cannot reach a listener on the host's gateway; RFC1918 is dropped; a **sibling box is unreachable** (a listener runs on the peer so "refused" — the packet arrived — cannot masquerade as "dropped"); DNS does not enumerate the sibling; IPv6 is off; and the host cannot connect **into** a box. | 9 |
 | **E** | **`box expose` — a deliberate loopback door (#55).** A listener is started inside a box and the port exposed: the host's loopback must reach it, `expose --list` and `box info` must say the box has a hole in it, a **non**-exposed port must still be dropped (the feature is per-port, never a global ingress opening), and `--remove` must shut the door. | 7 |
 | **D** | **The isolation contract, stated.** Not a rehearsal — see below. It judges only one thing: if phase C's baseline box could not reach the internet at all, it says out loud that every isolation result above is suspect rather than a pass. | 0 |
@@ -239,7 +240,7 @@ about the host in front of you, and whether it is a *failure* is what the
 Anything a converger puts on a box. Since #214 box installs no agent, so there
 is no agent CLI for the drill to find and no agent login to rehearse — both are
 downstream of convergence that box does not perform. What the drill asserts is the
-seed's *own* payload (`tmux`, `shellcheck`), which is what box can still be held
+seed's *own* payload (chrony, the `/tmp` cap, no tenant), which is what box can still be held
 to. Converging a box, and authenticating what you converged, are yours.
 
 If the host has no `/dev/kvm`, box falls back to container mode. The drill

@@ -503,6 +503,32 @@ if command -v ufw >/dev/null 2>&1; then
   fi
 fi
 
+# Drop-ins (#279): what other tools opened on the gateway, read through the
+# installed firewall's own parser so the doctor and the firewall can never
+# disagree about what a file means. Informational: a tool's port is that
+# tool's business; a malformed file is reported (it fails closed).
+FW_BIN=/usr/local/sbin/box-firewall
+[ -x "$FW_BIN" ] || FW_BIN="$(dirname "$0")/../host/box-firewall.sh"
+if [ -d "${BOX_FIREWALL_D:-/etc/box/firewall.d}" ]; then
+  head_ "Firewall — drop-in ports (${BOX_FIREWALL_D:-/etc/box/firewall.d})"
+  # READ, never run, to decide: a pre-#279 box-firewall ignores its arguments
+  # and applies the whole firewall — an upgraded host keeps the old binary
+  # until setup-host — so executing it as a probe would re-apply old rules.
+  if ! grep -q -- '--supports)' "$FW_BIN" 2>/dev/null; then
+    no "the installed box-firewall does not read drop-ins — re-run setup-host to install this release's"
+  else
+    dropin_err="$(mktemp)"
+    dropin_list="$(bash "$FW_BIN" --list-dropins 2>"$dropin_err" || true)"
+    if [ -n "$dropin_list" ]; then
+      ok "accepted from boxnet to the gateway only: $(tr '\n' ',' <<<"$dropin_list" | sed 's/,$//; s/,/, /g')"
+    else
+      inf "no drop-in ports"
+    fi
+    while IFS= read -r line; do [ -z "$line" ] || no "${line#box-firewall: }"; done <"$dropin_err"
+    rm -f "$dropin_err"
+  fi
+fi
+
 # box-profile is the placement contract. The pre-rename ancestor profile used to be
 # reported beside it, because the migration tool could still re-home the boxes
 # that referenced it; with that tool retired (#226), naming it here would tell
@@ -716,6 +742,47 @@ for u in boxdrill1 boxdrill2 boxdrill3 boxdrill4; do
     inf "fix:  sudo BOX_YES=1 box revoke $u --purge && sudo userdel -r $u"
   fi
 done
+
+# --- Grants: what each granted project holds (#282, #283, #287) -------------
+# Informational: a grant's pool fill, its caps and current use, whether it is
+# a service and whom it is shared with. An admin reads every project; nothing
+# here is a finding unless a grant pool is missing.
+grants="$(incus project list --format csv --columns n 2>/dev/null | sed 's/ (current)$//' | grep '^user-' || true)"
+if [ -n "$grants" ]; then
+  head_ "Grants"
+  share_dir="${BOX_SHARE_DIR:-/etc/box/shares}"
+  while IFS= read -r gp; do
+    [ -n "$gp" ] || continue
+    g_uid="${gp#user-}"; g_user="$(getent passwd "$g_uid" 2>/dev/null | cut -d: -f1)"
+    g_svc="$(incus project get "$gp" user.box.service 2>/dev/null || true)"
+    g_pool="$(incus project get "$gp" user.box.pool 2>/dev/null || true)"
+    line="$gp (${g_user:-uid $g_uid}$([ "$g_svc" = true ] && echo ", service"))"
+    caps=""
+    for k in memory cpu instances; do
+      v="$(incus project get "$gp" "limits.$k" 2>/dev/null || true)"
+      [ -z "$v" ] || caps="$caps${caps:+, }$k $v"
+    done
+    inf "$line"
+    if [ -n "$caps" ]; then
+      inf "  caps: $caps"
+      # Current use beside the caps (#283): incus's own resource table.
+      while IFS= read -r urow; do inf "    $urow"; done < <(incus project info "$gp" 2>/dev/null \
+        | awk -F'|' 'NF>3 && $2 ~ /[A-Z]/ { gsub(/^ +| +$/,"",$2); gsub(/^ +| +$/,"",$3); gsub(/^ +| +$/,"",$4); if ($2 != "RESOURCE") printf "%s: %s used of %s\n", tolower($2), $4, $3 }')
+    fi
+    if [ -n "$g_pool" ]; then
+      if pinfo="$(incus storage info "$g_pool" 2>/dev/null)"; then
+        used="$(awk -F': ' '/space used:/{print $2; exit}' <<<"$pinfo")"
+        total="$(awk -F': ' '/total space:/{print $2; exit}' <<<"$pinfo")"
+        inf "  pool: $g_pool — ${used:-?} of ${total:-?} used"
+      else
+        no "$gp's grant pool $g_pool is missing — re-run: box grant ${g_user:-<user>}$([ "$g_svc" = true ] && echo " --service") --pool $g_pool --pool-size <size>"
+      fi
+    fi
+    if [ -n "$g_user" ] && [ -e "$share_dir/$g_user" ]; then
+      inf "  shared with group: $(cat "$share_dir/$g_user") (box --as $g_user)"
+    fi
+  done <<<"$grants"
+fi
 
 # --- the box's DNS comes from the HOST's resolver. See issue #33. -----------
 head_ "Host resolver — a box's DNS is forwarded through this"
