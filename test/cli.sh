@@ -6842,6 +6842,13 @@ check "drill: derives the boxnet prefix from the network" 0 "" \
   grep -qF 'network get boxnet ipv4.address' "$ROOT/drill/drill.sh"
 check "multiuser: derives the boxnet prefix from the network" 0 "" \
   grep -qF 'network get boxnet ipv4.address' "$ROOT/drill/multiuser.sh"
+# #295: no wait on a drill box is swallowed — a timeout is a finding, never
+# a silent cascade of blind FAILs.
+check "drill: no wait_box has its failure thrown away (#295)" 1 "" \
+  grep -qE 'wait_box [a-z]+ >/dev/null 2>&1 *($|;)' "$ROOT/drill/drill.sh"
+# #296: the drop-in probe waits for its listener and says which layer refused.
+check "drill: the drop-in probe waits for its listener on the host (#296)" 0 "" \
+  grep -qF 'dhost=yes; break' "$ROOT/drill/drill.sh"
 
 # #293: the drill's up-front sudo check accepts passwordless root even when
 # 'sudo -v' would prompt (a NOPASSWD user who is also in %sudo). The check line
