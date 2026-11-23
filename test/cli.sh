@@ -3209,15 +3209,70 @@ check "cp: stdout refuses a directory" 2 "stdout carries one file" \
   env FAKE_REMOTE_DIRS=/root/proj bash -c "$(declare -f cpin); CPW='$CPW' CPSHIM='$CPSHIM' BOX='$BOX' cpin '$CPL' '' cp work:proj -"
 CPSA="$(mktemp -d)"; : >"$CPSA/$(id -un)"
 cpas() { (cd "$CPW" && env SUDO_USER=boxmember BOX_SHARE_DIR="$CPSA" FAKE_INCUS_LOG="$CPL" FAKE_PUSH_COPY="$CPW/pushed" PATH="$CPSHIM:$PATH" "$BOX" "$@"); }
-check "cp --as: a member's host PATH is refused — it would be read as the service (#287)" 2 "takes only '-'" \
+check "cp --as: the service's half never names a host path for a member (#287)" 2 "never names a host path" \
   cpas cp notes.md work:
 check "cp --as: ...and nothing reached incus" 1 "" grep -q 'file' "$CPL"
-check "cp --as: ...nor a pull onto a host path" 2 "takes only '-'" cpas cp work:out.txt ./out.txt
+check "cp --as: ...nor a pull onto a host path" 2 "never names a host path" cpas cp work:out.txt ./out.txt
 check "cp --as: stdin is allowed — the member's shell opened the file" 0 "copied stdin" \
   bash -c "$(declare -f cpas); CPW='$CPW' CPSA='$CPSA' CPL='$CPL' CPSHIM='$CPSHIM' BOX='$BOX'; printf member-bytes | cpas cp - work:in.txt"
 check "cp --as: stdout is allowed" 0 "pulled" \
   bash -c "$(declare -f cpas); CPW='$CPW' CPSA='$CPSA' CPL='$CPL' CPSHIM='$CPSHIM' BOX='$BOX'; cpas cp work:out.txt - 2>/dev/null"
 rm -rf "$CPSA"
+
+# 'box --as NAME cp' end to end (#278): the MEMBER's half tars or untars the
+# host side before sudo; the service's half sees only a stream. Driven with a
+# fake sudo (re-enters box as the "service" with SUDO_USER set) and a fake
+# incus that runs the guest scripts for real against a fake root.
+AC="$(mktemp -d)"; mkdir -p "$AC/bin" "$AC/root/root" "$AC/root/srv/ops" "$AC/shares" "$AC/host"
+: > "$AC/shares/$(id -un)"
+cat > "$AC/bin/sudo" <<SHIM
+#!/usr/bin/env bash
+for a; do [ "\$a" = -l ] && exit 0; done
+while [ "\$1" != -- ]; do shift; done; shift
+exec env SUDO_USER=boxmember BOX_SHARE_DIR="$AC/shares" "\$@"
+SHIM
+cat > "$AC/bin/chown" <<'SHIM'
+#!/bin/sh
+exit 0
+SHIM
+cat > "$AC/bin/incus" <<SHIM
+#!/usr/bin/env bash
+case "\$*" in
+  "config get --expanded work user.box"|"config get work user.box") echo 1; exit 0 ;;
+  "config get "*) exit 1 ;;
+  "exec work -- getent passwd ops") echo "ops:x:1500:1600:Ops:/srv/ops:/bin/bash"; exit 0 ;;
+  "exec work -- getent passwd "*) exit 2 ;;
+  "exec work -- sh -c "*)
+    shift 5; script="\$1"; shift 2
+    first="\$1"; shift; case "\$first" in /*) first="$AC/root\$first" ;; esac
+    exec sh -c "\$script" sh "\$first" "\$@" ;;
+esac
+exit 0
+SHIM
+chmod +x "$AC/bin/"*
+acp() { (cd "$AC/host" && env PATH="$AC/bin:$PATH" BOX_SHARE_BIN="$BOX" BOX_SHARE_DIR="$AC/shares" "$BOX" --as svc cp "$@"); }
+echo hello > "$AC/host/notes.md"; mkdir -p "$AC/host/dist/sub"; echo y > "$AC/host/dist/sub/f"
+check "cp --as: a member pushes a host FILE with the plain grammar" 0 "" acp notes.md work:
+check "cp --as: ...and it lands in /root" 0 "hello" cat "$AC/root/root/notes.md"
+check "cp --as: a member pushes a DIRECTORY, recursively" 0 "" acp dist work:proj/dist
+check "cp --as: ...a missing path becomes the tree (scp's rule)" 0 "y" cat "$AC/root/root/proj/dist/sub/f"
+check "cp --as: ...and onto an existing directory it lands inside" 0 "y" \
+  bash -c "$(declare -f acp); AC='$AC' BOX='$BOX'; mkdir -p '$AC/root/root/into'; acp dist work:into >/dev/null && cat '$AC/root/root/into/dist/sub/f'"
+check "cp --as: --user lands in the user's home" 0 "hello" \
+  bash -c "$(declare -f acp); AC='$AC' BOX='$BOX'; acp --user ops notes.md work: >/dev/null && cat '$AC/root/srv/ops/notes.md'"
+check "cp --as: a member pulls a FILE into a host directory" 0 "copied work:notes.md" \
+  bash -c "$(declare -f acp); AC='$AC' BOX='$BOX'; mkdir -p '$AC/host/back'; acp work:notes.md back"
+check "cp --as: ...with the bytes intact" 0 "hello" cat "$AC/host/back/notes.md"
+check "cp --as: a member pulls a DIRECTORY onto a missing path" 0 "y" \
+  bash -c "$(declare -f acp); AC='$AC' BOX='$BOX'; acp work:proj/dist got >/dev/null && cat '$AC/host/got/sub/f'"
+check "cp --as: ...and leaves no private temp dir behind" 0 "[]" bash -c "printf '[%s]' \"\$(ls -A '$AC/host' | grep '^\.box-cp')\""
+# A box is untrusted: a stream that would land outside the copy is refused,
+# and nothing is written to the destination.
+mkdir -p "$AC/root/root/evil"; ln -s /etc "$AC/root/root/evil/escape"
+check "cp --as: an archive with a symlink pointing outside the tree is refused" 1 "points outside the copied tree" \
+  acp work:evil evilout
+check "cp --as: ...and nothing reached the destination" 1 "" test -e "$AC/host/evilout"
+rm -rf "$AC"
 check "cp: a relative remote path resolves against /root" 0 "work:/root/a/b.md" cpbox "$CPL" cp notes.md work:a/b.md
 check "cp: a ~/ remote path resolves against /root, never the host's \$HOME" 0 "work:/root/x.md" cpbox "$CPL" cp notes.md 'work:~/x.md'
 check "cp: ...the host's \$HOME is nowhere in the call" 1 "" grep -qF "$HOME/" "$CPL"

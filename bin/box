@@ -7,7 +7,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 remote=""; mode="auto"; name=""; from=""; template=""; size=""; user=""
-force=0; json=0; want_help=0
+force=0; json=0; want_help=0; cp_stream=""
 cpu=""; memory=""; disk=""; instance_only=0
 autostart=0; require_vm=0   # boot demands as flags (#288)
 inst=""   # the resolved Incus instance, set by the 'box' precondition
@@ -673,15 +673,19 @@ A directory copied onto an existing directory lands inside it; onto a missing
 path it becomes that path (when pushing, the path must end in the directory's
 own name: proj/dist for ./dist). A host path with a colon is written ./a:b.
 
-'-' as the host side is stdin or stdout, for one file. It is the only host side
-a shared tenant's members may use (box --as): their own shell opens the file,
-so the service account never reads or writes a host path for them (#287).
+'-' as the host side is stdin or stdout, for one file.
+
+A shared tenant's members (box --as) use the same grammar, directories too: box
+reads and writes the host side AS THE MEMBER, before sudo, and hands the service
+only a tar stream, so the service never touches a host path for them (#287). A
+pulled stream is checked before it lands: one top entry, no absolute or '..'
+path, no symlink pointing outside the copied tree.
 
   box cp ./notes.md work:                  # → /root/notes.md
   box cp --user ops ./dist work:proj/dist  # → ~ops/proj/dist, owned by ops
   box cp work:/var/log/syslog .            # box → host
-  box --as crew cp - work:notes.md < notes.md          # a member, into the box
-  box --as crew cp work:out/report.pdf - > report.pdf  # a member, out of it
+  box cp - work:notes.md < notes.md        # stdin → a box file
+  box --as crew cp ./dist work:proj/dist    # a member: read as the member, landed as crew
 EOF
 ;;
     exec) cat <<'EOF'
@@ -1200,6 +1204,78 @@ show_help() {   # "" → general help
   esac
 }
 
+# --- box --as NAME cp: the member's half (#278, #287) -------------------------
+# Runs as the MEMBER. Push: tar the host path and pipe it to the service's
+# 'cp --tar-in'. Pull: take the service's 'cp --tar-out' stream into a fresh
+# private directory, refuse anything that could land outside it, then move it
+# into place. A '-' host side, or a malformed line, is passed through
+# untouched for the service's own cp to handle or refuse.
+as_cp() {
+  local as_user="$1"; shift; shift   # NAME, then 'cp'
+  local opts=() pos=() a
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user) [ $# -ge 2 ] || break; opts+=("$1" "$2"); shift 2 ;;
+      --) shift; pos+=("$@"); break ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+  local re='^([A-Za-z0-9][A-Za-z0-9-]*):(.*)$'
+  if [ "${#pos[@]}" -ne 2 ] || [ "${pos[0]}" = - ] || [ "${pos[1]}" = - ] \
+     || { [[ "${pos[0]}" =~ $re ]] && [[ "${pos[1]}" =~ $re ]]; } \
+     || { ! [[ "${pos[0]}" =~ $re ]] && ! [[ "${pos[1]}" =~ $re ]]; }; then
+    exec sudo -n -u "$as_user" -H -- "$SHARE_BIN" cp "${opts[@]}" -- "${pos[@]}"
+  fi
+  local svc=(sudo -n -u "$as_user" -H -- "$SHARE_BIN" cp "${opts[@]}")
+  if [[ "${pos[1]}" =~ $re ]]; then
+    # push: host → box
+    local h="${pos[0]}" bside="${pos[1]}"
+    [ -e "$h" ] || [ -L "$h" ] || { echo "box: no such file on the host: $h" >&2; return 1; }
+    local hd hb; hd="$(cd -- "$(dirname -- "$h")" && pwd)" || return 1; hb="$(basename -- "$h")"
+    case "$hb" in /|.|..) echo "box: name a file or directory to copy, not '$h'" >&2; return 2 ;; esac
+    tar -C "$hd" -cf - -- "$hb" | "${svc[@]}" --tar-in "$bside"
+    local rcs=("${PIPESTATUS[@]}")
+    [ "${rcs[0]}" -eq 0 ] || { echo "box: could not read $h" >&2; return 1; }
+    return "${rcs[1]}"
+  fi
+  # pull: box → host
+  local bside="${pos[0]}" dest="${pos[1]}" parent final=""
+  if [ -d "$dest" ]; then parent="$dest"; else
+    [[ "$dest" != */ ]] || { echo "box: no such host directory: $dest" >&2; return 1; }
+    parent="$(dirname -- "$dest")"; [ -d "$parent" ] || { echo "box: no such host directory: $parent" >&2; return 1; }
+    final="$dest"
+  fi
+  local tmp; tmp="$(mktemp -d "$parent/.box-cp.XXXXXXXX")" || return 1
+  # shellcheck disable=SC2064  # expand $tmp now: it is the path to remove
+  trap "rm -rf -- '$tmp'" RETURN
+  "${svc[@]}" --tar-out "$bside" > "$tmp/stream.tar" || return $?
+  # The stream comes from a box, and a box is untrusted: one top entry, no
+  # absolute path, no '..', nothing outside that entry — checked by NAME before
+  # anything is written, and by link target after it lands in the private dir.
+  local names top n
+  names="$(tar -tf "$tmp/stream.tar")" || { echo "box: the box sent an unreadable archive" >&2; return 1; }
+  top="$(printf '%s\n' "$names" | head -n1)"; top="${top%%/*}"
+  case "$top" in ""|.|..) echo "box: refusing the archive: no single top entry" >&2; return 1 ;; esac
+  while IFS= read -r n; do
+    case "$n" in
+      /*|..|../*|*/../*|*/..) echo "box: refusing the archive: unsafe path '$n'" >&2; return 1 ;;
+      "$top"|"$top"/*) ;;
+      *) echo "box: refusing the archive: '$n' is outside '$top'" >&2; return 1 ;;
+    esac
+  done <<<"$names"
+  mkdir -- "$tmp/x"
+  tar -xf "$tmp/stream.tar" -C "$tmp/x" --no-same-owner || { echo "box: could not unpack what the box sent" >&2; return 1; }
+  if find "$tmp/x" -type l -printf '%l\n' | grep -qE '^/|(^|/)\.\.(/|$)'; then
+    echo "box: refusing the archive: a symlink in it points outside the copied tree" >&2; return 1
+  fi
+  [ -n "$final" ] || final="${parent%/}/$top"
+  if [ -d "$final" ] && [ ! -L "$final" ]; then
+    echo "box: $final already exists as a directory — remove it or pick another destination" >&2; return 1
+  fi
+  mv -f -- "$tmp/x/$top" "$final" || return 1
+  echo "box: copied $bside → $final"
+}
+
 # --- Acting as a shared tenant: box --as NAME <verb> … (#287) ----------------
 # A shared tenant is a service grant (#281) that a GROUP operates: 'box grant
 # --service NAME --share GROUP' lets that group run box itself, and only box,
@@ -1221,6 +1297,10 @@ if [ "${1:-}" = --as ]; then
     fi
     exit 2
   fi
+  # 'cp' with a host path (#278): the member's half runs HERE, before sudo, as
+  # the member. It packs or unpacks the host side itself and hands the service
+  # only a tar stream, so the service never names a host path.
+  if [ "${1:-}" = cp ]; then as_cp "$as_user" "$@"; exit $?; fi
   exec sudo -n -u "$as_user" -H -- "$SHARE_BIN" "$@"
 fi
 
@@ -1291,6 +1371,8 @@ while [ $# -gt 0 ]; do
     --instance-only) instance_only=1; shift ;;
     --force|-f) force=1; shift ;;
     --json) json=1; shift ;;
+    --tar-in) cp_stream=in; shift ;;     # internal: box --as … cp (#278)
+    --tar-out) cp_stream=out; shift ;;   # internal: box --as … cp (#278)
     --help|-h) want_help=1; shift ;;
     --version|-V) version; exit 0 ;;
     --) shift; args+=("$@"); break ;;
@@ -3108,6 +3190,7 @@ cp_remote_kind() {
 
 cmd_cp() {
   local syn; syn="$(synopsis_of cp)"
+  if [ -n "$cp_stream" ]; then cp_stream_mode; return; fi
   [ "${#args[@]}" -eq 2 ] || usage_error "cp takes one source and one destination — usage: $syn"
   local src="${args[0]}" dst="${args[1]}" push box rpath hpath
   if [ -z "$src" ] || [ -z "$dst" ]; then
@@ -3133,9 +3216,8 @@ cmd_cp() {
   # 'incus file push/pull'. With '-', the member's shell opens the file as the
   # member, and the service never sees a host path.
   if [ "${AS_SHARED:-0}" = 1 ] && [ "$hpath" != - ]; then
-    echo "box --as $(id -un): 'cp' takes only '-' as its host side for a shared tenant's members — a host path would be read or written as $(id -un) (#287)." >&2
-    echo "  box --as $(id -un) cp - $box:${rpath:-file} < ./file        # into the box" >&2
-    echo "  box --as $(id -un) cp $box:${rpath:-file} - > ./file        # out of it" >&2
+    echo "box --as $(id -un): this half of 'cp' runs as $(id -un) and never names a host path for a member (#287)." >&2
+    echo "  run it as 'box --as $(id -un) cp …' — box then reads and writes the host side as you." >&2
     exit 2
   fi
 
@@ -3247,6 +3329,59 @@ cmd_cp() {
     cp_incus file pull -- "$inst$rsrc" "$target" || exit 1
   fi
   echo "box: copied $box:$rsrc → $target"
+}
+
+# The service's half of 'box --as NAME cp' (#278): a tar stream on stdin or
+# stdout, one box side, never a host path. --tar-in unpacks inside the box,
+# applying scp's rule (an existing directory receives the entry; a missing path
+# becomes it) and the entry model's ownership; --tar-out packs one remote path.
+cp_stream_mode() {
+  [ "${#args[@]}" -eq 1 ] || usage_error "cp --tar-in/--tar-out take one <box>:<path>"
+  [[ "${args[0]}" =~ ^([A-Za-z0-9][A-Za-z0-9-]*):(.*)$ ]] || usage_error "cp --tar-in/--tar-out take one <box>:<path>"
+  local box="${BASH_REMATCH[1]}" rpath="${BASH_REMATCH[2]}"
+  local resolved; resolved="$(resolve_box "$box")"; inst="$resolved"
+  local home=/root uid=0 gid=0
+  if [ -n "$user" ]; then
+    require_guest_user "$inst" "$box" "$user"
+    home="$guest_home"; uid="$guest_uid"; gid="$guest_gid"
+    [[ "$home" == /* && "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ ]] || die "could not read the home, uid and gid of '$user' in $box"
+  fi
+  home="${home%/}"
+  local abs
+  # shellcheck disable=SC2088  # a literal remote ~, expanded by hand
+  case "$rpath" in
+    ""|"~") abs="$home/" ;;
+    "~/"*)  abs="$home/${rpath#"~/"}" ;;
+    "~"*)   usage_error "cp: '~name' paths are not expanded — use --user NAME with ~/…, or an absolute path" ;;
+    /*)     abs="$rpath" ;;
+    *)      abs="$home/$rpath" ;;
+  esac
+  if [ "$cp_stream" = out ]; then
+    local rsrc="${abs%/}"; [ -n "$rsrc" ] || usage_error "cp: refusing to copy a box's whole / to the host"
+    # shellcheck disable=SC2016  # expands inside the guest
+    incus exec "$inst" -- sh -c '[ -e "$1" ] || { echo "no such path in the box: $1" >&2; exit 3; }; cd "$(dirname "$1")" && exec tar -cf - -- "$(basename "$1")"' sh "$rsrc"
+    return
+  fi
+  # shellcheck disable=SC2016  # expands inside the guest
+  incus exec "$inst" -- sh -c '
+    set -e; t="$1"; uid="$2"; gid="$3"
+    if [ -d "$t" ]; then base="${t%/}"; [ -n "$base" ] || base=/; work="$base"; else
+      case "$t" in */) echo "no such directory in the box: $t" >&2; exit 3 ;; esac
+      p="$(dirname "$t")"; top="$p"
+      while [ ! -e "$top" ]; do made="$top"; top="$(dirname "$top")"; done
+      mkdir -p "$p"; work="$p"
+    fi
+    tmp="$(mktemp -d "$work/.box-cp.XXXXXXXX")"; trap "rm -rf \"\$tmp\"" EXIT
+    tar -x -C "$tmp" --no-same-owner -f -
+    n="$(ls -A "$tmp")"
+    [ -n "$n" ] && [ "$(printf "%s\n" "$n" | wc -l)" -eq 1 ] || { echo "the stream must hold exactly one entry" >&2; exit 4; }
+    if [ -d "$t" ]; then dst="${base%/}/$n"; else dst="$t"; fi
+    if [ -d "$dst" ] && [ ! -L "$dst" ]; then echo "$dst already exists as a directory in the box" >&2; exit 5; fi
+    mv -f "$tmp/$n" "$dst"
+    chown -R -h "$uid:$gid" "$dst"
+    [ -z "${made:-}" ] || chown -R -h "$uid:$gid" "$made"
+    echo "$dst"
+  ' sh "$abs" "$uid" "$gid" >/dev/null || exit 1
 }
 
 # Removed with the tmux package (#289, #253 D7(a)): the verb goes with it, and
