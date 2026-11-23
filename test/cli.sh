@@ -6842,6 +6842,47 @@ check "drill: derives the boxnet prefix from the network" 0 "" \
   grep -qF 'network get boxnet ipv4.address' "$ROOT/drill/drill.sh"
 check "multiuser: derives the boxnet prefix from the network" 0 "" \
   grep -qF 'network get boxnet ipv4.address' "$ROOT/drill/multiuser.sh"
+
+# #300: the skew trial runs inside the guest against its MONOTONIC clock, so no
+# agent read rides across the clock step. Driven here with a fake clock: 'date'
+# keeps an offset, 'sleep' advances uptime, and a fake chrony steps the offset
+# back to zero after CONVERGE_AFTER sleeps (0 = never).
+SKT="$(mktemp -d)"
+awk '/^#!\/bin\/sh$/{f=1;next} /^SKEW$/{f=0} f' "$ROOT/drill/drill.sh" \
+  | sed "s|/proc/uptime|$SKT/uptime|; s|/var/tmp/|$SKT/|g" > "$SKT/skew.sh"
+mkdir -p "$SKT/bin"
+cat > "$SKT/bin/date" <<'FAKE'
+#!/bin/sh
+o=$(cat "$SKT/off"); base=1700000000; u=$(cut -d. -f1 "$SKT/uptime")
+case "$1" in
+  -s) [ -n "${SKEW_REFUSE:-}" ] && exit 1
+      case "$2" in "+3 hours") echo 10800 > "$SKT/off";; "-3 hours") echo -10800 > "$SKT/off";; @*) echo 0 > "$SKT/off";; esac ;;
+  +%s) echo $((base + u + o)) ;;
+esac
+FAKE
+cat > "$SKT/bin/sleep" <<'FAKE'
+#!/bin/sh
+u=$(cut -d. -f1 "$SKT/uptime"); echo "$((u + $1)).00 0" > "$SKT/uptime"
+n=$(( $(cat "$SKT/n") + 1 )); echo "$n" > "$SKT/n"
+[ "${CONVERGE_AFTER:-0}" -gt 0 ] && [ "$n" -ge "$CONVERGE_AFTER" ] && echo 0 > "$SKT/off"
+exit 0
+FAKE
+chmod +x "$SKT/bin/date" "$SKT/bin/sleep"
+skew_sim() {  # skew_sim <sign> → the verdict file's contents
+  echo "100.00 0" > "$SKT/uptime"; echo 0 > "$SKT/off"; echo 0 > "$SKT/n"
+  env SKT="$SKT" PATH="$SKT/bin:$PATH" sh "$SKT/skew.sh" "$1"; cat "$SKT/box-skew$1"
+}
+check "skew trial: +3h stepped back by chrony converges, measured on the monotonic clock (#300)" 0 "converged:6" \
+  env CONVERGE_AFTER=3 bash -c "$(declare -f skew_sim); SKT='$SKT' skew_sim +3"
+check "skew trial: -3h converges too (#300)" 0 "converged:4" \
+  env CONVERGE_AFTER=2 bash -c "$(declare -f skew_sim); SKT='$SKT' skew_sim -3"
+check "skew trial: no makestep is a timeout, and the clock is put back (#300)" 0 "timeout" \
+  env CONVERGE_AFTER=0 bash -c "$(declare -f skew_sim); SKT='$SKT' skew_sim +3; [ \"\$(cat '$SKT/off')\" = 0 ]"
+check "skew trial: a refused date -s is 'notlanded' (#300)" 0 "notlanded" \
+  env SKEW_REFUSE=1 bash -c "$(declare -f skew_sim); SKT='$SKT' skew_sim +3"
+check "drill: the clock probes run after every agent probe in G (#300)" 0 "" \
+  awk '/^phase G/{g=1} g && /box checkup archive/{ck=NR} g && /skew_trial archive/{sk=NR} /^phase C/{exit} END{exit !(ck && sk && sk > ck)}' "$ROOT/drill/drill.sh"
+rm -rf "$SKT"
 # #295: no wait on a drill box is swallowed — a timeout is a finding, never
 # a silent cascade of blind FAILs.
 check "drill: no wait_box has its failure thrown away (#295)" 1 "" \

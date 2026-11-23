@@ -1186,6 +1186,52 @@ in_box() {
   return "$rc"
 }
 
+# One skew trial, run INSIDE the guest and detached (#300). The step itself drops
+# the agent connection, so no read may ride the agent across it. The guest script
+# measures against its MONOTONIC clock (/proc/uptime, which 'date -s' does not
+# move) and leaves its verdict in /var/tmp, which survives a restart. The drill
+# waits out the window, restarts the box if the agent is gone, reads the
+# verdict, and then checks the guest against the HOST's clock as well.
+# Prints: converged:<s> | notlanded | timeout | hostoff:<s> | <empty>
+skew_trial() {
+  local b="$1" s="$2" out r _i g h
+  out="/var/tmp/box-skew${s}"
+  wait_box "$b" >/dev/null 2>&1 || return 0
+  timeout -k 5 20 incus exec "$b" -- sh -c 'cat > /var/tmp/box-skew.sh' <<'SKEW' 2>/dev/null || return 0
+#!/bin/sh
+s="$1"; out="/var/tmp/box-skew$s"; rm -f "$out"
+up() { cut -d. -f1 /proc/uptime; }
+u0=$(up); e0=$(date +%s)
+date -s "$s hours" >/dev/null 2>&1 || { echo notlanded > "$out"; exit 0; }
+d=$(( $(date +%s) - e0 )); [ "${d#-}" -gt 3600 ] || { echo notlanded > "$out"; exit 0; }
+i=0
+while [ "$i" -lt 60 ]; do
+  sleep 2; i=$((i + 1))
+  dd=$(( $(date +%s) - (e0 + $(up) - u0) ))
+  [ "${dd#-}" -le 2 ] && { echo "converged:$((i * 2))" > "$out"; exit 0; }
+done
+date -s "@$(( e0 + $(up) - u0 ))" >/dev/null 2>&1
+echo timeout > "$out"
+SKEW
+  # shellcheck disable=SC2016  # $0 expands inside the guest
+  timeout -k 5 20 incus exec "$b" -- sh -c 'setsid sh /var/tmp/box-skew.sh "$0" </dev/null >/dev/null 2>&1 &' "$s" </dev/null >/dev/null 2>&1 || return 0
+  r=""
+  for _i in $(seq 1 75); do
+    sleep 2
+    r="$(in_box "$b" cat "$out" 2>/dev/null)" && [ -n "$r" ] && break
+    r=""
+  done
+  if [ -z "$r" ]; then
+    box restart "$b" >/dev/null 2>&1; wait_box "$b" >/dev/null 2>&1
+    r="$(in_box "$b" cat "$out" 2>/dev/null)"
+  fi
+  if [ "${r%%:*}" = converged ]; then
+    g="$(in_box "$b" date +%s 2>/dev/null)"; h="$(date +%s)"
+    if [ -n "$g" ] && [ $(( g > h ? g - h : h - g )) -gt 2 ]; then r="hostoff:$(( g > h ? g - h : h - g ))"; fi
+  fi
+  printf '%s\n' "$r"
+}
+
 # The box's address ON BOXNET. Three ways to get this wrong, all of them hit:
 #   · 'incus list' name filters are NOT regexes ("^b$" silently matches nothing)
 #   · its CSV quotes a multi-address box across lines
@@ -1955,30 +2001,6 @@ if ! wait_box archive; then
                    || inf "archive still does not answer after a restart — the interiors below will fail blind"
 fi
 gtyp="$(box list | awk '$1 == "archive" { print $3 }')"
-if [ "$gtyp" = VM ]; then
-  in_box archive chronyc tracking 2>/dev/null | grep -qE '^Reference ID +: [0-9A-F]{8} \(' \
-    && ok "chronyc tracking answers with a reference source (#174)" \
-    || no "chronyc tracking named no reference source — the clock posture did not land"
-  # Measured against the HOST's clock, never chrony's own estimate (which reads
-  # ~0 right after an outside 'date -s'). Each sign starts from a correct clock,
-  # and a failure puts the guest clock back so phase C's TLS probes are not
-  # poisoned by a box three hours adrift.
-  guest_skew() { local g h; g="$(in_box archive date +%s 2>/dev/null)"; h="$(date +%s)"; [ -n "$g" ] || { echo 99999; return; }; echo $(( g > h ? g - h : h - g )); }
-  for skew in +3 -3; do
-    in_box archive date -s "@$(date +%s)" >/dev/null 2>&1
-    in_box archive date -s "$skew hours" >/dev/null 2>&1
-    if [ "$(guest_skew)" -le 3600 ]; then no "the ${skew}h skew did not even land (date -s refused?) — nothing to converge"; continue; fi
-    conv=""; for _i in $(seq 1 60); do
-      if [ "$(guest_skew)" -lt 2 ]; then conv="$((_i * 2))s"; break; fi
-      sleep 2
-    done
-    if [ -n "$conv" ]; then ok "a ${skew}h skew converged unattended to within 2s of the host (in $conv, makestep -1)"
-    else no "a ${skew}h skew did NOT converge within 120s — chrony's makestep posture is missing"
-         in_box archive date -s "@$(date +%s)" >/dev/null 2>&1; fi
-  done
-else
-  skipped G 3 "the box is a container: it shares the host clock and runs no chronyd, so tracking and skew have no guest verdict"
-fi
 pw="$(in_box archive getent passwd)"
 people="$(awk -F: '$3>=1000 && $3<60000' <<<"$pw" | wc -l)"
 if ! grep -q '^root:' <<<"$pw"; then no "could not read the guest's passwd — the no-tenant probe proves nothing"
@@ -2046,6 +2068,34 @@ else no "the drop-in port $DP on $GWD was not reachable from the box: the box sa
 kill "$DROPIN_PID" 2>/dev/null; DROPIN_PID=""; rm -rf "$dsrv"
 sudo rm -f /etc/box/firewall.d/cbdrill.conf
 sudo systemctl restart box-firewall.service >/dev/null 2>&1 || sudo /usr/local/sbin/box-firewall >/dev/null 2>&1
+
+# The clock probes run LAST in G, after every probe that needs the agent (#300):
+# a ±3h step of the guest clock drops the incus-agent connection until the box
+# restarts, and in rc1's drill that turned ten probes after it into blind FAILs.
+if [ "$gtyp" = VM ]; then
+  # chrony needs time to select a source after the box starts; reading it once,
+  # seconds after boot, measured the boot and not the posture (#300).
+  cref=""; for _i in $(seq 1 30); do
+    in_box archive chronyc tracking 2>/dev/null | grep -qE '^Reference ID +: [0-9A-F]{8} \(' && { cref=yes; break; }
+    sleep 3
+  done
+  [ -n "$cref" ] && ok "chronyc tracking answers with a reference source (#174)" \
+                 || no "chronyc tracking named no reference source within 90s — the clock posture did not land"
+  for skew in +3 -3; do
+    sres="$(skew_trial archive "$skew")"
+    case "$sres" in
+      converged:*) ok "a ${skew}h skew converged unattended to within 2s of the host (in ${sres#converged:}s, makestep -1)" ;;
+      notlanded)   no "the ${skew}h skew did not even land (date -s refused?) — nothing to converge" ;;
+      timeout)     no "a ${skew}h skew did NOT converge within 120s — chrony's makestep posture is missing" ;;
+      hostoff:*)   no "the ${skew}h skew settled in the guest but sits ${sres#hostoff:}s off the host's clock" ;;
+      *)           no "the ${skew}h skew trial gave no verdict (${sres:-nothing}) — the probe proves nothing" ;;
+    esac
+  done
+  # Phase C starts from a healthy agent, whatever the step left behind.
+  box restart archive >/dev/null 2>&1; wait_box archive >/dev/null || inf "archive did not answer after the post-clock restart — phase C will say so"
+else
+  skipped G 3 "the box is a container: it shares the host clock and runs no chronyd, so tracking and skew have no guest verdict"
+fi
 
 # ===========================================================================
 phase C "C. Isolation baseline — does the boundary actually hold? (#15 section A)"
