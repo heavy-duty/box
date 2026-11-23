@@ -692,6 +692,28 @@ if incus network acl show box-isolate >/dev/null 2>&1; then
       inf "fix:  BOX_SUBNET=${gwaddr%.*}.0/24 box setup-host   (it converges the ACL now)"
     fi
   fi
+  # Incus renders every drop ahead of every allow (#298), so the carve-out above
+  # only works if NO drop covers the gateway. A host set up before 0.11.0 still
+  # has the whole 10/8 dropped, and every firewall drop-in is dead behind it.
+  if [ -n "$gwaddr" ]; then
+    d_ip2int() { local a b c d; IFS=. read -r a b c d <<<"$1"; echo $(( (a << 24) | (b << 16) | (c << 8) | d )); }
+    gi="$(d_ip2int "$gwaddr")"; covered=""
+    for dst in $(incus network acl show box-isolate 2>/dev/null \
+                 | awk '/- action: drop/ { hit = 1; next } hit && /destination:/ { print $2 } { hit = 0 }' | tr ',' ' '); do
+      case "$dst" in
+        */*) lo="$(d_ip2int "${dst%/*}")"; hi=$(( lo + (1 << (32 - ${dst#*/})) - 1 )) ;;
+        *-*) lo="$(d_ip2int "${dst%-*}")"; hi="$(d_ip2int "${dst#*-}")" ;;
+        *)   lo="$(d_ip2int "$dst")"; hi="$lo" ;;
+      esac
+      [ "$gi" -ge "$lo" ] && [ "$gi" -le "$hi" ] && covered="$dst"
+    done
+    if [ -n "$covered" ]; then
+      no "the ACL drop $covered covers boxnet's gateway ($gwaddr) — Incus orders drops first, so the carve-out is dead and firewall drop-ins never reach the host (#298)"
+      inf "fix:  box setup-host   (it writes the drop around the gateway now)"
+    else
+      ok "no ACL drop covers boxnet's gateway — drop-in ports can reach the host (#298)"
+    fi
+  fi
 else
   inf "box-isolate does not exist (a fresh host)"
 fi

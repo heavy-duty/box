@@ -6842,6 +6842,13 @@ check "drill: derives the boxnet prefix from the network" 0 "" \
   grep -qF 'network get boxnet ipv4.address' "$ROOT/drill/drill.sh"
 check "multiuser: derives the boxnet prefix from the network" 0 "" \
   grep -qF 'network get boxnet ipv4.address' "$ROOT/drill/multiuser.sh"
+# #295: no wait on a drill box is swallowed — a timeout is a finding, never
+# a silent cascade of blind FAILs.
+check "drill: no wait_box has its failure thrown away (#295)" 1 "" \
+  grep -qE 'wait_box [a-z]+ >/dev/null 2>&1 *($|;)' "$ROOT/drill/drill.sh"
+# #296: the drop-in probe waits for its listener and says which layer refused.
+check "drill: the drop-in probe waits for its listener on the host (#296)" 0 "" \
+  grep -qF 'dhost=yes; break' "$ROOT/drill/drill.sh"
 
 # #293: the drill's up-front sudo check accepts passwordless root even when
 # 'sudo -v' would prompt (a NOPASSWD user who is also in %sudo). The check line
@@ -7199,8 +7206,12 @@ esac
 case "$*" in
   "network show boxnet")  printf '%s\n' "${FAKE_BOXNET_SHOW:-}" ;;
   "network acl show box-isolate")
-    printf 'egress:\n- action: allow\n  destination: %s/32\n- action: drop\n  destination: 10.0.0.0/8\n' \
-      "${FAKE_ACL_GW:-10.88.0.1}" ;;
+    # FAKE_ACL_WHOLE8 is a host set up before #298: the whole 10/8 dropped,
+    # gateway included. Unset, the drop runs around the gateway as setup-host
+    # now writes it.
+    if [ -n "${FAKE_ACL_WHOLE8:-}" ]; then d8=10.0.0.0/8; else d8=10.0.0.0-10.88.0.0,10.88.0.2-10.255.255.255; fi
+    printf 'egress:\n- action: allow\n  destination: %s/32\n- action: drop\n  destination: %s\n' \
+      "${FAKE_ACL_GW:-10.88.0.1}" "$d8" ;;
   # FAKE_DOC_NO_PROFILE is the restricted tier's project WITHOUT the contract in
   # it — either never granted, or granted under the old name. Unset (every case
   # above and the whole admin path) the profile is there, which is what those
@@ -7271,6 +7282,24 @@ docnohold() { ! rundoctor "$1" | grep -qF -e "--fix cannot reach" -e "need the b
 # the emptiness cannot leak into the next case.
 docnolive() { ( DOC_LIVE=""; rundoctor "$@" ); }
 docnolive_unwritten() { ( DOC_LIVE=""; rundoctor "$1" --fix >/dev/null 2>&1 ); [ ! -f "$1/ipv4.address" ]; }
+
+# #298: a drop that still covers the gateway is a doctor problem — Incus orders
+# drops first, so the /32 carve-out is dead behind it. The new shape passes.
+D298="$DOCSTATE/acl298"; rm -rf "$D298"; mkdir -p "$D298"
+printf 'no-resolv;server=1.1.1.1' > "$D298/raw.dnsmasq"; printf '10.88.0.1/24' > "$D298/ipv4.address"
+# #298: the ACL drop is written AROUND the gateway, as ranges Incus accepts.
+ACLFN="$(sed -n '/^ip2int()/p;/^int2ip()/p;/^acl_drop_dest()/,/^}/p' "$ROOT/host/setup-host.sh")"
+check "setup-host: the gateway's block is dropped around it (#298)" 0 "10.0.0.0-10.88.0.0,10.88.0.2-10.255.255.255" \
+  bash -c "$ACLFN; acl_drop_dest 10.0.0.0/8 10.88.0.1"
+check "setup-host: a block without the gateway stays one CIDR (#298)" 0 "172.16.0.0/12" \
+  bash -c "$ACLFN; acl_drop_dest 172.16.0.0/12 10.88.0.1"
+check "setup-host: a gateway at a block's edge leaves one range (#298)" 0 "10.0.0.1-10.255.255.255" \
+  bash -c "$ACLFN; acl_drop_dest 10.0.0.0/8 10.0.0.0"
+doc298old() { ( export FAKE_ACL_WHOLE8=1; rundoctor "$1" ); }
+doc298new() { rundoctor "$1" | grep -qF "no ACL drop covers boxnet's gateway"; }
+check "doctor: an ACL drop covering the gateway is flagged (#298)" 1 "covers boxnet's gateway" \
+  doc298old "$D298"
+check "doctor: the drop written around the gateway passes (#298)" 0 "" doc298new "$D298"
 
 # The measured state, verbatim: dns.mode unset, ipv4.address empty, ipv6 set.
 # Nothing is attached — the used_by that host reported held profiles only.

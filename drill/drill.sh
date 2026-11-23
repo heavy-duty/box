@@ -1938,7 +1938,22 @@ phase G "G. Guest interiors — what a fresh box holds, measured from inside (#2
 # witnessed any of them (#253 C1); 0.11.0 adds the no-tenant box, root entry,
 # the absent swapfile and the firewall drop-ins. Written against the seed as it
 # stands after #288–#291, on the drill box (renamed 'archive' by now).
-box start archive >/dev/null 2>&1; wait_box archive >/dev/null 2>&1
+# The first start after the rename. Its wait used to be swallowed, and a
+# timeout cascaded into ten blind FAILs (#295). A timeout is now ONE finding,
+# carrying the evidence that tells a slow nested boot from an agent that never
+# comes up after a rename. Then one restart, so the interior probes below
+# still measure something.
+box start archive >/dev/null 2>&1
+if ! wait_box archive; then
+  gst="$(incus info archive 2>&1 | awk -F': *' '/^(Status|Type):/ { printf "%s=%s ", $1, $2 }')"
+  # summary_no, not no: a finding that is not one of G's declared probes, so the
+  # ledger's floor stays exact on a healthy run and a sick one.
+  summary_no "archive's agent did not answer within 4 min of its first start since the rename (#295) — ${gst:-state unreadable}"
+  incus console archive --show-log 2>&1 | tail -n 8 | sed 's/^/        console: /'
+  box restart archive >/dev/null 2>&1
+  wait_box archive && inf "archive answers after one restart — the interiors below are measured on it" \
+                   || inf "archive still does not answer after a restart — the interiors below will fail blind"
+fi
 gtyp="$(box list | awk '$1 == "archive" { print $3 }')"
 if [ "$gtyp" = VM ]; then
   in_box archive chronyc tracking 2>/dev/null | grep -qE '^Reference ID +: [0-9A-F]{8} \(' \
@@ -2017,10 +2032,14 @@ sudo systemctl restart box-firewall.service >/dev/null 2>&1 || sudo /usr/local/s
 dsrv="$(mktemp -d)"; echo drill-dropin >"$dsrv/index.html"
 ( cd "$dsrv" && setsid python3 -m http.server "$DP" --bind "$GWD" >/dev/null 2>&1 & echo $! >"$dsrv/pid" )
 DROPIN_PID="$(cat "$dsrv/pid" 2>/dev/null || true)"
-sleep 1
-[ "$(box_probe archive "http://$GWD:$DP")" = reachable ] \
-  && ok "a drop-in port is reachable from a box on the gateway (#279)" \
-  || no "the drop-in port $DP on $GWD was not reachable from the box"
+# Wait for the listener instead of a fixed second: in a nested VM python can
+# take longer to bind, and a missing listener behind an open drop-in answers
+# 'refused' — graded exactly like a dropped port (#296).
+dhost=no; for _i in $(seq 1 30); do curl -s -m 2 -o /dev/null "http://$GWD:$DP" && { dhost=yes; break; }; sleep 0.5; done
+dans="$(box_probe archive "http://$GWD:$DP")"
+if [ "$dans" = reachable ]; then ok "a drop-in port is reachable from a box on the gateway (#279)"
+elif [ "$dhost" = no ]; then no "the drop-in probe's listener never answered on the host ($GWD:$DP) — the port was not measured (#296)"
+else no "the drop-in port $DP on $GWD was not reachable from the box: the box saw '$dans', the host's own listener answers (#296)"; fi
 [ "$(box_probe archive "http://$GWD:$((DP + 1))")" = dropped ] \
   && ok "every other gateway port stays DROPPED beside a drop-in (#279)" \
   || no "gateway port $((DP + 1)) answered — the drop-in widened more than its port"
