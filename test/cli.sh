@@ -6843,6 +6843,26 @@ check "drill: derives the boxnet prefix from the network" 0 "" \
 check "multiuser: derives the boxnet prefix from the network" 0 "" \
   grep -qF 'network get boxnet ipv4.address' "$ROOT/drill/multiuser.sh"
 
+# #293: the drill's up-front sudo check accepts passwordless root even when
+# 'sudo -v' would prompt (a NOPASSWD user who is also in %sudo). The check line
+# is lifted out of the drill and run against a fake sudo.
+SUDOFAKE="$(mktemp -d)"
+SUDOLINE="$(grep -E '^ *sudo -n true .*\|\| sudo -v \|\|' "$ROOT/drill/drill.sh")"
+sudo_fake() {  # $1: exit code for 'sudo -n true', $2: for 'sudo -v'
+  printf '#!/bin/sh\ncase "$*" in "-n true") exit %s;; "-v") exit %s;; esac\nexit 9\n' "$1" "$2" > "$SUDOFAKE/sudo"
+  chmod +x "$SUDOFAKE/sudo"
+}
+sudo_fake 0 1
+check "drill sudo check: NOPASSWD passes where sudo -v would prompt (#293)" 0 "" \
+  env PATH="$SUDOFAKE:$PATH" bash -c "$SUDOLINE"
+sudo_fake 1 0
+check "drill sudo check: falls back to sudo -v for an interactive operator (#293)" 0 "" \
+  env PATH="$SUDOFAKE:$PATH" bash -c "$SUDOLINE"
+sudo_fake 1 1
+check "drill sudo check: refuses loudly when neither works (#293)" 1 "drill: need sudo" \
+  env PATH="$SUDOFAKE:$PATH" bash -c "$SUDOLINE"
+rm -rf "$SUDOFAKE"
+
 # ---------------------------------------------------------------------------
 # The doctor's #80 signature. gw_squat_signature is pure text → findings, so
 # it is extracted and driven against synthetic route tables — including the
