@@ -3173,6 +3173,7 @@ case "$*" in
   "file pull "*) [ -z "${FAKE_PULL_FAIL:-}" ] || { echo "Error: not found" >&2; exit 1; } ;;&
   "file pull -r -- "*) mkdir -p "${*: -1}/${5##*/}" && echo x > "${*: -1}/${5##*/}/inner"; exit 0 ;;
   "file pull -- "*) echo pulled > "${*: -1}"; exit 0 ;;
+  "file push "*) [ -z "${FAKE_PUSH_COPY:-}" ] || { a=("$@"); cp -- "${a[-2]}" "$FAKE_PUSH_COPY"; }; exit 0 ;;
 esac
 exit 0
 SHIM
@@ -3190,6 +3191,33 @@ check "cp: host → box, a file into root's home (#291 root default)" 0 "copied 
 check "cp: ...through incus file push, owned root:root, parents created" 0 "" \
   grep -qFx 'incus [file] [push] [-p] [--uid] [0] [--gid] [0] [--] [notes.md] [work/root/notes.md]' "$CPL"
 check "cp: ...and no SSH, no exec cat" 1 "" grep -qE 'ssh|\[cat\]' "$CPL"
+# '-' is stdin/stdout for one file (#278), and the ONLY host side a shared
+# tenant's member gets (#287): their own shell opens the file, as them.
+cpin() {  # cpin <log> <stdin-text> <args...>
+  local log="$1" txt="$2"; shift 2; : > "$log"
+  (cd "$CPW" && printf '%s' "$txt" | env FAKE_INCUS_LOG="$log" FAKE_PUSH_COPY="$CPW/pushed" PATH="$CPSHIM:$PATH" "$BOX" "$@")
+}
+check "cp: stdin → a box file, as root" 0 "copied stdin → work:/root/in.txt" cpin "$CPL" "from-stdin" cp - work:in.txt
+check "cp: ...the bytes pushed are stdin's" 0 "from-stdin" cat "$CPW/pushed"
+# shellcheck disable=SC2016  # expands in the child shell
+check "cp: ...and no temp file is left behind" 0 "[]" bash -c 'printf "[%s]" "$(ls -A "${TMPDIR:-/tmp}" | grep "^box-cp-in\." )"'
+check "cp: stdin refuses a directory target (no name to land under)" 2 "name the remote FILE" \
+  env FAKE_REMOTE_DIRS=/root/proj bash -c "$(declare -f cpin); CPW='$CPW' CPSHIM='$CPSHIM' BOX='$BOX' cpin '$CPL' x cp - work:proj"
+cpout() { (cd "$CPW" && env FAKE_INCUS_LOG="$CPL" PATH="$CPSHIM:$PATH" "$BOX" "$@" 2>/dev/null); }
+check "cp: a box file → stdout, the message on stderr" 0 "pulled" cpout cp work:out.txt -
+check "cp: stdout refuses a directory" 2 "stdout carries one file" \
+  env FAKE_REMOTE_DIRS=/root/proj bash -c "$(declare -f cpin); CPW='$CPW' CPSHIM='$CPSHIM' BOX='$BOX' cpin '$CPL' '' cp work:proj -"
+CPSA="$(mktemp -d)"; : >"$CPSA/$(id -un)"
+cpas() { (cd "$CPW" && env SUDO_USER=boxmember BOX_SHARE_DIR="$CPSA" FAKE_INCUS_LOG="$CPL" FAKE_PUSH_COPY="$CPW/pushed" PATH="$CPSHIM:$PATH" "$BOX" "$@"); }
+check "cp --as: a member's host PATH is refused — it would be read as the service (#287)" 2 "takes only '-'" \
+  cpas cp notes.md work:
+check "cp --as: ...and nothing reached incus" 1 "" grep -q 'file' "$CPL"
+check "cp --as: ...nor a pull onto a host path" 2 "takes only '-'" cpas cp work:out.txt ./out.txt
+check "cp --as: stdin is allowed — the member's shell opened the file" 0 "copied stdin" \
+  bash -c "$(declare -f cpas); CPW='$CPW' CPSA='$CPSA' CPL='$CPL' CPSHIM='$CPSHIM' BOX='$BOX'; printf member-bytes | cpas cp - work:in.txt"
+check "cp --as: stdout is allowed" 0 "pulled" \
+  bash -c "$(declare -f cpas); CPW='$CPW' CPSA='$CPSA' CPL='$CPL' CPSHIM='$CPSHIM' BOX='$BOX'; cpas cp work:out.txt - 2>/dev/null"
+rm -rf "$CPSA"
 check "cp: a relative remote path resolves against /root" 0 "work:/root/a/b.md" cpbox "$CPL" cp notes.md work:a/b.md
 check "cp: a ~/ remote path resolves against /root, never the host's \$HOME" 0 "work:/root/x.md" cpbox "$CPL" cp notes.md 'work:~/x.md'
 check "cp: ...the host's \$HOME is nowhere in the call" 1 "" grep -qF "$HOME/" "$CPL"

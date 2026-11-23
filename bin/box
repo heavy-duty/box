@@ -673,9 +673,15 @@ A directory copied onto an existing directory lands inside it; onto a missing
 path it becomes that path (when pushing, the path must end in the directory's
 own name: proj/dist for ./dist). A host path with a colon is written ./a:b.
 
+'-' as the host side is stdin or stdout, for one file. It is the only host side
+a shared tenant's members may use (box --as): their own shell opens the file,
+so the service account never reads or writes a host path for them (#287).
+
   box cp ./notes.md work:                  # → /root/notes.md
   box cp --user ops ./dist work:proj/dist  # → ~ops/proj/dist, owned by ops
   box cp work:/var/log/syslog .            # box → host
+  box --as crew cp - work:notes.md < notes.md          # a member, into the box
+  box --as crew cp work:out/report.pdf - > report.pdf  # a member, out of it
 EOF
 ;;
     exec) cat <<'EOF'
@@ -1235,8 +1241,12 @@ fi
 # here: anything that reaches the host as the tenant — the incus escape hatch
 # (an editor is a shell; 'file push/pull' reads and writes the service's own
 # files), export/import to host paths, the host verbs — is refused. An editor
-# is pinned to /bin/false for good measure.
+# is pinned to /bin/false for good measure. 'cp' is allowed, but only through
+# '-' (stdin/stdout): the member's own shell opens the host file, as the
+# member, before sudo, so this process never names a host path (cmd_cp).
+AS_SHARED=0
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "$(id -un)" ] && [ -e "$SHARE_DIR/$(id -un)" ]; then
+  AS_SHARED=1
   export VISUAL=/bin/false EDITOR=/bin/false
   case "${1:-help}" in
     new|list|info|checkup|shell|root|exec|cp|snapshot|restore|rm|down|start|restart|rename|help|version|-h|--help|-V|--version) ;;
@@ -1284,6 +1294,8 @@ while [ $# -gt 0 ]; do
     --help|-h) want_help=1; shift ;;
     --version|-V) version; exit 0 ;;
     --) shift; args+=("$@"); break ;;
+    # A bare '-' is a positional (stdin/stdout to 'box cp', #278), never a flag.
+    -) args+=("$1"); shift ;;
     # An unrecognized flag used to be swallowed as a positional — so a typo'd
     # --labl silently became a snapshot's label. Say so instead.
     -*)
@@ -3115,6 +3127,17 @@ cmd_cp() {
   case "$hpath" in
     :*) usage_error "cp: '$hpath' has an empty box name — write <box>:<path>, or ./$hpath for a host path" ;;
   esac
+  # A shared tenant's member reaches the host only through stdin/stdout: this
+  # process runs as the service, so a host path here would read or write the
+  # SERVICE's files (its tokens, its rc files) — the hole #287 closed for
+  # 'incus file push/pull'. With '-', the member's shell opens the file as the
+  # member, and the service never sees a host path.
+  if [ "${AS_SHARED:-0}" = 1 ] && [ "$hpath" != - ]; then
+    echo "box --as $(id -un): 'cp' takes only '-' as its host side for a shared tenant's members — a host path would be read or written as $(id -un) (#287)." >&2
+    echo "  box --as $(id -un) cp - $box:${rpath:-file} < ./file        # into the box" >&2
+    echo "  box --as $(id -un) cp $box:${rpath:-file} - > ./file        # out of it" >&2
+    exit 2
+  fi
 
   local resolved; resolved="$(resolve_box "$box")"; inst="$resolved"
 
@@ -3140,6 +3163,19 @@ cmd_cp() {
   esac
 
   local name target parent
+  if [ "$push" -eq 1 ] && [ "$hpath" = - ]; then
+    # stdin → one remote FILE. There is no name to land under, so the remote
+    # side must name the file itself, not a directory.
+    if [[ "$abs" == */ ]] || [ "$(cp_remote_kind "$inst" "$box" "$abs")" = d ]; then
+      usage_error "cp: from stdin, name the remote FILE, not a directory — e.g. $box:${rpath%/}/notes.md"
+    fi
+    local stmp; stmp="$(mktemp "${TMPDIR:-/tmp}/box-cp-in.XXXXXXXX")" || die "no private temp file for stdin"
+    cat > "$stmp" || { rm -f -- "$stmp"; die "could not read stdin"; }
+    cp_incus file push -p --uid "$uid" --gid "$gid" --mode 0644 -- "$stmp" "$inst$abs" || { rm -f -- "$stmp"; exit 1; }
+    rm -f -- "$stmp"
+    echo "box: copied stdin → $box:$abs" >&2
+    return 0
+  fi
   if [ "$push" -eq 1 ]; then
     [ -e "$hpath" ] || [ -L "$hpath" ] || die "no such file on the host: $hpath"
     if [ -d "$hpath" ]; then
@@ -3177,6 +3213,17 @@ cmd_cp() {
   local rsrc="${abs%/}"
   [ -n "$rsrc" ] || usage_error "cp: refusing to copy a box's whole / to the host"
   name="${rsrc##*/}"
+  if [ "$hpath" = - ]; then
+    # one remote FILE → stdout. A tree has no single byte stream.
+    [ "$(cp_remote_kind "$inst" "$box" "$rsrc")" != d ] \
+      || usage_error "cp: $box:$rsrc is a directory — stdout carries one file; tar it in the box first (box exec $box -- tar -C … -cf - …)"
+    local otmp; otmp="$(mktemp -d "${TMPDIR:-/tmp}/box-cp-out.XXXXXXXX")" || die "no private temp dir for the pull"
+    cp_incus file pull -- "$inst$rsrc" "$otmp/f" || { rm -rf -- "$otmp"; exit 1; }
+    cat -- "$otmp/f" || { rm -rf -- "$otmp"; die "could not write to stdout"; }
+    rm -rf -- "$otmp"
+    echo "box: copied $box:$rsrc → stdout" >&2
+    return 0
+  fi
   if [ "$(cp_remote_kind "$inst" "$box" "$rsrc")" = d ]; then
     if [ -d "$hpath" ]; then
       target="${hpath%/}/$name"
