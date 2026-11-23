@@ -997,6 +997,19 @@ else
     incus --project "$ps_" list --format csv -c n 2>/dev/null | grep -qx drill-shared \
       && ok "(t) a member's box lands in the tenant's project $ps_" \
       || no "(t) the member's box is not in $ps_"
+    # box cp as a member (#278): the plain grammar, a directory each way. The
+    # member's box reads and writes the host side as the MEMBER; the tenant
+    # sees only a tar stream.
+    mh="$(getent passwd boxdrillm | cut -d: -f6)"
+    mkdir -p "$mh/cpd/sub"; echo member-bytes > "$mh/cpd/sub/f"; chown -R boxdrillm: "$mh/cpd"
+    if runuser -u boxdrillm -- sh -c "cd '$mh' && box --as '$US' cp cpd drill-shared:cpd" >/dev/null 2>&1 \
+       && [ "$(incus --project "$ps_" exec drill-shared -- cat /root/cpd/sub/f 2>/dev/null)" = member-bytes ]; then
+      ok "(t) a member pushes a directory with plain 'box --as $US cp' (#278)"
+    else no "(t) a member could not push a directory with 'box --as $US cp'"; fi
+    if runuser -u boxdrillm -- sh -c "cd '$mh' && box --as '$US' cp drill-shared:cpd back" >/dev/null 2>&1 \
+       && [ "$(cat "$mh/back/sub/f" 2>/dev/null)" = member-bytes ] && [ "$(stat -c %U "$mh/back/sub/f" 2>/dev/null)" = boxdrillm ]; then
+      ok "(t) a member pulls it back, owned by the member, not the tenant (#278)"
+    else no "(t) a member's pull did not land member-owned in their home"; fi
     runuser -u boxdrillm -- box --as "$US" rm drill-shared --force >/dev/null 2>&1
   else
     no "(t) a group member could not mint as the tenant:"; printf '%s\n' "$out" | tail -5 | sed 's/^/        /'

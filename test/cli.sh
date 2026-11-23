@@ -3153,9 +3153,182 @@ check "--user: an empty shell field becomes /bin/sh" 0 "SH=/bin/sh" rgshell "u:x
 check "--user: a nologin shell becomes /bin/sh, never \$SHELL=nologin" 0 "SH=/bin/sh" rgshell "u:x:1000:1000::/home/u:/usr/sbin/nologin"
 rm -f "$RGFN"
 check "shell --user on a box whose agent is down says so (exit 1), not 'no such user'" 1 "could not look up user 'claude' in work (is it running?)" user_down
+# --- box cp (#278, amended for #291): incus file push/pull, dressed ---------
+# A fake incus that knows one box 'work', one untagged instance 'vm', a guest
+# user 'ops' whose home is NOT /home/ops (/srv/ops, uid 1500, gid 1600), and
+# answers the directory probe from FAKE_REMOTE_DIRS. Every call is logged; a
+# 'file pull' writes what it was asked to, so the host side can be checked.
+CPSHIM="$(mktemp -d)"; CPW="$(mktemp -d)"
+cat > "$CPSHIM/incus" <<'SHIM'
+#!/usr/bin/env bash
+printf 'incus' >> "$FAKE_INCUS_LOG"; printf ' [%s]' "$@" >> "$FAKE_INCUS_LOG"; echo >> "$FAKE_INCUS_LOG"
+case "$*" in
+  "config get --expanded work user.box"|"config get work user.box") echo 1; exit 0 ;;
+  "config get "*) exit 1 ;;
+  "exec work -- getent passwd ops") echo "ops:x:1500:1600:Ops:/srv/ops:/bin/bash"; exit 0 ;;
+  "exec work -- getent passwd") echo "root:x:0:0:root:/root:/bin/bash"; echo "ops:x:1500:1600:Ops:/srv/ops:/bin/bash"; exit 0 ;;
+  "exec work -- getent passwd "*) exit 2 ;;
+  "exec work -- sh -c "*)
+    for d in ${FAKE_REMOTE_DIRS:-}; do [ "$d" = "${*: -1}" ] && { echo d; exit 0; }; done; echo f; exit 0 ;;
+  "file pull "*) [ -z "${FAKE_PULL_FAIL:-}" ] || { echo "Error: not found" >&2; exit 1; } ;;&
+  "file pull -r -- "*) mkdir -p "${*: -1}/${5##*/}" && echo x > "${*: -1}/${5##*/}/inner"; exit 0 ;;
+  "file pull -- "*) echo pulled > "${*: -1}"; exit 0 ;;
+  "file push "*) [ -z "${FAKE_PUSH_COPY:-}" ] || { a=("$@"); cp -- "${a[-2]}" "$FAKE_PUSH_COPY"; }; exit 0 ;;
+esac
+exit 0
+SHIM
+chmod +x "$CPSHIM/incus"
+cpbox() {  # cpbox <log> <args...> — the real box, cp shim, from $CPW
+  local log="$1"; shift; : > "$log"
+  (cd "$CPW" && env FAKE_INCUS_LOG="$log" PATH="$CPSHIM:$PATH" "$BOX" "$@" </dev/null)
+}
+CPL="$CPW/cp.log"; echo hi > "$CPW/notes.md"; mkdir -p "$CPW/dist/sub"; echo y > "$CPW/dist/sub/f"
+echo s > "$CPW/my notes.md"
+check "cp: help names the verb and its grammar" 0 "usage: box cp [--user <user>] <src> <dst>" "$BOX" help cp
+# shellcheck disable=SC2016  # expands in the child shell
+check "cp: listed in box help" 0 "" bash -c '"$1" help | grep -qE "^  cp +Copy"' _ "$BOX"
+check "cp: host → box, a file into root's home (#291 root default)" 0 "copied notes.md → work:/root/notes.md" cpbox "$CPL" cp notes.md work:
+check "cp: ...through incus file push, owned root:root, parents created" 0 "" \
+  grep -qFx 'incus [file] [push] [-p] [--uid] [0] [--gid] [0] [--] [notes.md] [work/root/notes.md]' "$CPL"
+check "cp: ...and no SSH, no exec cat" 1 "" grep -qE 'ssh|\[cat\]' "$CPL"
+# '-' is stdin/stdout for one file (#278), and the ONLY host side a shared
+# tenant's member gets (#287): their own shell opens the file, as them.
+cpin() {  # cpin <log> <stdin-text> <args...>
+  local log="$1" txt="$2"; shift 2; : > "$log"
+  (cd "$CPW" && printf '%s' "$txt" | env FAKE_INCUS_LOG="$log" FAKE_PUSH_COPY="$CPW/pushed" PATH="$CPSHIM:$PATH" "$BOX" "$@")
+}
+check "cp: stdin → a box file, as root" 0 "copied stdin → work:/root/in.txt" cpin "$CPL" "from-stdin" cp - work:in.txt
+check "cp: ...the bytes pushed are stdin's" 0 "from-stdin" cat "$CPW/pushed"
+# shellcheck disable=SC2016  # expands in the child shell
+check "cp: ...and no temp file is left behind" 0 "[]" bash -c 'printf "[%s]" "$(ls -A "${TMPDIR:-/tmp}" | grep "^box-cp-in\." )"'
+check "cp: stdin refuses a directory target (no name to land under)" 2 "name the remote FILE" \
+  env FAKE_REMOTE_DIRS=/root/proj bash -c "$(declare -f cpin); CPW='$CPW' CPSHIM='$CPSHIM' BOX='$BOX' cpin '$CPL' x cp - work:proj"
+cpout() { (cd "$CPW" && env FAKE_INCUS_LOG="$CPL" PATH="$CPSHIM:$PATH" "$BOX" "$@" 2>/dev/null); }
+check "cp: a box file → stdout, the message on stderr" 0 "pulled" cpout cp work:out.txt -
+check "cp: stdout refuses a directory" 2 "stdout carries one file" \
+  env FAKE_REMOTE_DIRS=/root/proj bash -c "$(declare -f cpin); CPW='$CPW' CPSHIM='$CPSHIM' BOX='$BOX' cpin '$CPL' '' cp work:proj -"
+CPSA="$(mktemp -d)"; : >"$CPSA/$(id -un)"
+cpas() { (cd "$CPW" && env SUDO_USER=boxmember BOX_SHARE_DIR="$CPSA" FAKE_INCUS_LOG="$CPL" FAKE_PUSH_COPY="$CPW/pushed" PATH="$CPSHIM:$PATH" "$BOX" "$@"); }
+check "cp --as: the service's half never names a host path for a member (#287)" 2 "never names a host path" \
+  cpas cp notes.md work:
+check "cp --as: ...and nothing reached incus" 1 "" grep -q 'file' "$CPL"
+check "cp --as: ...nor a pull onto a host path" 2 "never names a host path" cpas cp work:out.txt ./out.txt
+check "cp --as: stdin is allowed — the member's shell opened the file" 0 "copied stdin" \
+  bash -c "$(declare -f cpas); CPW='$CPW' CPSA='$CPSA' CPL='$CPL' CPSHIM='$CPSHIM' BOX='$BOX'; printf member-bytes | cpas cp - work:in.txt"
+check "cp --as: stdout is allowed" 0 "pulled" \
+  bash -c "$(declare -f cpas); CPW='$CPW' CPSA='$CPSA' CPL='$CPL' CPSHIM='$CPSHIM' BOX='$BOX'; cpas cp work:out.txt - 2>/dev/null"
+rm -rf "$CPSA"
+
+# 'box --as NAME cp' end to end (#278): the MEMBER's half tars or untars the
+# host side before sudo; the service's half sees only a stream. Driven with a
+# fake sudo (re-enters box as the "service" with SUDO_USER set) and a fake
+# incus that runs the guest scripts for real against a fake root.
+AC="$(mktemp -d)"; mkdir -p "$AC/bin" "$AC/root/root" "$AC/root/srv/ops" "$AC/shares" "$AC/host"
+: > "$AC/shares/$(id -un)"
+cat > "$AC/bin/sudo" <<SHIM
+#!/usr/bin/env bash
+for a; do [ "\$a" = -l ] && exit 0; done
+while [ "\$1" != -- ]; do shift; done; shift
+exec env SUDO_USER=boxmember BOX_SHARE_DIR="$AC/shares" "\$@"
+SHIM
+cat > "$AC/bin/chown" <<'SHIM'
+#!/bin/sh
+exit 0
+SHIM
+cat > "$AC/bin/incus" <<SHIM
+#!/usr/bin/env bash
+case "\$*" in
+  "config get --expanded work user.box"|"config get work user.box") echo 1; exit 0 ;;
+  "config get "*) exit 1 ;;
+  "exec work -- getent passwd ops") echo "ops:x:1500:1600:Ops:/srv/ops:/bin/bash"; exit 0 ;;
+  "exec work -- getent passwd "*) exit 2 ;;
+  "exec work -- sh -c "*)
+    shift 5; script="\$1"; shift 2
+    first="\$1"; shift; case "\$first" in /*) first="$AC/root\$first" ;; esac
+    exec sh -c "\$script" sh "\$first" "\$@" ;;
+esac
+exit 0
+SHIM
+chmod +x "$AC/bin/"*
+acp() { (cd "$AC/host" && env PATH="$AC/bin:$PATH" BOX_SHARE_BIN="$BOX" BOX_SHARE_DIR="$AC/shares" "$BOX" --as svc cp "$@"); }
+echo hello > "$AC/host/notes.md"; mkdir -p "$AC/host/dist/sub"; echo y > "$AC/host/dist/sub/f"
+check "cp --as: a member pushes a host FILE with the plain grammar" 0 "" acp notes.md work:
+check "cp --as: ...and it lands in /root" 0 "hello" cat "$AC/root/root/notes.md"
+check "cp --as: a member pushes a DIRECTORY, recursively" 0 "" acp dist work:proj/dist
+check "cp --as: ...a missing path becomes the tree (scp's rule)" 0 "y" cat "$AC/root/root/proj/dist/sub/f"
+check "cp --as: ...and onto an existing directory it lands inside" 0 "y" \
+  bash -c "$(declare -f acp); AC='$AC' BOX='$BOX'; mkdir -p '$AC/root/root/into'; acp dist work:into >/dev/null && cat '$AC/root/root/into/dist/sub/f'"
+check "cp --as: --user lands in the user's home" 0 "hello" \
+  bash -c "$(declare -f acp); AC='$AC' BOX='$BOX'; acp --user ops notes.md work: >/dev/null && cat '$AC/root/srv/ops/notes.md'"
+check "cp --as: a member pulls a FILE into a host directory" 0 "copied work:notes.md" \
+  bash -c "$(declare -f acp); AC='$AC' BOX='$BOX'; mkdir -p '$AC/host/back'; acp work:notes.md back"
+check "cp --as: ...with the bytes intact" 0 "hello" cat "$AC/host/back/notes.md"
+check "cp --as: a member pulls a DIRECTORY onto a missing path" 0 "y" \
+  bash -c "$(declare -f acp); AC='$AC' BOX='$BOX'; acp work:proj/dist got >/dev/null && cat '$AC/host/got/sub/f'"
+check "cp --as: ...and leaves no private temp dir behind" 0 "[]" bash -c "printf '[%s]' \"\$(ls -A '$AC/host' | grep '^\.box-cp')\""
+# A box is untrusted: a stream that would land outside the copy is refused,
+# and nothing is written to the destination.
+mkdir -p "$AC/root/root/evil"; ln -s /etc "$AC/root/root/evil/escape"
+check "cp --as: an archive with a symlink pointing outside the tree is refused" 1 "points outside the copied tree" \
+  acp work:evil evilout
+check "cp --as: ...and nothing reached the destination" 1 "" test -e "$AC/host/evilout"
+rm -rf "$AC"
+check "cp: a relative remote path resolves against /root" 0 "work:/root/a/b.md" cpbox "$CPL" cp notes.md work:a/b.md
+check "cp: a ~/ remote path resolves against /root, never the host's \$HOME" 0 "work:/root/x.md" cpbox "$CPL" cp notes.md 'work:~/x.md'
+check "cp: ...the host's \$HOME is nowhere in the call" 1 "" grep -qF "$HOME/" "$CPL"
+check "cp: an absolute remote path is kept" 0 "work:/etc/app.conf" cpbox "$CPL" cp notes.md work:/etc/app.conf
+cp_into_dir() { FAKE_REMOTE_DIRS=/root/proj cpbox "$CPL" cp notes.md work:proj; }
+check "cp: a file onto an existing remote directory lands inside it" 0 "work:/root/proj/notes.md" cp_into_dir
+check "cp: a path with spaces is one argument both sides" 0 "work:/root/my dir/my notes.md" cpbox "$CPL" cp "my notes.md" "work:my dir/"
+check "cp: ...passed whole to incus" 0 "" grep -qF '[my notes.md] [work/root/my dir/my notes.md]' "$CPL"
+check "cp --user: resolves against the guest's passwd home, not /home/ops" 0 "work:/srv/ops/notes.md" cpbox "$CPL" cp --user ops notes.md work:
+check "cp --user: ...owned by ops's uid and primary gid" 0 "" \
+  grep -qFx 'incus [file] [push] [-p] [--uid] [1500] [--gid] [1600] [--] [notes.md] [work/srv/ops/notes.md]' "$CPL"
+check "cp --user: ...~ is the user's home too" 0 "work:/srv/ops/.cfg" cpbox "$CPL" cp --user ops notes.md 'work:~/.cfg'
+check "cp --user ghost: refused (exit 2), never a root fallback" 2 "no user 'ghost' in work" cpbox "$CPL" cp --user ghost notes.md work:
+check "cp --user ghost: ...nothing was copied" 1 "" grep -qE '\[file\]|chown' "$CPL"
+check "cp: a ~name remote path is refused, not guessed" 2 "'~name' paths are not expanded" cpbox "$CPL" cp notes.md 'work:~ops/x'
+cpdir_new() { cpbox "$CPL" cp --user ops dist work:proj/dist; }
+check "cp: a directory recursively onto a missing path named for it" 0 "work:/srv/ops/proj/dist" cpdir_new
+check "cp: ...push -r -p into its parent" 0 "" grep -qF "[file] [push] [-r] [-p] [--] [$(cd "$CPW/dist" && pwd)] [work/srv/ops/proj/]" "$CPL"
+check "cp: ...then the tree is chowned to ops (push -r keeps host owners)" 0 "" \
+  grep -qFx 'incus [exec] [work] [--] [chown] [-R] [-h] [--] [1500:1600] [/srv/ops/proj/dist]' "$CPL"
+cpdir_in() { FAKE_REMOTE_DIRS=/root/proj cpbox "$CPL" cp dist/ work:proj; }
+check "cp: a directory onto an existing remote directory lands inside, as root" 0 "work:/root/proj/dist" cpdir_in
+check "cp: ...chowned 0:0" 0 "" grep -qF '[chown] [-R] [-h] [--] [0:0] [/root/proj/dist]' "$CPL"
+check "cp: a directory onto a missing path with another name is refused" 2 "does not exist and is not named 'dist'" cpbox "$CPL" cp dist work:other
+check "cp: box → host, a file" 0 "copied work:/root/out.log → got.log" cpbox "$CPL" cp work:out.log got.log
+check "cp: ...through incus file pull" 0 "" grep -qFx 'incus [file] [pull] [--] [work/root/out.log] [got.log]' "$CPL"
+check "cp: ...and it landed" 0 "pulled" cat "$CPW/got.log"
+mkdir -p "$CPW/into"
+check "cp: box → host into an existing directory" 0 "into/report.pdf" cpbox "$CPL" cp work:/tmp/report.pdf into/
+pull_dir() { FAKE_REMOTE_DIRS=/root/tree cpbox "$CPL" cp work:tree back; }
+check "cp: box → host, a directory onto a missing path becomes it" 0 "copied work:/root/tree → back" pull_dir
+check "cp: ...pulled with -r" 0 "" grep -qF '[file] [pull] [-r] [--] [work/root/tree]' "$CPL"
+# shellcheck disable=SC2016  # expands in the child shell
+check "cp: ...the tree is at the named path, no temp dir left" 0 "x" bash -c 'cat "$1/back/inner" && ! ls -A "$1" | grep -q box-cp' _ "$CPW"
+pull_fail() { FAKE_REMOTE_DIRS=/root/tree FAKE_PULL_FAIL=1 cpbox "$CPL" cp work:tree back2; }
+check "cp: a failed pull says Incus's reason, prefixed, and leaves no temp dir" 1 "box: Error: not found" pull_fail
+# shellcheck disable=SC2016  # expands in the child shell
+check "cp: ...nothing left behind" 1 "" bash -c 'ls -A "$1" | grep -qE "box-cp|back2"' _ "$CPW"
+check "cp --user: pulling resolves ~ against the user's home" 0 "work:/srv/ops/f.txt" cpbox "$CPL" cp --user ops 'work:~/f.txt' f.txt
+check "cp: two remote sides refused (exit 2)" 2 "both sides name a box" cpbox "$CPL" cp work:a work:b
+check "cp: zero remote sides refused (exit 2)" 2 "neither side names a box" cpbox "$CPL" cp a b
+check "cp: ...a colon after a slash is a host path, as with scp" 2 "neither side names a box" cpbox "$CPL" cp ./a:b /x/c:d
+check "cp: ...and incus was never called" 1 "" grep -q incus "$CPL"
+check "cp: an empty path refused (exit 2)" 2 "an empty path" cpbox "$CPL" cp "" work:
+check "cp: one argument refused with the usage" 2 "usage: box cp" cpbox "$CPL" cp notes.md
+check "cp: an untagged instance is refused like every verb" 1 "no such box: vm" cpbox "$CPL" cp notes.md vm:
+check "cp: ...nothing was pushed to it" 1 "" grep -q '\[file\]' "$CPL"
+check "cp: a missing host source fails before incus file" 1 "no such file on the host" cpbox "$CPL" cp nope work:
+check "cp: --as members may use it (#287 allow-list)" 0 "" grep -qE '^    new\|.*\|cp\|' "$BOX"
+CPSA="$(mktemp -d)"; : >"$CPSA/$(id -un)"
+check "cp: --as: a shared tenant's member reaches cp (refused only for its grammar)" 2 "neither side names a box" \
+  env SUDO_USER=boxmember BOX_SHARE_DIR="$CPSA" "$BOX" cp a b
+rm -rf "$CPSHIM" "$CPW" "$CPSA"
 check "--user with an empty value is refused, never a root entry (#291 review)" 2 "--user needs a value" "$BOX" exec --user "" work -- id -u
 check "box root --user is refused, pointing at box shell --user" 2 "box shell --user claude <box>" "$BOX" root --user claude work
-check "--user on another verb is refused, not ignored" 2 "--user is for 'box shell' and 'box exec'" "$BOX" info --user claude work
+check "--user on another verb is refused, not ignored" 2 "--user is for 'box shell', 'box exec' and 'box cp'" "$BOX" info --user claude work
 check "--autostart on a verb other than new is refused" 2 "are 'box new' flags" "$BOX" import --autostart x.tar.gz
 # shellcheck disable=SC2016  # $-strings expand in the child shell, by design
 check "box help lists no removed verb (tmux, templates) (#289, #288)" 1 "" bash -c '"$1" help | grep -qE "^  (tmux|templates) "' _ "$BOX"
@@ -6842,6 +7015,47 @@ check "drill: derives the boxnet prefix from the network" 0 "" \
   grep -qF 'network get boxnet ipv4.address' "$ROOT/drill/drill.sh"
 check "multiuser: derives the boxnet prefix from the network" 0 "" \
   grep -qF 'network get boxnet ipv4.address' "$ROOT/drill/multiuser.sh"
+
+# #300: the skew trial runs inside the guest against its MONOTONIC clock, so no
+# agent read rides across the clock step. Driven here with a fake clock: 'date'
+# keeps an offset, 'sleep' advances uptime, and a fake chrony steps the offset
+# back to zero after CONVERGE_AFTER sleeps (0 = never).
+SKT="$(mktemp -d)"
+awk '/^#!\/bin\/sh$/{f=1;next} /^SKEW$/{f=0} f' "$ROOT/drill/drill.sh" \
+  | sed "s|/proc/uptime|$SKT/uptime|; s|/var/tmp/|$SKT/|g" > "$SKT/skew.sh"
+mkdir -p "$SKT/bin"
+cat > "$SKT/bin/date" <<'FAKE'
+#!/bin/sh
+o=$(cat "$SKT/off"); base=1700000000; u=$(cut -d. -f1 "$SKT/uptime")
+case "$1" in
+  -s) [ -n "${SKEW_REFUSE:-}" ] && exit 1
+      case "$2" in "+3 hours") echo 10800 > "$SKT/off";; "-3 hours") echo -10800 > "$SKT/off";; @*) echo 0 > "$SKT/off";; esac ;;
+  +%s) echo $((base + u + o)) ;;
+esac
+FAKE
+cat > "$SKT/bin/sleep" <<'FAKE'
+#!/bin/sh
+u=$(cut -d. -f1 "$SKT/uptime"); echo "$((u + $1)).00 0" > "$SKT/uptime"
+n=$(( $(cat "$SKT/n") + 1 )); echo "$n" > "$SKT/n"
+[ "${CONVERGE_AFTER:-0}" -gt 0 ] && [ "$n" -ge "$CONVERGE_AFTER" ] && echo 0 > "$SKT/off"
+exit 0
+FAKE
+chmod +x "$SKT/bin/date" "$SKT/bin/sleep"
+skew_sim() {  # skew_sim <sign> → the verdict file's contents
+  echo "100.00 0" > "$SKT/uptime"; echo 0 > "$SKT/off"; echo 0 > "$SKT/n"
+  env SKT="$SKT" PATH="$SKT/bin:$PATH" sh "$SKT/skew.sh" "$1"; cat "$SKT/box-skew$1"
+}
+check "skew trial: +3h stepped back by chrony converges, measured on the monotonic clock (#300)" 0 "converged:6" \
+  env CONVERGE_AFTER=3 bash -c "$(declare -f skew_sim); SKT='$SKT' skew_sim +3"
+check "skew trial: -3h converges too (#300)" 0 "converged:4" \
+  env CONVERGE_AFTER=2 bash -c "$(declare -f skew_sim); SKT='$SKT' skew_sim -3"
+check "skew trial: no makestep is a timeout, and the clock is put back (#300)" 0 "timeout" \
+  env CONVERGE_AFTER=0 bash -c "$(declare -f skew_sim); SKT='$SKT' skew_sim +3; [ \"\$(cat '$SKT/off')\" = 0 ]"
+check "skew trial: a refused date -s is 'notlanded' (#300)" 0 "notlanded" \
+  env SKEW_REFUSE=1 bash -c "$(declare -f skew_sim); SKT='$SKT' skew_sim +3"
+check "drill: the clock probes run after every agent probe in G (#300)" 0 "" \
+  awk '/^phase G/{g=1} g && /box checkup archive/{ck=NR} g && /skew_trial archive/{sk=NR} /^phase C/{exit} END{exit !(ck && sk && sk > ck)}' "$ROOT/drill/drill.sh"
+rm -rf "$SKT"
 # #295: no wait on a drill box is swallowed — a timeout is a finding, never
 # a silent cascade of blind FAILs.
 check "drill: no wait_box has its failure thrown away (#295)" 1 "" \
@@ -7838,14 +8052,14 @@ check "probe ledger: the extracted block is valid bash" 0 "" bash -n "$LEDGERFN"
 # script around it, so the harness supplies it, exactly as the drill does.
 led() { bash -c "set -u; findings=(); . '$LEDGERFN'; $1"; }
 # A complete run: every phase emits what it declared.
-FULL='PHASE_RAN=([I]=1 [A]=8 [B]=47 [G]=16 [C]=9 [E]=7 [D]=0 [T]=1)'
+FULL='PHASE_RAN=([I]=1 [A]=8 [B]=47 [G]=19 [C]=9 [E]=7 [D]=0 [T]=1)'
 
 # shellcheck disable=SC2016  # the snippet is evaluated by led(), not here
-check "probe ledger: the declared total is 89" 0 "[89]" led 'printf "[%s]" "$(ledger_declared)"'
+check "probe ledger: the declared total is 92" 0 "[92]" led 'printf "[%s]" "$(ledger_declared)"'
 # The number CONTRIBUTING and drills/README.md have quoted all along with
 # nothing checking it. If a phase gains probes, both move together or this reds.
 check "probe ledger: ...which is the contract CONTRIBUTING states" 0 "" \
-  grep -qF '89-probe' "$ROOT/CONTRIBUTING.md"
+  grep -qF '92-probe' "$ROOT/CONTRIBUTING.md"
 # The README quotes the total too, and it was the ONE copy nothing checked —
 # so it sat at "84 checks, 84 passing" through a cut that moved every other
 # copy to 81. Driven off ledger_declared() like the rest, rather than a
@@ -7892,25 +8106,25 @@ check "probe ledger: ...and the total the README advertises (#214)" 0 "" \
 # The guard's own test, on the axis the round moved it: the denominator is
 # pinned and the numerator is free, so a run that HAD a failure is reportable.
 RQPROBE="$(mktemp)"
-printf 'currently **89 checks, 88 passing**\n' > "$RQPROBE"
-check "probe ledger: ...and a run with a failure is still quotable, 88/89" 0 "" \
+printf 'currently **92 checks, 91 passing**\n' > "$RQPROBE"
+check "probe ledger: ...and a run with a failure is still quotable, 91/92" 0 "" \
   readme_quotes_the_total "$RQPROBE"
 printf 'currently **84 checks, 84 passing**\n' > "$RQPROBE"
 check "probe ledger: ...while the drift that started this, 84/84, reds" 1 "advertises 84" \
   readme_quotes_the_total "$RQPROBE"
-printf 'currently **89 checks, 99 passing**\n' > "$RQPROBE"
+printf 'currently **92 checks, 99 passing**\n' > "$RQPROBE"
 check "probe ledger: ...and so does passing more probes than exist" 1 "more probes than exist" \
   readme_quotes_the_total "$RQPROBE"
 # The second copy, which 'head -1' would have read straight past: the first
 # total is correct here and the guard must still red.
-printf 'currently **89 checks, 88 passing**\nand elsewhere **84 checks, 84 passing**\n' > "$RQPROBE"
+printf 'currently **92 checks, 91 passing**\nand elsewhere **84 checks, 84 passing**\n' > "$RQPROBE"
 check "probe ledger: ...and a second total nothing would have read reds too" 1 "quotes 2 totals" \
   readme_quotes_the_total "$RQPROBE"
 rm -f "$RQPROBE"
 
 check "probe ledger: a complete run is short in nothing" 0 "[]" \
   led "$FULL; printf '[%s]' \"\$(ledger_short)\""
-check "probe ledger: a complete run's floor is the declared total" 0 "[89]" \
+check "probe ledger: a complete run's floor is the declared total" 0 "[92]" \
   led "$FULL; printf '[%s]' \"\$(ledger_expected)\""
 
 # THE regression. A phase that never executed used to be invisible: the pass
@@ -7926,7 +8140,7 @@ check "probe ledger: overshooting a phase is not a shortfall" 0 "[]" \
 
 # A declared skip is honest — it lowers the expectation by exactly its probes
 # and says so. The whole point is that the floor is never tuned down silently.
-check "probe ledger: a declared skip lowers the floor by its probes" 0 "[80]" \
+check "probe ledger: a declared skip lowers the floor by its probes" 0 "[83]" \
   led "$FULL; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; printf '[%s]' \"\$(ledger_expected)\""
 check "probe ledger: ...so a declared skip is not a shortfall" 0 "[]" \
   led "$FULL; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; printf '[%s]' \"\$(ledger_short)\""
@@ -8054,39 +8268,39 @@ summary_lacks() {   # 0 when the composed run does NOT say $1
   local needle="$1"; shift
   ! run_summary "$1" 2>&1 | grep -qF -e "$needle"
 }
-COMPLETE="$FULL; pass=89; fail=0"
+COMPLETE="$FULL; pass=92; fail=0"
 
-check "drill summary: a complete run reports 89/89 and EXITS 0" 0 "89/89 passed, 0 failed" \
+check "drill summary: a complete run reports 92/92 and EXITS 0" 0 "92/92 passed, 0 failed" \
   run_summary "$COMPLETE"
 
 # THE regression, end to end. Phase C never executed: 62 verdicts, none of them
 # failing, and the drill used to leave here 0 with "62 passed, 0 failed" on the
 # line an operator transcribes into drills/<version>.md as proof.
 check "drill summary: a phase that never ran EXITS NON-ZERO" 1 "the drill ran SHORT:" \
-  run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
+  run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=83"
 check "drill summary: ...naming the short phase, against the full denominator" 1 \
-  "short in: C(0/9)" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
-check "drill summary: ...and the record carries 80/89, not a clean 80" 1 \
-  "80/89 passed, 1 failed" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
+  "short in: C(0/9)" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=83"
+check "drill summary: ...and the record carries 83/92, not a clean 83" 1 \
+  "83/92 passed, 1 failed" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=83"
 # The verdict names both roads to a short phase, not just the commoner one.
 check "drill summary: ...and does not diagnose 'never ran' as the only cause" 1 \
-  "or failed before emitting the rest" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=80"
+  "or failed before emitting the rest" run_summary "$COMPLETE; PHASE_RAN[C]=0; pass=83"
 
 # A DECLARED skip is the line between honest and tuned-down: same 62 verdicts,
 # but the run said which nine it was not going to emit, and why.
 check "drill summary: a declared skip lowers the floor and EXITS 0" 0 \
-  "80/80 passed, 0 failed" \
-  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=80"
+  "83/83 passed, 0 failed" \
+  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=83"
 check "drill summary: ...and the SKIP survives into the findings block" 0 \
   "SKIP: no isolation stack" \
-  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=80"
+  run_summary "$COMPLETE; skipped C 9 'no isolation stack'; PHASE_RAN[C]=0; pass=83"
 
 # The other road to non-zero: nothing short, one thing genuinely failed. Both
 # roads have to work, and the second must not be reported as the first.
 check "drill summary: a complete run with one real FAIL EXITS NON-ZERO" 1 \
-  "88/89 passed, 1 failed" run_summary "$COMPLETE; pass=88; fail=1"
+  "91/92 passed, 1 failed" run_summary "$COMPLETE; pass=91; fail=1"
 check "drill summary: ...and is not mislabelled as a short run" 0 "" \
-  summary_lacks "the drill ran SHORT:" "$COMPLETE; pass=88; fail=1"
+  summary_lacks "the drill ran SHORT:" "$COMPLETE; pass=91; fail=1"
 
 # ---------------------------------------------------------------------------
 # The record emitter (#152). drills/README.md asks a record for six things and
@@ -8488,7 +8702,7 @@ check "drill record: a tree dirtied AFTER the install records the clean ref" 0 \
 # --- the record itself ------------------------------------------------------
 # A finished drill, pinned so every field is assertable. record_collect fills
 # only what is not already set, which is what lets a test pin the world away.
-RECSTATE="PHASE_RAN=([I]=1 [A]=8 [B]=47 [G]=16 [C]=9 [E]=7 [D]=0 [M]=10 [T]=1)
+RECSTATE="PHASE_RAN=([I]=1 [A]=8 [B]=47 [G]=19 [C]=9 [E]=7 [D]=0 [M]=10 [T]=1)
 REC_VERSION=9.9.9; REC_DATE=2026-07-21; REC_HOST='bare Debian 13, Incus 6.0.2'
 REC_RUN_ID=drill-9.9.9-20260721-01; REC_TREE_SHA=abc1234
 REC_TREE_REF=release/9.9.9; REC_TREE_REPO=heavy-duty/box
@@ -8498,7 +8712,7 @@ emit() {   # emit <state> → the record that state produces, on stdout
   rec "$RECSTATE; $1; record_write '$RECOUT'" >/dev/null 2>&1
   cat "$RECOUT" 2>/dev/null
 }
-CLEAN='pass=89; fail=0'
+CLEAN='pass=92; fail=0'
 
 # drills/README.md:34-42 asks for six things. One check each, because a record
 # missing one of them is the hand-transcription this replaces, reintroduced.
@@ -8534,15 +8748,15 @@ record_invocation_names_a_tree() { emit "$1" | grep -qE '^`.*--(repo|ref) '; }
 check "drill record: ...and names no repo or ref in it, there being none to get wrong" \
   1 "" record_invocation_names_a_tree "$CLEAN"
 check "drill record: gives the numbers and the wall clock" 0 \
-  "**89/89 passed, 0 failed.** 41 minutes wall clock." emit "$CLEAN"
+  "**92/92 passed, 0 failed.** 41 minutes wall clock." emit "$CLEAN"
 check "drill record: carries the per-phase ledger a single total cannot say" 0 \
   "B 47/47" emit "$CLEAN"
 check "drill record: states the floor and the table's total as two facts" 0 \
-  "Probe floor: 89 expected this run; the table declares 89." emit "$CLEAN"
+  "Probe floor: 92 expected this run; the table declares 92." emit "$CLEAN"
 # DRILL_EXPECT can raise the floor above the table, and the record must not read
 # that as an error — the operator is deliberately demanding more than the table.
 check "drill record: ...which stays readable when DRILL_EXPECT raises the floor" 0 \
-  "Probe floor: 100 expected this run; the table declares 89." \
+  "Probe floor: 100 expected this run; the table declares 92." \
   emit "DRILL_EXPECT=100; $CLEAN"
 # The record is pasted into a file and read months later. Escape codes in it are
 # the peculiar thing this issue found: every script emitted ANSI unconditionally.
@@ -8565,19 +8779,19 @@ check "drill record: ...and says the judgement is the operator's to write" 0 \
 # 62 of 71 and failed none is not "62/62 passed" — and the record is precisely
 # where that fraction used to get written down as proof a release was drilled.
 check "drill record: a short run's denominator is the FLOOR, not what ran" 0 \
-  "**80/89 passed" emit "pass=80; fail=0; PHASE_RAN[C]=0"
+  "**83/92 passed" emit "pass=83; fail=0; PHASE_RAN[C]=0"
 check "drill record: ...and the short phase is named in it" 0 "C 0/9" \
-  emit "pass=80; fail=0; PHASE_RAN[C]=0"
+  emit "pass=83; fail=0; PHASE_RAN[C]=0"
 # A DECLARED skip is the honest half: the floor moves, and the record says which
 # probes were not expected and why — recorded as skipped, never as passing.
 check "drill record: a declared skip lowers the record's denominator" 0 \
-  "**80/80 passed" emit "pass=80; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
+  "**83/83 passed" emit "pass=83; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
 check "drill record: ...and the skip is recorded AS a skip, beside the failures" 0 \
   "- SKIP: no isolation stack" \
-  emit "pass=80; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
+  emit "pass=83; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
 check "drill record: ...and the waived probes are visible in the ledger line" 0 \
   "9 waived by declared skips" \
-  emit "pass=80; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
+  emit "pass=83; fail=0; PHASE_RAN[C]=0; skipped C 9 'no isolation stack' >/dev/null"
 check "drill record: failures land in it verbatim, uncoloured" 0 "- FAIL: the boundary held open" \
   emit "pass=86; fail=1; no 'the boundary held open' >/dev/null"
 check "drill record: a clean run says so rather than leaving a bare heading" 0 \
@@ -8618,7 +8832,7 @@ run_emit() {   # run_emit <state> — EXIT STATUS is the drill's own
 }
 check "drill emit: a clean run writes the record and still EXITS 0" 0 \
   "record written:" run_emit "$CLEAN"
-check "drill emit: ...and the file on disk is the record" 0 "**89/89 passed, 0 failed.**" \
+check "drill emit: ...and the file on disk is the record" 0 "**92/92 passed, 0 failed.**" \
   cat "$RECOUT"
 check "drill emit: ...pinned to the run ID the drill announced at install time" 0 \
   "drill-9.9.9-20260721-01" cat "$RECOUT"
@@ -8636,15 +8850,15 @@ check "drill: ...and no phase header sends the operator to the closed audit" 1 "
 # before that `no` fires would put a clean sweep in the record on a short run,
 # which is the defect #153 closed.
 check "drill emit: a short run EXITS NON-ZERO with a record written" 1 \
-  "record written:" run_emit "pass=80; fail=0; PHASE_RAN[C]=0"
+  "record written:" run_emit "pass=83; fail=0; PHASE_RAN[C]=0"
 check "drill emit: ...and the record it wrote carries the shortfall, not a sweep" 0 \
   "FAIL: the drill ran SHORT:" cat "$RECOUT"
-check "drill emit: ...against the full denominator, 80/89" 0 "**80/89 passed" cat "$RECOUT"
+check "drill emit: ...against the full denominator, 80/89" 0 "**83/92 passed" cat "$RECOUT"
 check "drill emit: a short run has no unattributed summary probe" 1 "" \
   grep -q 'unattributed' "$RECOUT"
 short_ledgers_agree() {
   local out terminal emitted
-  out="$(run_emit 'pass=80; fail=0; PHASE_RAN[C]=0')"
+  out="$(run_emit 'pass=83; fail=0; PHASE_RAN[C]=0')"
   terminal="$(printf '%s\n' "$out" | grep '^  probes')"
   # shellcheck disable=SC2016
   emitted="$(sed -n '/^```$/,/^```$/p' "$RECOUT" | grep '^  probes')"
