@@ -236,6 +236,7 @@ CMDS=(
   "shell^[--user <user>] <box>^box^Open a shell in a box — root unless --user names one that exists^fn:cmd_shell^"
   "root^<box>^box^Open a root shell in a box (the same as 'box shell') — authorized by the host's Incus socket^fn:cmd_root^"
   "exec^[--user <user>] <box> -- <cmd...>^box^Run a command inside a box — as root unless --user names one^fn:cmd_exec^"
+  "cp^[--user <user>] <src> <dst>^^Copy files between the host and a box (<box>:<path>) — no SSH^fn:cmd_cp^"
   "tmux^^^Removed in 0.11.0 — see 'box help tmux' for the replacement^fn:cmd_tmux^"
   "snapshot^<box> [<label>]^box^Checkpoint a box (label defaults to manual-<epoch>)^fn:cmd_snapshot^"
   "restore^<box> <snapshot> [--force]^box,arg2,confirm^Roll a box back to one of its snapshots — irreversible, and it asks first^incus:snapshot restore^restored {} to {1}^roll {} back to snapshot '{1}' and discard everything in the box since it was taken"
@@ -334,6 +335,7 @@ OPTIONS
   --name <box>          Name for the new box                  (new, import)
   --size <size>         Named resource bundle: small, medium, large   (new)
   --user <user>         Enter as this user, which must exist  (shell, exec)
+                          or copy as them: their home, their owner  (cp)
   --autostart           Start with the host after a reboot            (new)
   --require-vm          VM mode only: refuse --container and fallback (new)
   --from <src>[/<snap>] Clone from box <src>, or from its snapshot    (new)
@@ -654,6 +656,26 @@ It does not use or require sudo inside the guest, so it also works when the
 tenant has no sudoers entry.
 
   box root work
+EOF
+;;
+    cp) cat <<'EOF'
+Copy one file or directory between the host and a box, scp-style: exactly one
+side is <box>:<path>, the other a host path. Directories copy recursively. It
+rides 'incus file push/pull' on the host socket — no SSH, no inbound route.
+
+As root by default (#291): a relative or ~ remote path resolves against /root,
+and pushed files are owned root:root. With --user NAME (which must exist in the
+box, refused otherwise, never a root fallback) it resolves against NAME's home
+from the guest's passwd, and pushed files are owned by NAME and its group —
+also outside that home. ~ is expanded in the box, never on the host.
+
+A directory copied onto an existing directory lands inside it; onto a missing
+path it becomes that path (when pushing, the path must end in the directory's
+own name: proj/dist for ./dist). A host path with a colon is written ./a:b.
+
+  box cp ./notes.md work:                  # → /root/notes.md
+  box cp --user ops ./dist work:proj/dist  # → ~ops/proj/dist, owned by ops
+  box cp work:/var/log/syslog .            # box → host
 EOF
 ;;
     exec) cat <<'EOF'
@@ -1217,7 +1239,7 @@ fi
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "$(id -un)" ] && [ -e "$SHARE_DIR/$(id -un)" ]; then
   export VISUAL=/bin/false EDITOR=/bin/false
   case "${1:-help}" in
-    new|list|info|checkup|shell|root|exec|snapshot|restore|rm|down|start|restart|rename|help|version|-h|--help|-V|--version) ;;
+    new|list|info|checkup|shell|root|exec|cp|snapshot|restore|rm|down|start|restart|rename|help|version|-h|--help|-V|--version) ;;
     *) echo "box --as $(id -un): '${1:-}' is not available to a shared tenant's members — it reaches the host as $(id -un) (#287). Ask an admin." >&2
        exit 2 ;;
   esac
@@ -1287,9 +1309,9 @@ if [ "$want_help" -eq 1 ]; then show_help "$cmd"; exit 0; fi
 # with exit 0 is exactly the quiet surprise the entry model exists to remove.
 if [ -n "$user" ]; then
   case "$cmd" in
-    shell|exec|new) ;;
+    shell|exec|cp|new) ;;
     root) usage_error "'box root' is always root — to enter as a user: box shell --user $user <box>" ;;
-    *) usage_error "--user is for 'box shell' and 'box exec' (got it on '$cmd')" ;;
+    *) usage_error "--user is for 'box shell', 'box exec' and 'box cp' (got it on '$cmd')" ;;
   esac
 fi
 if [ "$autostart$require_vm" != 00 ] && [ "$cmd" != new ]; then
@@ -2987,6 +3009,9 @@ require_guest_user() {
   # (and an empty field) become /bin/sh. Stdout only, first line only.
   if [ "$rc" -eq 0 ]; then
     guest_shell="$(printf '%s\n' "$pwline" | head -n1 | cut -d: -f7)"
+    # uid, primary gid and home for 'box cp --user' (#278): read from the
+    # guest's own passwd line, never assumed to be /home/<user>.
+    IFS=: read -r _ _ guest_uid guest_gid _ guest_home _ <<<"$(printf '%s\n' "$pwline" | head -n1)"
     case "$guest_shell" in ""|*/nologin|*/false) guest_shell=/bin/sh ;; esac
     return 0
   fi
@@ -3028,6 +3053,153 @@ cmd_exec() {
   else
     incus exec "$inst" -- bash -lc 'cd ~ && exec "$@"' _ "${args[@]:1}"
   fi
+}
+
+# --- cp (#278, amended for #291): scp for boxes, over the Incus socket ------
+#
+# 'incus file push/pull', dressed: one side is <box>:<path>, the other a host
+# path. The entry model is exec's — root by default (paths against /root,
+# files root:root), --user NAME opt-in and refusing a missing NAME before
+# anything moves, never a root fallback. A remote ~ is expanded HERE against
+# the guest's passwd home, so the host shell and the host's $HOME never see
+# it. Never 'incus exec … cat': the only exec calls are the passwd lookup,
+# a directory probe and the chown of a pushed tree.
+#
+# A side names a box when it starts with an Incus instance name and a colon
+# before any slash — scp's rule, so './a:b' and '/x/a:b' stay host paths.
+cp_box_side() { [[ "$1" =~ ^([A-Za-z0-9][A-Za-z0-9-]*):(.*)$ ]]; }
+
+# cp_incus <args...> — run incus; on failure, Incus's own reason, prefixed,
+# and a non-zero return the caller turns into exit 1 (after its cleanup).
+cp_incus() {
+  local errf rc=0; errf="$(mktemp)"
+  incus "$@" 2>"$errf" </dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ -s "$errf" ]; then sed 's/^/box: /' "$errf" >&2; else echo "box: incus $1 $2 failed (exit $rc)" >&2; fi
+    rm -f "$errf"; return 1
+  fi
+  rm -f "$errf"
+}
+
+# cp_remote_kind <inst> <box> <abs> — prints d (a directory), f (anything
+# else, or nothing there). Answered on stdout, not by exit code: incus exec
+# exits 1 both for 'test' failing and for a box it cannot reach.
+cp_remote_kind() {
+  local k
+  # shellcheck disable=SC2016  # $1 expands in the guest shell, by design
+  k="$(incus exec "$1" -- sh -c 'if [ -d "$1" ]; then echo d; else echo f; fi' _ "$3" </dev/null 2>/dev/null || true)"
+  case "$k" in
+    d|f) echo "$k" ;;
+    *) die "could not reach $2 to copy (is it running? see 'box info $2')" ;;
+  esac
+}
+
+cmd_cp() {
+  local syn; syn="$(synopsis_of cp)"
+  [ "${#args[@]}" -eq 2 ] || usage_error "cp takes one source and one destination — usage: $syn"
+  local src="${args[0]}" dst="${args[1]}" push box rpath hpath
+  if [ -z "$src" ] || [ -z "$dst" ]; then
+    usage_error "cp: an empty path — name both sides, e.g. 'box cp ./notes.md work:' (usage: $syn)"
+  fi
+  if cp_box_side "$src"; then
+    if cp_box_side "$dst"; then
+      usage_error "cp: both sides name a box ('${src%%:*}:' and '${dst%%:*}:') — one side must be a host path; a host path with a colon is written ./a:b"
+    fi
+    cp_box_side "$src"  # re-match: the dst test above cleared BASH_REMATCH
+    push=0; box="${BASH_REMATCH[1]}"; rpath="${BASH_REMATCH[2]}"; hpath="$dst"
+  elif cp_box_side "$dst"; then
+    push=1; box="${BASH_REMATCH[1]}"; rpath="${BASH_REMATCH[2]}"; hpath="$src"
+  else
+    usage_error "cp: neither side names a box — write the box side as <box>:<path>, e.g. 'box cp ./notes.md work:' or 'box cp work:out.log .'"
+  fi
+  case "$hpath" in
+    :*) usage_error "cp: '$hpath' has an empty box name — write <box>:<path>, or ./$hpath for a host path" ;;
+  esac
+
+  local resolved; resolved="$(resolve_box "$box")"; inst="$resolved"
+
+  # Who the copy is for, decided BEFORE anything moves (#291).
+  local home=/root uid=0 gid=0
+  if [ -n "$user" ]; then
+    require_guest_user "$inst" "$box" "$user"
+    home="$guest_home"; uid="$guest_uid"; gid="$guest_gid"
+    [[ "$home" == /* ]] || die "user '$user' in $box has no absolute home in its passwd entry (got '$home') — name an absolute remote path"
+    [[ "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ ]] || die "could not read uid/gid of '$user' in $box from its passwd entry"
+  fi
+  home="${home%/}"
+
+  # The remote path, absolute, expanded in terms of the GUEST's home.
+  local abs
+  # shellcheck disable=SC2088  # the ~ patterns are a literal remote ~, expanded by hand
+  case "$rpath" in
+    ""|"~") abs="$home/" ;;
+    "~/"*)  abs="$home/${rpath#"~/"}" ;;
+    "~"*)   usage_error "cp: '~name' paths are not expanded — use --user NAME with ~/…, or an absolute path" ;;
+    /*)     abs="$rpath" ;;
+    *)      abs="$home/$rpath" ;;
+  esac
+
+  local name target parent
+  if [ "$push" -eq 1 ]; then
+    [ -e "$hpath" ] || [ -L "$hpath" ] || die "no such file on the host: $hpath"
+    if [ -d "$hpath" ]; then
+      local srcdir; srcdir="$(cd -- "$hpath" && pwd)" || die "cannot read the host directory $hpath"
+      [ "$srcdir" != / ] || usage_error "cp: refusing to copy the host's whole / into a box"
+      name="${srcdir##*/}"
+      # scp's rule, which incus's 'push -r' (always lands INSIDE its target)
+      # cannot spell alone: an existing remote directory receives the tree;
+      # a missing path ending in the tree's own name becomes it.
+      local t="${abs%/}"; [ -n "$t" ] || t=/
+      if [ "$(cp_remote_kind "$inst" "$box" "$t")" = d ]; then
+        parent="$t"
+      elif [ "${t##*/}" = "$name" ]; then
+        parent="${t%/*}"; [ -n "$parent" ] || parent=/
+      else
+        usage_error "cp: $box:$t does not exist and is not named '$name' — push into an existing directory, or name it $box:${t%/*}/$name"
+      fi
+      target="${parent%/}/$name"
+      cp_incus file push -r -p -- "$srcdir" "$inst${parent%/}/" || exit 1
+      # push -r keeps the HOST's numeric owners; the tree is the entry user's.
+      cp_incus exec "$inst" -- chown -R -h -- "$uid:$gid" "$target" || exit 1
+    else
+      if [[ "$abs" == */ ]] || [ "$(cp_remote_kind "$inst" "$box" "$abs")" = d ]; then
+        target="${abs%/}/${hpath##*/}"
+      else
+        target="$abs"
+      fi
+      cp_incus file push -p --uid "$uid" --gid "$gid" -- "$hpath" "$inst$target" || exit 1
+    fi
+    echo "box: copied $hpath → $box:$target"
+    return 0
+  fi
+
+  # Pull: box → host.
+  local rsrc="${abs%/}"
+  [ -n "$rsrc" ] || usage_error "cp: refusing to copy a box's whole / to the host"
+  name="${rsrc##*/}"
+  if [ "$(cp_remote_kind "$inst" "$box" "$rsrc")" = d ]; then
+    if [ -d "$hpath" ]; then
+      target="${hpath%/}/$name"
+      cp_incus file pull -r -- "$inst$rsrc" "$hpath" || exit 1
+    else
+      # Missing host path: it BECOMES the tree (scp's rule). incus pulls
+      # into a directory, so pull into a private one beside it, then move.
+      [[ "$hpath" != */ ]] || die "no such host directory: $hpath"
+      [ ! -e "$hpath" ] || die "$hpath exists and is not a directory — a directory cannot replace it"
+      parent="$(dirname -- "$hpath")"
+      [ -d "$parent" ] || die "no such host directory: $parent"
+      local tmp; tmp="$(mktemp -d "$parent/.box-cp.XXXXXXXX")"
+      cp_incus file pull -r -- "$inst$rsrc" "$tmp" || { rm -rf -- "$tmp"; exit 1; }
+      mv -- "$tmp/$name" "$hpath" || { rm -rf -- "$tmp"; die "could not move the pulled tree to $hpath"; }
+      rmdir -- "$tmp"
+      target="$hpath"
+    fi
+  else
+    if [ -d "$hpath" ]; then target="${hpath%/}/$name"; else target="$hpath"; fi
+    [[ "$target" != */ ]] || die "no such host directory: $hpath"
+    cp_incus file pull -- "$inst$rsrc" "$target" || exit 1
+  fi
+  echo "box: copied $box:$rsrc → $target"
 }
 
 # Removed with the tmux package (#289, #253 D7(a)): the verb goes with it, and
