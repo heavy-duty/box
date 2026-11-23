@@ -685,6 +685,7 @@ box info <box>               # one box: state, IP, exposures, provenance, snapsh
 box shell [--user <u>] <box> # root by default; --user enters as one who exists
 box root <box>               # enter as root through the host's Incus authorization
 box exec [--user <u>] <box> -- <cmd...>   # run a command in the box (root by default)
+box cp [--user <u>] <src> <dst>           # copy files host ↔ box, scp-style (<box>:<path>)
 box snapshot <box> [label]   # checkpoint (label defaults to manual-<epoch>)
 box restore <box> <snap> [--force]
                              # roll back to a snapshot — destructive, asks first

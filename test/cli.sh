@@ -3153,9 +3153,99 @@ check "--user: an empty shell field becomes /bin/sh" 0 "SH=/bin/sh" rgshell "u:x
 check "--user: a nologin shell becomes /bin/sh, never \$SHELL=nologin" 0 "SH=/bin/sh" rgshell "u:x:1000:1000::/home/u:/usr/sbin/nologin"
 rm -f "$RGFN"
 check "shell --user on a box whose agent is down says so (exit 1), not 'no such user'" 1 "could not look up user 'claude' in work (is it running?)" user_down
+# --- box cp (#278, amended for #291): incus file push/pull, dressed ---------
+# A fake incus that knows one box 'work', one untagged instance 'vm', a guest
+# user 'ops' whose home is NOT /home/ops (/srv/ops, uid 1500, gid 1600), and
+# answers the directory probe from FAKE_REMOTE_DIRS. Every call is logged; a
+# 'file pull' writes what it was asked to, so the host side can be checked.
+CPSHIM="$(mktemp -d)"; CPW="$(mktemp -d)"
+cat > "$CPSHIM/incus" <<'SHIM'
+#!/usr/bin/env bash
+printf 'incus' >> "$FAKE_INCUS_LOG"; printf ' [%s]' "$@" >> "$FAKE_INCUS_LOG"; echo >> "$FAKE_INCUS_LOG"
+case "$*" in
+  "config get --expanded work user.box"|"config get work user.box") echo 1; exit 0 ;;
+  "config get "*) exit 1 ;;
+  "exec work -- getent passwd ops") echo "ops:x:1500:1600:Ops:/srv/ops:/bin/bash"; exit 0 ;;
+  "exec work -- getent passwd") echo "root:x:0:0:root:/root:/bin/bash"; echo "ops:x:1500:1600:Ops:/srv/ops:/bin/bash"; exit 0 ;;
+  "exec work -- getent passwd "*) exit 2 ;;
+  "exec work -- sh -c "*)
+    for d in ${FAKE_REMOTE_DIRS:-}; do [ "$d" = "${*: -1}" ] && { echo d; exit 0; }; done; echo f; exit 0 ;;
+  "file pull "*) [ -z "${FAKE_PULL_FAIL:-}" ] || { echo "Error: not found" >&2; exit 1; } ;;&
+  "file pull -r -- "*) mkdir -p "${*: -1}/${5##*/}" && echo x > "${*: -1}/${5##*/}/inner"; exit 0 ;;
+  "file pull -- "*) echo pulled > "${*: -1}"; exit 0 ;;
+esac
+exit 0
+SHIM
+chmod +x "$CPSHIM/incus"
+cpbox() {  # cpbox <log> <args...> — the real box, cp shim, from $CPW
+  local log="$1"; shift; : > "$log"
+  (cd "$CPW" && env FAKE_INCUS_LOG="$log" PATH="$CPSHIM:$PATH" "$BOX" "$@" </dev/null)
+}
+CPL="$CPW/cp.log"; echo hi > "$CPW/notes.md"; mkdir -p "$CPW/dist/sub"; echo y > "$CPW/dist/sub/f"
+echo s > "$CPW/my notes.md"
+check "cp: help names the verb and its grammar" 0 "usage: box cp [--user <user>] <src> <dst>" "$BOX" help cp
+# shellcheck disable=SC2016  # expands in the child shell
+check "cp: listed in box help" 0 "" bash -c '"$1" help | grep -qE "^  cp +Copy"' _ "$BOX"
+check "cp: host → box, a file into root's home (#291 root default)" 0 "copied notes.md → work:/root/notes.md" cpbox "$CPL" cp notes.md work:
+check "cp: ...through incus file push, owned root:root, parents created" 0 "" \
+  grep -qFx 'incus [file] [push] [-p] [--uid] [0] [--gid] [0] [--] [notes.md] [work/root/notes.md]' "$CPL"
+check "cp: ...and no SSH, no exec cat" 1 "" grep -qE 'ssh|\[cat\]' "$CPL"
+check "cp: a relative remote path resolves against /root" 0 "work:/root/a/b.md" cpbox "$CPL" cp notes.md work:a/b.md
+check "cp: a ~/ remote path resolves against /root, never the host's \$HOME" 0 "work:/root/x.md" cpbox "$CPL" cp notes.md 'work:~/x.md'
+check "cp: ...the host's \$HOME is nowhere in the call" 1 "" grep -qF "$HOME/" "$CPL"
+check "cp: an absolute remote path is kept" 0 "work:/etc/app.conf" cpbox "$CPL" cp notes.md work:/etc/app.conf
+cp_into_dir() { FAKE_REMOTE_DIRS=/root/proj cpbox "$CPL" cp notes.md work:proj; }
+check "cp: a file onto an existing remote directory lands inside it" 0 "work:/root/proj/notes.md" cp_into_dir
+check "cp: a path with spaces is one argument both sides" 0 "work:/root/my dir/my notes.md" cpbox "$CPL" cp "my notes.md" "work:my dir/"
+check "cp: ...passed whole to incus" 0 "" grep -qF '[my notes.md] [work/root/my dir/my notes.md]' "$CPL"
+check "cp --user: resolves against the guest's passwd home, not /home/ops" 0 "work:/srv/ops/notes.md" cpbox "$CPL" cp --user ops notes.md work:
+check "cp --user: ...owned by ops's uid and primary gid" 0 "" \
+  grep -qFx 'incus [file] [push] [-p] [--uid] [1500] [--gid] [1600] [--] [notes.md] [work/srv/ops/notes.md]' "$CPL"
+check "cp --user: ...~ is the user's home too" 0 "work:/srv/ops/.cfg" cpbox "$CPL" cp --user ops notes.md 'work:~/.cfg'
+check "cp --user ghost: refused (exit 2), never a root fallback" 2 "no user 'ghost' in work" cpbox "$CPL" cp --user ghost notes.md work:
+check "cp --user ghost: ...nothing was copied" 1 "" grep -qE '\[file\]|chown' "$CPL"
+check "cp: a ~name remote path is refused, not guessed" 2 "'~name' paths are not expanded" cpbox "$CPL" cp notes.md 'work:~ops/x'
+cpdir_new() { cpbox "$CPL" cp --user ops dist work:proj/dist; }
+check "cp: a directory recursively onto a missing path named for it" 0 "work:/srv/ops/proj/dist" cpdir_new
+check "cp: ...push -r -p into its parent" 0 "" grep -qF "[file] [push] [-r] [-p] [--] [$(cd "$CPW/dist" && pwd)] [work/srv/ops/proj/]" "$CPL"
+check "cp: ...then the tree is chowned to ops (push -r keeps host owners)" 0 "" \
+  grep -qFx 'incus [exec] [work] [--] [chown] [-R] [-h] [--] [1500:1600] [/srv/ops/proj/dist]' "$CPL"
+cpdir_in() { FAKE_REMOTE_DIRS=/root/proj cpbox "$CPL" cp dist/ work:proj; }
+check "cp: a directory onto an existing remote directory lands inside, as root" 0 "work:/root/proj/dist" cpdir_in
+check "cp: ...chowned 0:0" 0 "" grep -qF '[chown] [-R] [-h] [--] [0:0] [/root/proj/dist]' "$CPL"
+check "cp: a directory onto a missing path with another name is refused" 2 "does not exist and is not named 'dist'" cpbox "$CPL" cp dist work:other
+check "cp: box → host, a file" 0 "copied work:/root/out.log → got.log" cpbox "$CPL" cp work:out.log got.log
+check "cp: ...through incus file pull" 0 "" grep -qFx 'incus [file] [pull] [--] [work/root/out.log] [got.log]' "$CPL"
+check "cp: ...and it landed" 0 "pulled" cat "$CPW/got.log"
+mkdir -p "$CPW/into"
+check "cp: box → host into an existing directory" 0 "into/report.pdf" cpbox "$CPL" cp work:/tmp/report.pdf into/
+pull_dir() { FAKE_REMOTE_DIRS=/root/tree cpbox "$CPL" cp work:tree back; }
+check "cp: box → host, a directory onto a missing path becomes it" 0 "copied work:/root/tree → back" pull_dir
+check "cp: ...pulled with -r" 0 "" grep -qF '[file] [pull] [-r] [--] [work/root/tree]' "$CPL"
+# shellcheck disable=SC2016  # expands in the child shell
+check "cp: ...the tree is at the named path, no temp dir left" 0 "x" bash -c 'cat "$1/back/inner" && ! ls -A "$1" | grep -q box-cp' _ "$CPW"
+pull_fail() { FAKE_REMOTE_DIRS=/root/tree FAKE_PULL_FAIL=1 cpbox "$CPL" cp work:tree back2; }
+check "cp: a failed pull says Incus's reason, prefixed, and leaves no temp dir" 1 "box: Error: not found" pull_fail
+# shellcheck disable=SC2016  # expands in the child shell
+check "cp: ...nothing left behind" 1 "" bash -c 'ls -A "$1" | grep -qE "box-cp|back2"' _ "$CPW"
+check "cp --user: pulling resolves ~ against the user's home" 0 "work:/srv/ops/f.txt" cpbox "$CPL" cp --user ops 'work:~/f.txt' f.txt
+check "cp: two remote sides refused (exit 2)" 2 "both sides name a box" cpbox "$CPL" cp work:a work:b
+check "cp: zero remote sides refused (exit 2)" 2 "neither side names a box" cpbox "$CPL" cp a b
+check "cp: ...a colon after a slash is a host path, as with scp" 2 "neither side names a box" cpbox "$CPL" cp ./a:b /x/c:d
+check "cp: ...and incus was never called" 1 "" grep -q incus "$CPL"
+check "cp: an empty path refused (exit 2)" 2 "an empty path" cpbox "$CPL" cp "" work:
+check "cp: one argument refused with the usage" 2 "usage: box cp" cpbox "$CPL" cp notes.md
+check "cp: an untagged instance is refused like every verb" 1 "no such box: vm" cpbox "$CPL" cp notes.md vm:
+check "cp: ...nothing was pushed to it" 1 "" grep -q '\[file\]' "$CPL"
+check "cp: a missing host source fails before incus file" 1 "no such file on the host" cpbox "$CPL" cp nope work:
+check "cp: --as members may use it (#287 allow-list)" 0 "" grep -qE '^    new\|.*\|cp\|' "$BOX"
+CPSA="$(mktemp -d)"; : >"$CPSA/$(id -un)"
+check "cp: --as: a shared tenant's member reaches cp (refused only for its grammar)" 2 "neither side names a box" \
+  env SUDO_USER=boxmember BOX_SHARE_DIR="$CPSA" "$BOX" cp a b
+rm -rf "$CPSHIM" "$CPW" "$CPSA"
 check "--user with an empty value is refused, never a root entry (#291 review)" 2 "--user needs a value" "$BOX" exec --user "" work -- id -u
 check "box root --user is refused, pointing at box shell --user" 2 "box shell --user claude <box>" "$BOX" root --user claude work
-check "--user on another verb is refused, not ignored" 2 "--user is for 'box shell' and 'box exec'" "$BOX" info --user claude work
+check "--user on another verb is refused, not ignored" 2 "--user is for 'box shell', 'box exec' and 'box cp'" "$BOX" info --user claude work
 check "--autostart on a verb other than new is refused" 2 "are 'box new' flags" "$BOX" import --autostart x.tar.gz
 # shellcheck disable=SC2016  # $-strings expand in the child shell, by design
 check "box help lists no removed verb (tmux, templates) (#289, #288)" 1 "" bash -c '"$1" help | grep -qE "^  (tmux|templates) "' _ "$BOX"
